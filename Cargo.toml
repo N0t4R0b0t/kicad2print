@@ -1,0 +1,29 @@
+[package]
+name = "kicad2print"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# CLI argument parsing with derive macros
+clap = { version = "4.5", features = ["derive"] }
+
+# Configuration: TOML parsing + serialization
+serde = { version = "1.0", features = ["derive"] }
+toml = "0.8"
+
+# S-expression parsing for KiCad files
+nom = "7.1"
+
+# 3MF output (ZIP + XML)
+zip = "2.1"
+quick-xml = { version = "0.36", features = ["serialize"] }
+
+# Error handling with context
+anyhow = "1.0"
+thiserror = "1.0"
+
+# 2D/3D math for geometry calculations
+nalgebra = "0.33"
+
+# NOTE: Solid geometry modeling (truck) will be added once we verify the correct crate versions
+# For now, the geometry generation is a placeholder using basic 3D structures
