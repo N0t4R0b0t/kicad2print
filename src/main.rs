@@ -46,6 +46,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use config::{CliOverrides, Config, EyeletStyle, OutputFormat};
 use std::path::PathBuf;
+use std::process::Command;
 
 /// Command-line arguments for `kicad2print`.
 ///
@@ -114,6 +115,10 @@ struct Args {
     /// Verbose output (print detailed information during processing)
     #[arg(short, long)]
     verbose: bool,
+
+    /// Open the generated model in a 3D viewer after conversion
+    #[arg(long)]
+    view: bool,
 }
 
 impl Args {
@@ -148,6 +153,45 @@ impl Args {
             output_format,
             output_dir: self.output_dir.clone(),
         })
+    }
+}
+
+/// Open a 3D model file in the system's default viewer or in view3dscene.
+///
+/// Tries view3dscene first (if available), then falls back to the system default:
+/// - Linux: xdg-open
+/// - macOS: open
+/// - Windows: start
+fn open_viewer(file_path: &PathBuf) {
+    // Try view3dscene first
+    if Command::new("view3dscene")
+        .arg(file_path)
+        .spawn()
+        .is_ok()
+    {
+        println!("🔍 Opening in view3dscene...");
+        return;
+    }
+
+    // Fall back to system default
+    let cmd = if cfg!(target_os = "windows") {
+        Command::new("cmd")
+            .args(["/C", "start", &file_path.display().to_string()])
+            .spawn()
+    } else if cfg!(target_os = "macos") {
+        Command::new("open")
+            .arg(file_path)
+            .spawn()
+    } else {
+        // Linux and other Unix-like systems
+        Command::new("xdg-open")
+            .arg(file_path)
+            .spawn()
+    };
+
+    match cmd {
+        Ok(_) => println!("🔍 Opening in default viewer..."),
+        Err(e) => eprintln!("⚠️  Could not open viewer: {}", e),
     }
 }
 
@@ -244,6 +288,19 @@ fn main() -> Result<()> {
     // Success message
     println!("\n✅ Processing complete!");
     println!("   Output files will be in: {}", config.output_dir);
+
+    // Open viewer if requested
+    if args.view {
+        // Once export is implemented, this will construct the actual output filename
+        // For now, show a note
+        println!("\n💡 Tip: Once export is implemented, use --view to auto-open the generated model");
+
+        // TODO: Once we know the generated filename, construct it here and call:
+        // let output_file = PathBuf::from(&config.output_dir).join("boardname_combined.stl");
+        // if output_file.exists() {
+        //     open_viewer(&output_file);
+        // }
+    }
 
     Ok(())
 }

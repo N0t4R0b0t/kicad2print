@@ -51,6 +51,9 @@ kicad2print my_board.kicad_pcb --verbose
 
 # Generate both STL and 3MF
 kicad2print my_board.kicad_pcb --format both
+
+# Auto-open in 3D viewer after conversion
+kicad2print my_board.kicad_pcb --view
 ```
 
 ## Configuration
@@ -111,6 +114,7 @@ OPTIONS:
   --scale <FACTOR>                 Manual scale factor (0 = auto)
   --format <FORMAT>                "stl", "3mf", or "both"
   --output-dir <DIR>               Output directory
+  --view                           Auto-open result in 3D viewer
   -v, --verbose                    Detailed output during processing
   -h, --help                       Show help
   -V, --version                    Show version
