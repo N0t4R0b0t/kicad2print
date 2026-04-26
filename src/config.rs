@@ -1,3 +1,7 @@
+// Copyright (c) 2024 Ricardo Salvador
+// Licensed under the GNU Affero General Public License v3.0
+// See LICENSE file in the repository root for full details.
+
 //! Configuration management for `kicad2print`.
 //!
 //! This module handles loading settings from TOML config files and merging them with

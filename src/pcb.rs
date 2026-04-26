@@ -1,3 +1,7 @@
+// Copyright (c) 2024 Ricardo Salvador
+// Licensed under the GNU Affero General Public License v3.0
+// See LICENSE file in the repository root for full details.
+
 //! Core PCB data types representing parsed KiCad design elements.
 //!
 //! This module defines the fundamental data structures that represent a KiCad PCB design.

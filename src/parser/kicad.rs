@@ -1,3 +1,7 @@
+// Copyright (c) 2024 Ricardo Salvador
+// Licensed under the GNU Affero General Public License v3.0
+// See LICENSE file in the repository root for full details.
+
 //! KiCad PCB file parser.
 //!
 //! This module walks the S-expression tree produced by the S-expression parser

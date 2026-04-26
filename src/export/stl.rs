@@ -1,3 +1,7 @@
+// Copyright (c) 2024 Ricardo Salvador
+// Licensed under the GNU Affero General Public License v3.0
+// See LICENSE file in the repository root for full details.
+
 //! Binary STL writer.
 //!
 //! Format: 80-byte header, uint32 triangle count, then for each triangle:

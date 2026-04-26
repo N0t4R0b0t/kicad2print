@@ -1,3 +1,7 @@
+// Copyright (c) 2024 Ricardo Salvador
+// Licensed under the GNU Affero General Public License v3.0
+// See LICENSE file in the repository root for full details.
+
 //! Board scale factor resolution.
 //!
 //! The board is always output at 1:1 scale by default. Component pad spacing

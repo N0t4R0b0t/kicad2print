@@ -7,12 +7,13 @@ This tool generates STL/3MF 3D models from KiCad `.kicad_pcb` files, enabling yo
 ## Features
 
 - 📝 Parses KiCad S-expression `.kicad_pcb` files
-- 🔄 Auto-scales designs to fit configured trace channel widths
 - 🧊 Generates 3D-printable substrate models (STL/3MF)
+- 🌐 Interactive 3D preview with three.js (rotate, pan, zoom)
 - ⚙️ Configurable via TOML + CLI arguments
-- 📊 Extracts traces, vias, pads, and board outlines
-- 🎯 Supports both "hole" and "indent" via styles
-- 📦 Generates combined + separate top/bottom models
+- 📊 Extracts traces, vias, pads, and board outlines with exact positioning
+- 🎯 Supports both "hole" (through-hole) and "indent" (guide dimple) via styles
+- ✅ Preserves component hole spacing at 1:1 scale — components fit perfectly
+- ⚠️ Geometry validation: warns if channel depth or eyelet indents too shallow
 
 ## Quick Start
 
@@ -89,7 +90,8 @@ pad_hole_diameter_mm = 0.8
 # Total thickness of the printed substrate
 substrate_thickness_mm = 3.0
 
-# Manual scale factor (0 = auto-calculate based on trace widths)
+# Manual scale factor (0 = true size, preserves component spacing)
+# Only use if you want a deliberately scaled mock-up
 scale_factor = 0.0
 
 # Output format: "stl", "3mf", or "both"
