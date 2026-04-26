@@ -45,8 +45,18 @@ pub fn parse_pcb<P: AsRef<Path>>(path: P) -> Result<PcbData> {
     let sexp_nodes = sexp::parse_sexp(&content)
         .context("Failed to parse S-expressions from KiCad file")?;
 
-    // Step 3: Extract PCB data from the expression tree
-    let pcb_data = kicad::walk_kicad_tree(&sexp_nodes)
+    // Step 3: Unwrap the kicad_pcb root node to get its direct children.
+    // The file has a single top-level (kicad_pcb ...) wrapper; the actual
+    // design elements (segment, via, gr_line, footprint, …) are its children.
+    let root_children = sexp_nodes
+        .first()
+        .and_then(|n| n.as_list())
+        .filter(|l| l.first().and_then(|n| n.as_atom()) == Some("kicad_pcb"))
+        .map(|l| &l[1..])
+        .ok_or_else(|| anyhow::anyhow!("Not a valid kicad_pcb file: missing root node"))?;
+
+    // Step 4: Extract PCB data from the expression tree
+    let pcb_data = kicad::walk_kicad_tree(root_children)
         .context("Failed to extract PCB design elements")?;
 
     Ok(pcb_data)

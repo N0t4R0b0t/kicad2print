@@ -25,5 +25,7 @@ thiserror = "1.0"
 # 2D/3D math for geometry calculations
 nalgebra = "0.33"
 
-# NOTE: Solid geometry modeling (truck) will be added once we verify the correct crate versions
-# For now, the geometry generation is a placeholder using basic 3D structures
+# 2D polygon boolean ops (union/difference/intersection)
+geo = { version = "0.28", features = ["earcutr"] }
+# Earcut triangulation (also a transitive dep of geo, pinned explicitly for direct use)
+earcutr = "0.4"

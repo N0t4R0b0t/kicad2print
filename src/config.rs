@@ -134,9 +134,9 @@ pub struct Config {
 
     /// Manual scale factor to apply to the entire board.
     ///
-    /// If set to 0 (default), the scale factor is computed automatically to ensure
-    /// that the narrowest trace can fit the configured channel width.
-    /// If set to > 0, that value is used instead.
+    /// Default 0 means 1:1 (true size). Component hole spacing is preserved.
+    /// Setting this to any other value scales the entire model uniformly —
+    /// components will no longer fit at their original positions.
     #[serde(default = "default_scale_factor")]
     pub scale_factor: f64,
 
@@ -260,7 +260,7 @@ impl Config {
         println!("Pad hole diameter:   {:.2} mm", self.pad_hole_diameter_mm);
         println!("Substrate thickness: {:.2} mm", self.substrate_thickness_mm);
         println!("Scale factor:        {}",
-            if self.scale_factor > 0.0 { format!("{:.2}", self.scale_factor) } else { "auto".to_string() }
+            if self.scale_factor > 0.0 { format!("{:.2}x (manual)", self.scale_factor) } else { "1.00x (true size)".to_string() }
         );
         println!("Output format:       {}", self.output_format);
         println!("Output directory:    {}", self.output_dir);

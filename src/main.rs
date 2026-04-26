@@ -39,6 +39,8 @@
 
 mod autoscale;
 mod config;
+mod export;
+mod geometry;
 mod parser;
 mod pcb;
 
@@ -254,14 +256,14 @@ fn main() -> Result<()> {
 
     let scale_factor = autoscale::compute_scale_factor(&pcb_data, &config);
     if args.verbose {
-        println!("   Scale factor: {:.2}x", scale_factor);
+        if (scale_factor - 1.0).abs() > 0.001 {
+            println!("   Scale factor: {:.2}x (manual override)", scale_factor);
+        } else {
+            println!("   Scale factor: 1.00x (true size — component spacing preserved)");
+        }
     }
 
-    // Apply scaling to PCB data if needed
     let _pcb_data = if (scale_factor - 1.0).abs() > 0.001 {
-        if args.verbose {
-            println!("   Applying scaling...");
-        }
         pcb_data.scale(scale_factor)
     } else {
         pcb_data
@@ -272,34 +274,36 @@ fn main() -> Result<()> {
         println!("\n🔧 Generating 3D geometry...");
     }
 
-    // TODO: Implement geometry generation module
-    println!("⚠️  Geometry generation not yet implemented!");
-    println!("   (Next steps: create geometry/ module with substrate, channels, eyelets, pads)");
+    let mesh = geometry::generate_model(&_pcb_data, &config)
+        .context("Failed to generate 3D geometry")?;
+
+    if args.verbose {
+        println!("   Generated {} triangles", mesh.triangle_count());
+    }
 
     // Step 7: Export to files
     if args.verbose {
         println!("\n💾 Exporting to {} format...", config.output_format);
     }
 
-    // TODO: Implement export module
-    println!("⚠️  Export not yet implemented!");
-    println!("   (Next steps: create export/ module with STL and 3MF writers)");
+    let stem = args.input
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("board");
 
-    // Success message
-    println!("\n✅ Processing complete!");
-    println!("   Output files will be in: {}", config.output_dir);
+    let written = export::export(&mesh, stem, &config)
+        .context("Failed to export 3D model")?;
+
+    println!("\n✅ Done! Generated:");
+    for f in &written {
+        println!("   {}", f.display());
+    }
 
     // Open viewer if requested
     if args.view {
-        // Once export is implemented, this will construct the actual output filename
-        // For now, show a note
-        println!("\n💡 Tip: Once export is implemented, use --view to auto-open the generated model");
-
-        // TODO: Once we know the generated filename, construct it here and call:
-        // let output_file = PathBuf::from(&config.output_dir).join("boardname_combined.stl");
-        // if output_file.exists() {
-        //     open_viewer(&output_file);
-        // }
+        if let Some(first) = written.first() {
+            open_viewer(first);
+        }
     }
 
     Ok(())
