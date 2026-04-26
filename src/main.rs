@@ -296,12 +296,20 @@ fn main() -> Result<()> {
 
     println!("\n✅ Done! Generated:");
     for f in &written {
-        println!("   {}", f.display());
+        let label = if f.extension().map(|e| e == "html").unwrap_or(false) {
+            "  🌐 Preview (interactive)"
+        } else {
+            "  📦"
+        };
+        println!("{} {}", label, f.display());
     }
 
-    // Open viewer if requested
+    // Open viewer if requested (prefer HTML preview)
     if args.view {
-        if let Some(first) = written.first() {
+        let html_file = written.iter().find(|f| f.extension().map(|e| e == "html").unwrap_or(false));
+        if let Some(preview) = html_file {
+            open_viewer(preview);
+        } else if let Some(first) = written.first() {
             open_viewer(first);
         }
     }
