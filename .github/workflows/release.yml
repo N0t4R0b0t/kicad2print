@@ -1,0 +1,181 @@
+name: Build & Release
+
+on:
+  push:
+    branches: [master, main]
+    tags: ["v*"]
+  pull_request:
+    branches: [master, main]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            binary: kicad2print
+            asset: kicad2print-linux-x86_64
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            binary: kicad2print.exe
+            asset: kicad2print-windows-x86_64.exe
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set version from tag
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          echo "Setting version to $VERSION"
+          sed -i "s/^version = \"[^\"]*\"/version = \"$VERSION\"/" Cargo.toml
+          # Regenerate lock file entry for the version bump
+          cargo update --precise "$VERSION" kicad2print 2>/dev/null || true
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build release binary
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Rename binary for upload
+        shell: bash
+        run: |
+          cp "target/${{ matrix.target }}/release/${{ matrix.binary }}" \
+             "${{ matrix.asset }}"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: ${{ matrix.asset }}
+          retention-days: 7
+
+  # ── Snapshot release ────────────────────────────────────────────────────────
+  # Publishes a rolling "snapshot" pre-release on every push to the main branch.
+  # Always overwrites the same snapshot tag so there is only ever one snapshot.
+  snapshot:
+    name: Publish snapshot
+    needs: build
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Move binaries flat
+        run: |
+          find artifacts -type f | while read f; do
+            mv "$f" "$(basename "$f")"
+          done
+
+      - name: Delete existing snapshot tag (if any)
+        run: |
+          git push origin :refs/tags/snapshot 2>/dev/null || true
+          git tag -d snapshot 2>/dev/null || true
+
+      - name: Publish snapshot release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: snapshot
+          name: "Snapshot (latest ${{ github.ref_name }}@${{ github.sha }})"
+          body: |
+            **Automated snapshot build** from `${{ github.ref_name }}` — commit `${{ github.sha }}`.
+
+            This release is overwritten on every push to the main branch and is not
+            suitable for production use. For stable releases, see the tagged releases.
+
+            | Platform | File |
+            |---|---|
+            | Linux x86-64 | `kicad2print-linux-x86_64` |
+            | Windows x86-64 | `kicad2print-windows-x86_64.exe` |
+          prerelease: true
+          files: |
+            kicad2print-linux-x86_64
+            kicad2print-windows-x86_64.exe
+
+  # ── Tagged release ───────────────────────────────────────────────────────────
+  # Publishes a proper versioned release when a tag like v1.2.3 is pushed.
+  release:
+    name: Publish release ${{ github.ref_name }}
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Move binaries flat
+        run: |
+          find artifacts -type f | while read f; do
+            mv "$f" "$(basename "$f")"
+          done
+
+      - name: Extract changelog for this version
+        id: changelog
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          echo "VERSION=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: "kicad2print ${{ github.ref_name }}"
+          body: |
+            ## kicad2print ${{ github.ref_name }}
+
+            ### Installation
+
+            Download the binary for your platform below and make it executable:
+
+            **Linux:**
+            ```bash
+            chmod +x kicad2print-linux-x86_64
+            sudo mv kicad2print-linux-x86_64 /usr/local/bin/kicad2print
+            ```
+
+            **Windows:**
+            Download `kicad2print-windows-x86_64.exe` and place it anywhere on your `PATH`.
+
+            ### MCP server (Claude Desktop)
+
+            Add to `claude_desktop_config.json`:
+            ```json
+            "kicad2print": {
+              "command": "/usr/local/bin/kicad2print",
+              "args": ["--mcp"]
+            }
+            ```
+          generate_release_notes: true
+          files: |
+            kicad2print-linux-x86_64
+            kicad2print-windows-x86_64.exe

@@ -174,6 +174,19 @@ impl Pad {
     }
 }
 
+/// A placed component footprint with its reference designator, value, and pad locations.
+#[derive(Debug, Clone)]
+pub struct Footprint {
+    /// Reference designator (e.g. "R1", "C3", "U2")
+    pub reference: String,
+    /// Component value (e.g. "10k", "100nF", "ATmega328P")
+    pub value: String,
+    /// Center position of the footprint on the board
+    pub position: Point2,
+    /// Through-hole pads belonging to this footprint
+    pub pads: Vec<Pad>,
+}
+
 /// Axis-aligned bounding box for the board.
 ///
 /// Used to determine substrate dimensions and for coordinate transformations.
@@ -305,6 +318,9 @@ pub struct PcbData {
 
     /// Component pad through-holes
     pub pads: Vec<Pad>,
+
+    /// Parsed footprints with reference designators, values, and positions
+    pub footprints: Vec<Footprint>,
 }
 
 impl PcbData {
@@ -320,6 +336,12 @@ impl PcbData {
             arc_traces: self.arc_traces.iter().map(|a| a.scale(factor)).collect(),
             vias: self.vias.iter().map(|v| v.scale(factor)).collect(),
             pads: self.pads.iter().map(|p| p.scale(factor)).collect(),
+            footprints: self.footprints.iter().map(|f| Footprint {
+                reference: f.reference.clone(),
+                value: f.value.clone(),
+                position: f.position.scale(factor),
+                pads: f.pads.iter().map(|p| p.scale(factor)).collect(),
+            }).collect(),
         }
     }
 

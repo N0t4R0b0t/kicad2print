@@ -80,6 +80,38 @@ impl std::str::FromStr for OutputFormat {
     }
 }
 
+/// One step in the assembly guide.
+///
+/// Each step names a group of components (by reference designator) and provides
+/// an optional instruction string shown beside the board graphic.
+///
+/// # Example (TOML)
+/// ```toml
+/// [[assembly_steps]]
+/// name = "Install resistors"
+/// components = ["R1", "R2", "R3"]
+/// instruction = "Insert resistors into the board. Bend leads flush to substrate."
+///
+/// [[assembly_steps]]
+/// name = "Lay front-copper wires"
+/// wire_layer = "F.Cu"
+/// instruction = "Lay 30 AWG wire into each highlighted groove on the top surface."
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct AssemblyStep {
+    /// Short name displayed as the step heading
+    pub name: String,
+    /// Reference designators of components highlighted in this step (e.g. ["R1", "R2"])
+    #[serde(default)]
+    pub components: Vec<String>,
+    /// Highlight all traces on this layer ("F.Cu" or "B.Cu")
+    #[serde(default)]
+    pub wire_layer: Option<String>,
+    /// Human-readable instruction text shown in the guide
+    #[serde(default)]
+    pub instruction: String,
+}
+
 /// Main configuration struct for the entire application.
 ///
 /// All values have sensible defaults that work well for typical PCB designs.
@@ -174,6 +206,14 @@ pub struct Config {
     /// Set to false to skip via indents and solder vias directly instead.
     #[serde(default = "default_generate_via_indents")]
     pub generate_via_indents: bool,
+
+    /// Optional assembly guide steps.
+    ///
+    /// When non-empty, kicad2print generates an HTML assembly guide alongside the 3D model.
+    /// Each step highlights specific components or wire layers on an SVG board view.
+    /// If empty, a default guide is auto-generated (components first, then F.Cu wires, then B.Cu wires).
+    #[serde(default)]
+    pub assembly_steps: Vec<AssemblyStep>,
 }
 
 // Default value functions for serde
@@ -206,6 +246,7 @@ impl Default for Config {
             output_dir: default_output_dir(),
             generate_pad_holes: default_generate_pad_holes(),
             generate_via_indents: default_generate_via_indents(),
+            assembly_steps: Vec::new(),
         }
     }
 }

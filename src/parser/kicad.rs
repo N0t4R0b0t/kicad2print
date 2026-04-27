@@ -94,9 +94,9 @@ pub fn walk_kicad_tree(nodes: &[SexpNode]) -> Result<PcbData> {
 
                     // Component footprint (contains pads)
                     "footprint" => {
-                        // Extract pads from footprint
-                        if let Ok(pads) = parse_footprint_pads(node) {
-                            pcb.pads.extend(pads);
+                        if let Ok(fp) = parse_footprint(node) {
+                            pcb.pads.extend(fp.pads.iter().copied());
+                            pcb.footprints.push(fp);
                         }
                     }
 
@@ -283,16 +283,8 @@ fn parse_gr_poly(node: &SexpNode) -> Result<BoardOutline> {
     Ok(BoardOutline::new(vertices))
 }
 
-/// Parses a `(footprint ...)` node to extract all component pads with drills.
-///
-/// A footprint is a group of pads. We iterate through it looking for `(pad ...)` elements.
-/// We only extract pads that have a `(drill ...)` value (through-hole pads),
-/// ignoring SMD pads without holes.
-///
-/// Footprints themselves have a position and rotation that must be applied to pad coordinates.
-fn parse_footprint_pads(node: &SexpNode) -> Result<Vec<Pad>> {
-    let mut pads = Vec::new();
-
+/// Parses a `(footprint ...)` node into a `Footprint` with reference, value, position, and pads.
+fn parse_footprint(node: &SexpNode) -> Result<Footprint> {
     // Read footprint position in raw KiCad coords (Y-down, no negation yet)
     let at_node = node.get_child("at");
     let fp_x = at_node
@@ -313,13 +305,37 @@ fn parse_footprint_pads(node: &SexpNode) -> Result<Vec<Pad>> {
         .unwrap_or(0.0);
     let fp_rot = fp_rot_deg.to_radians();
 
+    let position = Point2::new(fp_x, -fp_y);
+
+    // Extract reference and value from (property "Reference" "R1") nodes
+    let mut reference = String::new();
+    let mut value = String::new();
+
+    if let Some(list) = node.as_list() {
+        for item in list {
+            if let Some(item_list) = item.as_list() {
+                if let Some(tag) = item_list.first().and_then(|n| n.as_atom()) {
+                    if tag == "property" {
+                        let prop_name = item_list.get(1).and_then(|n| n.as_atom()).unwrap_or("");
+                        let prop_val = item_list.get(2).and_then(|n| n.as_atom()).unwrap_or("").to_string();
+                        match prop_name {
+                            "Reference" => reference = prop_val,
+                            "Value" => value = prop_val,
+                            _ => {}
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     // Walk through all pad elements
+    let mut pads = Vec::new();
     if let Some(list) = node.as_list() {
         for item in list {
             if let Some(pad_list) = item.as_list() {
                 if let Some(pad_type) = pad_list.first().and_then(|n| n.as_atom()) {
                     if pad_type == "pad" {
-                        // Extract pad data
                         if let Some(at_node) = item.get_child("at") {
                             // Read pad position in raw KiCad coords (Y-down, no negation)
                             let pad_x = at_node.nth(1)
@@ -364,7 +380,7 @@ fn parse_footprint_pads(node: &SexpNode) -> Result<Vec<Pad>> {
         }
     }
 
-    Ok(pads)
+    Ok(Footprint { reference, value, position, pads })
 }
 
 /// Attempts to chain outline segments into a closed polygon.

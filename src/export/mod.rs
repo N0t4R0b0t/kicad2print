@@ -4,19 +4,21 @@
 
 //! Export orchestration — writes the mesh to STL, 3MF, and HTML preview files.
 
+pub mod assembly;
 pub mod html;
 pub mod stl;
 pub mod threemf;
 
 use crate::config::{Config, OutputFormat};
 use crate::geometry::Mesh3D;
+use crate::pcb::PcbData;
 use anyhow::Result;
 use std::fs;
 use std::path::{Path, PathBuf};
 
 /// Write `mesh` to one or both output formats as configured, plus an HTML preview.
 /// Returns the list of files that were created.
-pub fn export(mesh: &Mesh3D, stem: &str, config: &Config) -> Result<Vec<PathBuf>> {
+pub fn export(mesh: &Mesh3D, pcb: &PcbData, stem: &str, config: &Config) -> Result<Vec<PathBuf>> {
     let out_dir = Path::new(&config.output_dir);
     fs::create_dir_all(out_dir)?;
 
@@ -41,6 +43,11 @@ pub fn export(mesh: &Mesh3D, stem: &str, config: &Config) -> Result<Vec<PathBuf>
     let html_path = out_dir.join(format!("{}_preview.html", stem));
     html::write(mesh, stem, &html_path)?;
     written.push(html_path);
+
+    // Generate assembly guide (always; uses auto steps if none configured)
+    let guide_path = out_dir.join(format!("{}_assembly.html", stem));
+    assembly::write(pcb, &config.assembly_steps, stem, &guide_path)?;
+    written.push(guide_path);
 
     Ok(written)
 }

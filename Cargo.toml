@@ -2,6 +2,11 @@
 name = "kicad2print"
 version = "0.1.0"
 edition = "2021"
+description = "Convert KiCad PCB designs to 3D-printable substrate models; MCP server for Claude Desktop"
+repository = "https://github.com/N0t4R0b0t/kicad2print"
+license = "AGPL-3.0"
+keywords = ["kicad", "pcb", "3d-printing", "mcp"]
+categories = ["command-line-utilities"]
 
 [dependencies]
 # CLI argument parsing with derive macros
@@ -29,3 +34,12 @@ nalgebra = "0.33"
 geo = { version = "0.28", features = ["earcutr"] }
 # Earcut triangulation (also a transitive dep of geo, pinned explicitly for direct use)
 earcutr = "0.4"
+
+# MCP server
+rmcp = { version = "1.5.0", features = ["macros", "schemars", "server", "transport-io"] }
+tokio = { version = "1", features = ["full"] }
+schemars = "0.8"
+
+# PNG rendering for MCP preview
+image = { version = "0.25", default-features = false, features = ["png"] }
+base64 = { version = "0.22", features = [] }

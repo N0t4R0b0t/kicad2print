@@ -45,14 +45,35 @@ mod autoscale;
 mod config;
 mod export;
 mod geometry;
+mod mcp;
 mod parser;
 mod pcb;
+mod render;
 
 use anyhow::{Context, Result};
 use clap::Parser;
 use config::{CliOverrides, Config, EyeletStyle, OutputFormat};
 use std::path::PathBuf;
 use std::process::Command;
+
+/// Main entry point — dispatches to MCP server or CLI based on `--mcp` flag.
+#[tokio::main]
+async fn async_main() -> Result<()> {
+    // If first arg is --mcp, run as MCP server (no other args needed)
+    if std::env::args().any(|a| a == "--mcp") {
+        return mcp::run().await;
+    }
+    cli_main()
+}
+
+fn main() -> Result<()> {
+    // Use tokio only when needed (MCP mode); for CLI skip the async runtime overhead
+    if std::env::args().any(|a| a == "--mcp") {
+        tokio::runtime::Runtime::new()?.block_on(async { mcp::run().await })
+    } else {
+        cli_main()
+    }
+}
 
 /// Command-line arguments for `kicad2print`.
 ///
@@ -211,16 +232,7 @@ fn open_viewer(file_path: &PathBuf) {
     }
 }
 
-/// Main entry point.
-///
-/// This function coordinates the entire pipeline:
-/// 1. Parse command-line arguments
-/// 2. Load and merge configuration
-/// 3. Parse the KiCad PCB file
-/// 4. Calculate scaling factor
-/// 5. Generate 3D geometry
-/// 6. Export to STL/3MF files
-fn main() -> Result<()> {
+fn cli_main() -> Result<()> {
     // Parse command-line arguments
     let args = Args::parse();
 
@@ -305,12 +317,15 @@ fn main() -> Result<()> {
         .and_then(|s| s.to_str())
         .unwrap_or("board");
 
-    let written = export::export(&mesh, stem, &config)
+    let written = export::export(&mesh, &_pcb_data, stem, &config)
         .context("Failed to export 3D model")?;
 
     println!("\n✅ Done! Generated:");
     for f in &written {
-        let label = if f.extension().map(|e| e == "html").unwrap_or(false) {
+        let name = f.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        let label = if name.ends_with("_assembly.html") {
+            "  📋 Assembly guide"
+        } else if f.extension().map(|e| e == "html").unwrap_or(false) {
             "  🌐 Preview (interactive)"
         } else {
             "  📦"
