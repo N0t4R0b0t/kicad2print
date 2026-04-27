@@ -293,19 +293,25 @@ fn parse_gr_poly(node: &SexpNode) -> Result<BoardOutline> {
 fn parse_footprint_pads(node: &SexpNode) -> Result<Vec<Pad>> {
     let mut pads = Vec::new();
 
-    // Get the footprint's own position for relative coordinate translation
-    let footprint_at = node
-        .get_child("at")
-        .and_then(|n| get_xy_point(n))
-        .unwrap_or_else(|| Point2::new(0.0, 0.0));
-
-    // Footprint rotation (simplified: we may ignore or handle later)
-    let _footprint_rot = node
-        .get_child("at")
+    // Read footprint position in raw KiCad coords (Y-down, no negation yet)
+    let at_node = node.get_child("at");
+    let fp_x = at_node
+        .and_then(|n| n.nth(1))
+        .and_then(|n| n.as_atom())
+        .and_then(|s| s.parse::<f64>().ok())
+        .unwrap_or(0.0);
+    let fp_y = at_node
         .and_then(|n| n.nth(2))
         .and_then(|n| n.as_atom())
         .and_then(|s| s.parse::<f64>().ok())
         .unwrap_or(0.0);
+    // Rotation is at index 3 (optional, degrees, CCW in KiCad Y-down view)
+    let fp_rot_deg = at_node
+        .and_then(|n| n.nth(3))
+        .and_then(|n| n.as_atom())
+        .and_then(|s| s.parse::<f64>().ok())
+        .unwrap_or(0.0);
+    let fp_rot = fp_rot_deg.to_radians();
 
     // Walk through all pad elements
     if let Some(list) = node.as_list() {
@@ -315,25 +321,37 @@ fn parse_footprint_pads(node: &SexpNode) -> Result<Vec<Pad>> {
                     if pad_type == "pad" {
                         // Extract pad data
                         if let Some(at_node) = item.get_child("at") {
-                            if let Some(pad_center) = get_xy_point(at_node) {
-                                // Translate pad position by footprint position
-                                let absolute_pos = Point2::new(
-                                    pad_center.x + footprint_at.x,
-                                    pad_center.y + footprint_at.y,
-                                );
+                            // Read pad position in raw KiCad coords (Y-down, no negation)
+                            let pad_x = at_node.nth(1)
+                                .and_then(|n| n.as_atom())
+                                .and_then(|s| s.parse::<f64>().ok())
+                                .unwrap_or(0.0);
+                            let pad_y = at_node.nth(2)
+                                .and_then(|n| n.as_atom())
+                                .and_then(|s| s.parse::<f64>().ok())
+                                .unwrap_or(0.0);
 
-                                // Only include if pad has a drill
-                                if let Some(drill_node) = item.get_child("drill") {
-                                    if let Some(drill_size) = drill_node
-                                        .nth(1)
-                                        .and_then(|n| n.as_atom())
-                                        .and_then(|s| s.parse::<f64>().ok())
-                                    {
-                                        pads.push(Pad {
-                                            center: absolute_pos,
-                                            drill: drill_size,
-                                        });
-                                    }
+                            // Apply footprint rotation in KiCad Y-down space,
+                            // then translate to absolute position,
+                            // then negate Y to convert to standard Y-up.
+                            let rot_x = pad_x * fp_rot.cos() - pad_y * fp_rot.sin();
+                            let rot_y = pad_x * fp_rot.sin() + pad_y * fp_rot.cos();
+                            let absolute_pos = Point2::new(
+                                fp_x + rot_x,
+                                -(fp_y + rot_y),  // Y-up conversion
+                            );
+
+                            // Only include if pad has a drill
+                            if let Some(drill_node) = item.get_child("drill") {
+                                if let Some(drill_size) = drill_node
+                                    .nth(1)
+                                    .and_then(|n| n.as_atom())
+                                    .and_then(|s| s.parse::<f64>().ok())
+                                {
+                                    pads.push(Pad {
+                                        center: absolute_pos,
+                                        drill: drill_size,
+                                    });
                                 }
                             }
                         }
