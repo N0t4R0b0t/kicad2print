@@ -331,11 +331,14 @@ fn parse_footprint_pads(node: &SexpNode) -> Result<Vec<Pad>> {
                                 .and_then(|s| s.parse::<f64>().ok())
                                 .unwrap_or(0.0);
 
-                            // Apply footprint rotation in KiCad Y-down space,
-                            // then translate to absolute position,
-                            // then negate Y to convert to standard Y-up.
-                            let rot_x = pad_x * fp_rot.cos() - pad_y * fp_rot.sin();
-                            let rot_y = pad_x * fp_rot.sin() + pad_y * fp_rot.cos();
+                            // Apply footprint rotation in KiCad Y-down space.
+                            // KiCad uses CCW-positive in its Y-down view, which in
+                            // Y-down coordinates uses the opposite sin sign vs standard
+                            // Y-up math (flipping Y reverses rotation handedness).
+                            // CCW in KiCad Y-down: x' = x*cos - y*(-sin) = x*cos + y*sin
+                            //                      y' = x*(-sin) + y*cos = -x*sin + y*cos
+                            let rot_x = pad_x * fp_rot.cos() + pad_y * fp_rot.sin();
+                            let rot_y = -pad_x * fp_rot.sin() + pad_y * fp_rot.cos();
                             let absolute_pos = Point2::new(
                                 fp_x + rot_x,
                                 -(fp_y + rot_y),  // Y-up conversion
