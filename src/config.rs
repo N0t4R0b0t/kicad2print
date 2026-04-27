@@ -122,10 +122,15 @@ pub struct Config {
     #[serde(default = "default_indent_depth")]
     pub indent_depth_mm: f64,
 
-    /// Diameter of component pad through-holes.
+    /// Minimum diameter of component pad through-holes.
     ///
-    /// Should be slightly larger than the component lead diameter.
-    /// Default: 0.8 mm (good for standard component leads)
+    /// Each pad uses its own drill size from the KiCad design (preserving
+    /// the correct hole size for each component — e.g. 1.0mm for D-Sub pins,
+    /// 3.2mm for mounting holes, 0.8mm for IC pins).
+    ///
+    /// This config sets a MINIMUM hole diameter — used for pads that have
+    /// missing or unrealistically small drill values.
+    /// Default: 0.8 mm
     #[serde(default = "default_pad_hole_diameter")]
     pub pad_hole_diameter_mm: f64,
 

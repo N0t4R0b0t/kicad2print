@@ -146,9 +146,10 @@ pub fn generate_model(pcb: &PcbData, config: &Config) -> Result<Mesh3D> {
     let fcu = union_traces(&pcb.traces_fcu, chan_w);
     let bcu = union_traces(&pcb.traces_bcu, chan_w);
 
-    // Pad holes: only if enabled
+    // Pad holes: each pad uses its own drill size from KiCad.
+    // hole_r serves as a minimum (in case a pad has a tiny or missing drill value).
     let holes = if config.generate_pad_holes {
-        union_circles(&pcb.pads, hole_r, 16)
+        union_pad_holes(&pcb.pads, hole_r, 16)
     } else {
         MultiPolygon::new(vec![])
     };
@@ -184,16 +185,19 @@ pub fn generate_model(pcb: &PcbData, config: &Config) -> Result<Mesh3D> {
 
     // ── Pad through-hole cylinder walls ────────────────────────────────────
     if config.generate_pad_holes {
-        // Only include pads that are inside the board outline
-        let outline_polygon = &outline_to_geo(outline);
+        let tol = 0.5;
         let pads_inside: Vec<_> = pcb
             .pads
             .iter()
             .filter(|pad| {
-                use geo::Contains;
-                outline_polygon.contains(&Coord { x: pad.center.x, y: pad.center.y })
+                pad.center.x >= outline.bbox.min_x - tol
+                    && pad.center.x <= outline.bbox.max_x + tol
+                    && pad.center.y >= outline.bbox.min_y - tol
+                    && pad.center.y <= outline.bbox.max_y + tol
             })
             .collect();
+
+
         add_pad_walls(&mut mesh, &pads_inside, hole_r, &ctx, 0.0, thickness, 16);
     }
 
@@ -287,6 +291,19 @@ fn union_traces(traces: &[Trace], channel_width: f64) -> MultiPolygon {
 
 fn union_circles(pads: &[Pad], radius: f64, sides: usize) -> MultiPolygon {
     union_polys(pads.iter().map(|p| circle_poly(&p.center, radius, sides)).collect())
+}
+
+/// Union of pad hole circles, using each pad's own drill diameter (from KiCad).
+/// `min_radius` is a floor in case a pad has a missing or unrealistically small drill.
+fn union_pad_holes(pads: &[Pad], min_radius: f64, sides: usize) -> MultiPolygon {
+    union_polys(
+        pads.iter()
+            .map(|p| {
+                let r = (p.drill / 2.0).max(min_radius);
+                circle_poly(&p.center, r, sides)
+            })
+            .collect(),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -464,10 +481,11 @@ fn push_ring(ring: &geo::LineString, verts: &mut Vec<f64>) {
 }
 
 /// Cylinder walls for each pad through-hole (inward-facing normals).
+/// Each pad uses its own drill diameter from KiCad. `min_radius` is a floor.
 fn add_pad_walls(
     mesh: &mut Mesh3D,
     pads: &[&Pad],
-    radius: f64,
+    min_radius: f64,
     ctx: &Ctx,
     z0: f32,
     z1: f32,
@@ -475,6 +493,7 @@ fn add_pad_walls(
 ) {
     use std::f64::consts::PI;
     for pad in pads {
+        let radius = (pad.drill / 2.0).max(min_radius);
         for i in 0..sides {
             let a0 = 2.0 * PI * i as f64 / sides as f64;
             let a1 = 2.0 * PI * (i + 1) as f64 / sides as f64;
