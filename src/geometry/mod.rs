@@ -145,15 +145,29 @@ pub fn generate_model(pcb: &PcbData, config: &Config) -> Result<Mesh3D> {
     // Boolean unions for each feature type
     let fcu = union_traces(&pcb.traces_fcu, chan_w);
     let bcu = union_traces(&pcb.traces_bcu, chan_w);
-    let holes = union_circles(&pcb.pads, hole_r, 16);
+
+    // Pad holes: only if enabled
+    let holes = if config.generate_pad_holes {
+        union_circles(&pcb.pads, hole_r, 16)
+    } else {
+        MultiPolygon::new(vec![])
+    };
+
+    // Via indent guides: only if enabled
+    let via_indents = if config.generate_via_indents {
+        let via_r = config.eyelet_diameter_mm / 2.0;
+        union_circles(&pcb.vias.iter().map(|v| Pad { center: v.center, drill: config.eyelet_diameter_mm }).collect::<Vec<_>>(), via_r, 16)
+    } else {
+        MultiPolygon::new(vec![])
+    };
 
     // ── Top face (z = thickness, normal +Z) ────────────────────────────────
-    // Board outline minus F.Cu channel openings minus pad holes
-    let top_face = board_mp.difference(&fcu).difference(&holes);
+    // Board outline minus F.Cu channel openings minus pad holes minus via indents
+    let top_face = board_mp.difference(&fcu).difference(&holes).difference(&via_indents);
     add_flat(&mut mesh, &top_face, &ctx, thickness, true);
 
     // ── Bottom face (z = 0, normal −Z) ─────────────────────────────────────
-    let bot_face = board_mp.difference(&bcu).difference(&holes);
+    let bot_face = board_mp.difference(&bcu).difference(&holes).difference(&via_indents);
     add_flat(&mut mesh, &bot_face, &ctx, 0.0, false);
 
     // ── Side walls (z = 0 → thickness) ─────────────────────────────────────
@@ -169,17 +183,29 @@ pub fn generate_model(pcb: &PcbData, config: &Config) -> Result<Mesh3D> {
     add_channel(&mut mesh, &bcu_clip, &ctx, chan_depth, 0.0, false);
 
     // ── Pad through-hole cylinder walls ────────────────────────────────────
-    // Only include pads that are inside the board outline
-    let outline_polygon = &outline_to_geo(outline);
-    let pads_inside: Vec<_> = pcb
-        .pads
-        .iter()
-        .filter(|pad| {
-            use geo::Contains;
-            outline_polygon.contains(&Coord { x: pad.center.x, y: pad.center.y })
-        })
-        .collect();
-    add_pad_walls(&mut mesh, &pads_inside, hole_r, &ctx, 0.0, thickness, 16);
+    if config.generate_pad_holes {
+        // Only include pads that are inside the board outline
+        let outline_polygon = &outline_to_geo(outline);
+        let pads_inside: Vec<_> = pcb
+            .pads
+            .iter()
+            .filter(|pad| {
+                use geo::Contains;
+                outline_polygon.contains(&Coord { x: pad.center.x, y: pad.center.y })
+            })
+            .collect();
+        add_pad_walls(&mut mesh, &pads_inside, hole_r, &ctx, 0.0, thickness, 16);
+    }
+
+    // ── Via eyelet indent guides ──────────────────────────────────────────
+    if config.generate_via_indents && !pcb.vias.is_empty() {
+        let via_r = config.eyelet_diameter_mm / 2.0;
+        let indent_d = config.indent_depth_mm as f32;
+        // Top indent dimples
+        add_via_indents(&mut mesh, &pcb.vias, via_r, &ctx, thickness, indent_d, 16);
+        // Bottom indent dimples
+        add_via_indents(&mut mesh, &pcb.vias, via_r, &ctx, 0.0, indent_d, 16);
+    }
 
     Ok(mesh)
 }
@@ -387,6 +413,39 @@ fn add_ring_walls<'a>(
             // Outward normals: right-of-travel (reversed)
             mesh.tri(af, bf, bo);
             mesh.tri(af, bo, ao);
+        }
+    }
+}
+
+/// Shallow indent dimples at via locations (guide marks for eyelets).
+fn add_via_indents(
+    mesh: &mut Mesh3D,
+    vias: &[crate::pcb::Via],
+    radius: f64,
+    ctx: &Ctx,
+    z_surface: f32,
+    indent_depth: f32,
+    sides: usize,
+) {
+    use std::f64::consts::PI;
+    let z_floor = z_surface - indent_depth;
+
+    for via in vias {
+        let cx = via.center.x;
+        let cy = via.center.y;
+        for i in 0..sides {
+            let a0 = 2.0 * PI * i as f64 / sides as f64;
+            let a1 = 2.0 * PI * (i + 1) as f64 / sides as f64;
+            let x0 = cx + radius * a0.cos();
+            let y0 = cy + radius * a0.sin();
+            let x1 = cx + radius * a1.cos();
+            let y1 = cy + radius * a1.sin();
+            let p00 = ctx.v(x0, y0, z_surface);
+            let p10 = ctx.v(x1, y1, z_surface);
+            let pf1 = ctx.v(x1, y1, z_floor);
+            let pf0 = ctx.v(x0, y0, z_floor);
+            mesh.tri(p00, p10, pf0);
+            mesh.tri(p10, pf1, pf0);
         }
     }
 }

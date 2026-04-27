@@ -155,6 +155,20 @@ pub struct Config {
     /// Default: "./output" (created if it doesn't exist)
     #[serde(default = "default_output_dir")]
     pub output_dir: String,
+
+    /// Whether to generate through-holes for component pads.
+    ///
+    /// Default: true (generate pad holes for eyelets)
+    /// Set to false for rapid prototyping where you'll solder directly to component legs.
+    #[serde(default = "default_generate_pad_holes")]
+    pub generate_pad_holes: bool,
+
+    /// Whether to generate indent guides for vias/eyelets.
+    ///
+    /// Default: true (generate via indent guides)
+    /// Set to false to skip via indents and solder vias directly instead.
+    #[serde(default = "default_generate_via_indents")]
+    pub generate_via_indents: bool,
 }
 
 // Default value functions for serde
@@ -168,6 +182,8 @@ fn default_substrate_thickness() -> f64 { 3.0 }
 fn default_scale_factor() -> f64 { 0.0 }
 fn default_output_format() -> OutputFormat { OutputFormat::Stl }
 fn default_output_dir() -> String { "./output".to_string() }
+fn default_generate_pad_holes() -> bool { true }
+fn default_generate_via_indents() -> bool { true }
 
 impl Default for Config {
     /// Creates a config with all default values.
@@ -183,6 +199,8 @@ impl Default for Config {
             scale_factor: default_scale_factor(),
             output_format: default_output_format(),
             output_dir: default_output_dir(),
+            generate_pad_holes: default_generate_pad_holes(),
+            generate_via_indents: default_generate_via_indents(),
         }
     }
 }
@@ -249,6 +267,12 @@ impl Config {
         if overrides.output_dir.is_some() {
             self.output_dir = overrides.output_dir.as_ref().unwrap().clone();
         }
+        if overrides.generate_pad_holes.is_some() {
+            self.generate_pad_holes = overrides.generate_pad_holes.unwrap();
+        }
+        if overrides.generate_via_indents.is_some() {
+            self.generate_via_indents = overrides.generate_via_indents.unwrap();
+        }
     }
 
     /// Prints the current configuration to stdout.
@@ -268,6 +292,8 @@ impl Config {
         );
         println!("Output format:       {}", self.output_format);
         println!("Output directory:    {}", self.output_dir);
+        println!("Generate pad holes:  {}", if self.generate_pad_holes { "yes" } else { "no" });
+        println!("Generate via indents: {}", if self.generate_via_indents { "yes" } else { "no" });
     }
 }
 
@@ -287,4 +313,6 @@ pub struct CliOverrides {
     pub scale_factor: Option<f64>,
     pub output_format: Option<OutputFormat>,
     pub output_dir: Option<String>,
+    pub generate_pad_holes: Option<bool>,
+    pub generate_via_indents: Option<bool>,
 }

@@ -125,6 +125,14 @@ struct Args {
     /// Open the generated model in a 3D viewer after conversion
     #[arg(long)]
     view: bool,
+
+    /// Disable component pad through-holes (for rapid prototyping)
+    #[arg(long)]
+    no_pad_holes: bool,
+
+    /// Disable via/eyelet indent guides
+    #[arg(long)]
+    no_via_indents: bool,
 }
 
 impl Args {
@@ -158,6 +166,8 @@ impl Args {
             scale_factor: self.scale,
             output_format,
             output_dir: self.output_dir.clone(),
+            generate_pad_holes: if self.no_pad_holes { Some(false) } else { None },
+            generate_via_indents: if self.no_via_indents { Some(false) } else { None },
         })
     }
 }
