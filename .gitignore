@@ -1,1 +1,5 @@
 /target
+/output
+*.stl
+*.3mf
+*_preview.html
