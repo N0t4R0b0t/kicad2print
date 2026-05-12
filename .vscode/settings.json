@@ -1,0 +1,51 @@
+{
+  // Rust analyzer
+  "rust-analyzer.cargo.features": "all",
+  "rust-analyzer.checkOnSave.command": "clippy",
+  "rust-analyzer.checkOnSave.extraArgs": ["--", "-W", "clippy::all"],
+  "rust-analyzer.inlayHints.parameterHints.enable": true,
+  "rust-analyzer.inlayHints.typeHints.enable": true,
+  "rust-analyzer.inlayHints.closureReturnTypeHints.enable": "always",
+  "rust-analyzer.lens.enable": true,
+  "rust-analyzer.lens.run.enable": true,
+  "rust-analyzer.lens.debug.enable": true,
+
+  // Editor
+  "editor.formatOnSave": true,
+  "editor.defaultFormatter": "rust-lang.rust-analyzer",
+  "[rust]": {
+    "editor.defaultFormatter": "rust-lang.rust-analyzer",
+    "editor.formatOnSave": true,
+    "editor.tabSize": 4
+  },
+  "[toml]": {
+    "editor.formatOnSave": false
+  },
+
+  // Files
+  "files.watcherExclude": {
+    "**/target/**": true
+  },
+  "files.exclude": {
+    "**/target": false
+  },
+  "search.exclude": {
+    "**/target": true
+  },
+
+  // Terminal — use bash on Linux, PowerShell on Windows
+  "terminal.integrated.defaultProfile.linux": "bash",
+  "terminal.integrated.defaultProfile.windows": "PowerShell",
+
+  // KiCad S-expression files — treat as text with bracket matching
+  "files.associations": {
+    "*.kicad_pcb": "plaintext",
+    "*.kicad_sch": "plaintext",
+    "*.kicad_sym": "plaintext",
+    "*.kicad_mod": "plaintext",
+    "*.kicad_pro": "json"
+  },
+
+  // Show problems inline
+  "problems.showCurrentInStatus": true
+}

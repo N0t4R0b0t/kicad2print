@@ -1,0 +1,120 @@
+# kicad2print Configuration File
+#
+# This is the default configuration for kicad2print.
+# Copy this to your project directory and modify as needed.
+#
+# All dimensions are in millimeters.
+
+# ============================================================================
+# TRACE CHANNEL CONFIGURATION
+# ============================================================================
+#
+# These settings control how the copper wire traces will fit into the
+# 3D-printed substrate.
+
+# Width of the groove channels that will hold copper wire traces
+#
+# Recommended values:
+#   - 30 AWG Kynar wire: 1.0-1.2 mm
+#   - 28 AWG Kynar wire: 1.2-1.5 mm
+#   - 24 AWG wire:       1.5-2.0 mm
+channel_width_mm = 1.2
+
+# Depth of the groove channels below the substrate surface
+#
+# A deeper channel provides better mechanical support for the wire but
+# makes printing more time-intensive. Typical range: 0.4-0.8 mm
+channel_depth_mm = 0.5
+
+
+# ============================================================================
+# VIA / EYELET CONFIGURATION
+# ============================================================================
+#
+# These settings control how via holes are represented in the printed model.
+
+# Via style: how eyelets are represented
+#
+#   "hole"   - Full through-holes that you can drill with a drill press
+#              after printing. Allows drilling to exact diameter needed.
+#              Slightly longer print time but more flexible.
+#
+#   "indent" - Shallow dimples on top and bottom to guide copper eyelets
+#              (like a drilling jig). No post-print drilling needed.
+#              Faster printing, less flexible.
+#
+# Recommendation: Use "indent" for faster printing and assembly.
+eyelet_style = "indent"
+
+# Diameter of via holes or indent dimples (millimeters)
+#
+# Should match the size of your copper eyelets:
+#   - M0.9 eyelets (smaller):   0.9 mm
+#   - M1.3 eyelets (standard):  1.3 mm
+#   - M2.0 eyelets (larger):    2.0 mm
+#
+# If using "hole" style with a drill press, use a slightly larger value
+# (e.g., 1.5 for M1.3 eyelets) to be conservative.
+eyelet_diameter_mm = 1.5
+
+# Depth of shallow indent dimples (only used when eyelet_style = "indent")
+#
+# Typical range: 0.2-0.4 mm
+#   - Shallower (0.2mm): easier to print, less precise
+#   - Deeper (0.4mm):    harder to print, better eyelet guidance
+indent_depth_mm = 0.3
+
+
+# ============================================================================
+# COMPONENT PAD CONFIGURATION
+# ============================================================================
+
+# Diameter of component pad through-holes (millimeters)
+#
+# Should be slightly larger than the component leads:
+#   - Small resistor leads (0.6mm):  0.7-0.8 mm
+#   - Standard component leads:      0.8-1.0 mm
+#   - Larger component leads:        1.0-1.2 mm
+#
+# Too tight: components hard to insert
+# Too loose: components wobble around
+pad_hole_diameter_mm = 0.8
+
+
+# ============================================================================
+# BOARD CONFIGURATION
+# ============================================================================
+
+# Total thickness of the printed substrate (millimeters)
+#
+# Typical range: 2.5-4.0 mm
+#   - Thinner (2.5mm):   faster print, less rigid
+#   - Thicker (4.0mm):   slower print, more rigid
+#
+# With PLA @ 0.2mm layer height: 3mm = ~15 layers
+substrate_thickness_mm = 3.0
+
+# Manual scale factor for the entire board
+#
+# If 0: automatically scale to fit traces into channels (recommended)
+# If > 0: use this exact scale factor (1.0 = 1:1 scale, 2.0 = 2x larger, etc.)
+#
+# Auto-scaling is recommended unless you have a specific size requirement.
+scale_factor = 0.0
+
+
+# ============================================================================
+# OUTPUT CONFIGURATION
+# ============================================================================
+
+# Output format(s)
+#
+#   "stl"  - Binary STL (most compatible with slicers)
+#   "3mf"  - 3MF format (modern, supports colors)
+#   "both" - Generate both STL and 3MF files
+output_format = "stl"
+
+# Output directory where files will be written
+#
+# Will be created if it doesn't exist
+output_dir = "./output"

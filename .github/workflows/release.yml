@@ -1,0 +1,285 @@
+name: Build & Release
+
+on:
+  push:
+    branches: [master, main]
+    tags: ["v*"]
+  pull_request:
+    branches: [master, main]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Git tag to build from (e.g. v1.2.3). Leave blank to build a snapshot from HEAD."
+        required: false
+
+env:
+  CARGO_TERM_COLOR: always
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  # ── Cleanup ──────────────────────────────────────────────────────────────────
+  # Deletes stale artifacts and old releases so the repo stays tidy.
+  # Skipped on pull requests.
+  cleanup:
+    name: Cleanup old artifacts & releases
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      actions: write
+
+    steps:
+      - name: Delete all workflow artifacts
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "Deleting all workflow artifacts..."
+          gh api repos/${{ github.repository }}/actions/artifacts \
+            --paginate -q '.artifacts[].id' | while read artifact_id; do
+            echo "Deleting artifact $artifact_id"
+            gh api repos/${{ github.repository }}/actions/artifacts/$artifact_id -X DELETE
+          done
+          echo "All artifacts deleted"
+
+      - name: Delete old releases (keep latest versioned + snapshot)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TARGET_TAG: ${{ inputs.tag }}
+        run: |
+          RELEASES=$(gh release list --repo ${{ github.repository }} --limit 100 --json tagName,isPrerelease)
+
+          if [ -z "$RELEASES" ] || [ "$RELEASES" = "[]" ]; then
+            echo "No releases found"
+            exit 0
+          fi
+
+          LATEST_TAG=$(echo "$RELEASES" | jq -r '.[] | select(.isPrerelease == false) | .tagName' | head -1)
+          SNAPSHOT_TAG=$(echo "$RELEASES" | jq -r '.[] | select(.isPrerelease == true) | .tagName' | head -1)
+
+          if [[ -n "$TARGET_TAG" ]]; then
+            LATEST_TAG="$TARGET_TAG"
+          fi
+
+          echo "Keeping: tag=[$LATEST_TAG] snapshot=[$SNAPSHOT_TAG]"
+
+          echo "$RELEASES" | jq -r '.[] | .tagName' | while read tag; do
+            [ -n "$tag" ] || continue
+            if [[ "$tag" != "$LATEST_TAG" && "$tag" != "$SNAPSHOT_TAG" ]]; then
+              echo "Deleting release $tag"
+              gh release delete "$tag" --yes --cleanup-tag --repo ${{ github.repository }}
+            fi
+          done
+          echo "Cleanup complete"
+
+  # ── Build ────────────────────────────────────────────────────────────────────
+  build:
+    name: Build (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    needs: [cleanup]
+    if: always() && (needs.cleanup.result == 'success' || needs.cleanup.result == 'skipped')
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            binary: kicad2print
+            asset: kicad2print-linux-x86_64
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            binary: kicad2print.exe
+            asset: kicad2print-windows-x86_64.exe
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - name: Set version from tag
+        if: startsWith(github.ref, 'refs/tags/v') || inputs.tag != ''
+        shell: bash
+        run: |
+          VERSION="${{ inputs.tag != '' && inputs.tag || github.ref_name }}"
+          VERSION="${VERSION#v}"
+          echo "Setting version to $VERSION"
+          sed -i "s/^version = \"[^\"]*\"/version = \"$VERSION\"/" Cargo.toml
+          cargo update --precise "$VERSION" kicad2print 2>/dev/null || true
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build release binary
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Rename binary for upload
+        shell: bash
+        run: |
+          cp "target/${{ matrix.target }}/release/${{ matrix.binary }}" \
+             "${{ matrix.asset }}"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: ${{ matrix.asset }}
+          retention-days: 7
+
+  # ── Snapshot release ─────────────────────────────────────────────────────────
+  # Publishes a rolling "snapshot" pre-release on every push to the main branch,
+  # or when workflow_dispatch is triggered without a tag.
+  # Binaries are served from Cloudflare R2; GitHub release carries notes only.
+  snapshot:
+    name: Publish snapshot
+    needs: build
+    if: |
+      (github.event_name == 'push' && (github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main')) ||
+      (github.event_name == 'workflow_dispatch' && inputs.tag == '')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Move binaries flat
+        run: |
+          find artifacts -type f | while read f; do
+            mv "$f" "$(basename "$f")"
+          done
+
+      - name: Upload binaries to R2 (snapshot/)
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
+          R2_ENDPOINT: https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
+        run: |
+          aws s3 cp kicad2print-linux-x86_64 \
+            s3://${{ secrets.R2_BUCKET }}/snapshot/kicad2print-linux-x86_64 \
+            --endpoint-url "$R2_ENDPOINT" --no-progress
+          aws s3 cp kicad2print-windows-x86_64.exe \
+            s3://${{ secrets.R2_BUCKET }}/snapshot/kicad2print-windows-x86_64.exe \
+            --endpoint-url "$R2_ENDPOINT" --no-progress
+
+      - name: Delete existing snapshot release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release delete snapshot --yes --cleanup-tag 2>/dev/null || true
+
+      - name: Publish snapshot release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: snapshot
+          name: "Snapshot (latest ${{ github.ref_name }}@${{ github.sha }})"
+          prerelease: true
+          body: |
+            **Automated snapshot build** from `${{ github.ref_name }}` — commit `${{ github.sha }}`.
+
+            This release is overwritten on every push to the main branch and is not
+            suitable for production use. For stable releases, see the tagged releases.
+
+            | Platform | Download |
+            |---|---|
+            | Linux x86-64 | [${{ secrets.CDN_BASE_URL }}/snapshot/kicad2print-linux-x86_64](${{ secrets.CDN_BASE_URL }}/snapshot/kicad2print-linux-x86_64) |
+            | Windows x86-64 | [${{ secrets.CDN_BASE_URL }}/snapshot/kicad2print-windows-x86_64.exe](${{ secrets.CDN_BASE_URL }}/snapshot/kicad2print-windows-x86_64.exe) |
+
+  # ── Tagged release ────────────────────────────────────────────────────────────
+  # Publishes a proper versioned release when a v* tag is pushed,
+  # or when workflow_dispatch is triggered with a specific tag.
+  # Binaries are uploaded to R2 under /{version}/ and /latest/.
+  release:
+    name: Publish release ${{ inputs.tag || github.ref_name }}
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.tag != '')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Move binaries flat
+        run: |
+          find artifacts -type f | while read f; do
+            mv "$f" "$(basename "$f")"
+          done
+
+      - name: Resolve version slug
+        id: ver
+        run: |
+          VERSION="${{ inputs.tag || github.ref_name }}"
+          echo "slug=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Upload binaries to R2 (versioned + latest)
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
+          R2_ENDPOINT: https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
+          VERSION: ${{ steps.ver.outputs.slug }}
+        run: |
+          for asset in kicad2print-linux-x86_64 kicad2print-windows-x86_64.exe; do
+            aws s3 cp "$asset" \
+              "s3://${{ secrets.R2_BUCKET }}/${VERSION}/${asset}" \
+              --endpoint-url "$R2_ENDPOINT" --no-progress
+            aws s3 cp "$asset" \
+              "s3://${{ secrets.R2_BUCKET }}/latest/${asset}" \
+              --endpoint-url "$R2_ENDPOINT" --no-progress
+          done
+
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.ver.outputs.slug }}
+          name: "kicad2print ${{ steps.ver.outputs.slug }}"
+          generate_release_notes: true
+          body: |
+            ## kicad2print ${{ steps.ver.outputs.slug }}
+
+            ### Installation
+
+            **Linux:**
+            ```bash
+            curl -fsSL ${{ secrets.CDN_BASE_URL }}/latest/kicad2print-linux-x86_64 \
+              -o kicad2print
+            chmod +x kicad2print
+            sudo mv kicad2print /usr/local/bin/kicad2print
+            ```
+
+            **Windows** — download and place on your `PATH`:
+            ```
+            ${{ secrets.CDN_BASE_URL }}/latest/kicad2print-windows-x86_64.exe
+            ```
+
+            | Platform | Versioned | Latest |
+            |---|---|---|
+            | Linux x86-64 | [`${{ steps.ver.outputs.slug }}/kicad2print-linux-x86_64`](${{ secrets.CDN_BASE_URL }}/${{ steps.ver.outputs.slug }}/kicad2print-linux-x86_64) | [`latest/kicad2print-linux-x86_64`](${{ secrets.CDN_BASE_URL }}/latest/kicad2print-linux-x86_64) |
+            | Windows x86-64 | [`${{ steps.ver.outputs.slug }}/kicad2print-windows-x86_64.exe`](${{ secrets.CDN_BASE_URL }}/${{ steps.ver.outputs.slug }}/kicad2print-windows-x86_64.exe) | [`latest/kicad2print-windows-x86_64.exe`](${{ secrets.CDN_BASE_URL }}/latest/kicad2print-windows-x86_64.exe) |
+
+            ### MCP server (Claude Desktop)
+
+            Add to `claude_desktop_config.json`:
+            ```json
+            "kicad2print": {
+              "command": "/usr/local/bin/kicad2print",
+              "args": ["--mcp"]
+            }
+            ```

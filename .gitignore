@@ -1,0 +1,23 @@
+# Rust
+/target
+/output
+
+# Generated files
+*.stl
+*.3mf
+*_preview.html
+
+# Keep example files
+!examples/**/*.stl
+!examples/**/*.3mf
+.mcp.json
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Logs
+logs/
+*.log
+.claude/

@@ -1,0 +1,50 @@
+[package]
+name = "kicad2print"
+version = "1.0.0"
+edition = "2021"
+description = "Convert KiCad PCB designs to 3D-printable substrate models; MCP server for Claude Desktop"
+repository = "https://github.com/N0t4R0b0t/kicad2print"
+license = "AGPL-3.0"
+keywords = ["kicad", "pcb", "3d-printing", "mcp"]
+categories = ["command-line-utilities"]
+
+[dependencies]
+# CLI argument parsing with derive macros
+clap = { version = "4.5", features = ["derive"] }
+
+# Configuration: TOML parsing + serialization
+serde = { version = "1.0", features = ["derive"] }
+toml = "0.8"
+
+# S-expression parsing for KiCad files
+nom = "7.1"
+
+# 3MF output (ZIP + XML)
+zip = "2.1"
+quick-xml = { version = "0.36", features = ["serialize"] }
+
+# Error handling with context
+anyhow = "1.0"
+thiserror = "1.0"
+
+# 2D/3D math for geometry calculations
+nalgebra = "0.33"
+
+# 2D polygon boolean ops (union/difference/intersection)
+geo = { version = "0.28", features = ["earcutr"] }
+# Earcut triangulation (also a transitive dep of geo, pinned explicitly for direct use)
+earcutr = "0.4"
+
+# (removed clipper fallback)
+
+# MCP server
+rmcp = { version = "1.5.0", features = ["macros", "schemars", "server", "transport-io"] }
+tokio = { version = "1", features = ["full"] }
+schemars = "0.8"
+
+# PNG rendering for MCP preview
+image = { version = "0.25", default-features = false, features = ["png"] }
+base64 = { version = "0.22", features = [] }
+
+# JSON parsing for DRC output and pcbnew subprocess IPC
+serde_json = "1.0"

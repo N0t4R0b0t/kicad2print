@@ -1,0 +1,57 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Debug CLI (convert)",
+      "type": "lldb",
+      "request": "launch",
+      "cargo": {
+        "args": ["build", "--bin=kicad2print"],
+        "filter": {
+          "name": "kicad2print",
+          "kind": "bin"
+        }
+      },
+      "args": ["${input:pcbFile}"],
+      "cwd": "${workspaceFolder}",
+      "env": {}
+    },
+    {
+      "name": "Debug MCP server (stdio)",
+      "type": "lldb",
+      "request": "launch",
+      "cargo": {
+        "args": ["build", "--bin=kicad2print"],
+        "filter": {
+          "name": "kicad2print",
+          "kind": "bin"
+        }
+      },
+      "args": ["--mcp"],
+      "cwd": "${workspaceFolder}",
+      "env": {}
+    },
+    {
+      "name": "Run tests",
+      "type": "lldb",
+      "request": "launch",
+      "cargo": {
+        "args": ["test", "--no-run"],
+        "filter": {
+          "name": "kicad2print",
+          "kind": "bin"
+        }
+      },
+      "args": [],
+      "cwd": "${workspaceFolder}"
+    }
+  ],
+  "inputs": [
+    {
+      "id": "pcbFile",
+      "type": "promptString",
+      "description": "Path to .kicad_pcb file",
+      "default": "example.kicad_pcb"
+    }
+  ]
+}
