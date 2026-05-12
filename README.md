@@ -6,9 +6,9 @@ Convert KiCad PCB designs into 3D-printable substrate models for the **hybrid PC
 
 | 3D Substrate Preview | Assembly Guide |
 |:---:|:---:|
-| [![3D substrate preview](examples/ps2-serial-mouse-adapter/preview.png)](https://github.com/N0t4R0b0t/kicad2print/blob/master/examples/ps2-serial-mouse-adapter/ps2-serial-mouse-adapter.stl) | [![Assembly guide](examples/ps2-serial-mouse-adapter/assembly.png)](https://github.com/N0t4R0b0t/kicad2print/blob/master/examples/ps2-serial-mouse-adapter/ps2-serial-mouse-adapter.stl) |
+| [![3D substrate preview](examples/ps2-serial-mouse-adapter/assembly.png)](https://github.com/N0t4R0b0t/kicad2print/blob/master/examples/ps2-serial-mouse-adapter/ps2-serial-mouse-adapter.stl) | [![Assembly guide](examples/ps2-serial-mouse-adapter/preview.png)](https://github.com/N0t4R0b0t/kicad2print/blob/master/examples/ps2-serial-mouse-adapter/preview.png) |
 
-*Example: [ps2-serial-mouse-adapter](https://github.com/N0t4R0b0t/ps2-serial-mouse-adapter) — a fork of [necroware/ps2-serial-mouse-adapter](https://github.com/necroware/ps2-serial-mouse-adapter). Both images link to the interactive 3D viewer.*
+*Example: [ps2-serial-mouse-adapter](https://github.com/N0t4R0b0t/ps2-serial-mouse-adapter) — a fork of [necroware/ps2-serial-mouse-adapter](https://github.com/necroware/ps2-serial-mouse-adapter). Substrate preview links to the interactive 3D viewer.*
 
 ---
 
