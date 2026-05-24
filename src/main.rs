@@ -52,7 +52,7 @@ mod render;
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use config::{CliOverrides, Config, EyeletStyle, OutputFormat};
+use config::{CliOverrides, Config, EyeletStyle, Mode, OutputFormat};
 use std::path::PathBuf;
 use std::process::Command;
 
@@ -88,6 +88,17 @@ struct Args {
     /// If the file doesn't exist, built-in defaults are used.
     #[arg(short, long, value_name = "FILE")]
     config: Option<PathBuf>,
+
+    /// Construction mode: 'copper-wire' or 'electrolysis'
+    ///
+    /// Selects preset geometry defaults and assembly guide style.
+    /// 'copper-wire' (default): wide channels for 30 AWG wire, wire-laying guide.
+    /// 'electrolysis': narrow channels for electroplated copper, plating guide.
+    /// Any explicit --channel-width / --channel-depth / --eyelet-style flags override
+    /// the mode preset. Copy presets/copper-wire.toml or presets/electrolysis.toml
+    /// into your project for a fully customisable starting point.
+    #[arg(long, value_name = "MODE")]
+    mode: Option<String>,
 
     /// Width of trace channels (millimeters)
     #[arg(long, value_name = "MM")]
@@ -171,6 +182,13 @@ impl Args {
             .transpose()
             .map_err(|e| anyhow::anyhow!("Invalid output format: {}", e))?;
 
+        let mode = self
+            .mode
+            .as_ref()
+            .map(|s| s.parse::<Mode>())
+            .transpose()
+            .map_err(|e| anyhow::anyhow!("Invalid mode: {}", e))?;
+
         Ok(CliOverrides {
             channel_width_mm: self.channel_width,
             channel_depth_mm: self.channel_depth,
@@ -184,6 +202,7 @@ impl Args {
             output_dir: self.output_dir.clone(),
             generate_pad_holes: if self.no_pad_holes { Some(false) } else { None },
             generate_via_indents: if self.no_via_indents { Some(false) } else { None },
+            mode,
         })
     }
 }
@@ -375,8 +394,8 @@ fn cli_main() -> Result<()> {
     println!("\n✅ Done! Generated:");
     for f in &written {
         let name = f.file_name().and_then(|n| n.to_str()).unwrap_or("");
-        let label = if name.ends_with("_assembly.html") {
-            "  📋 Assembly guide"
+        let label = if name.ends_with("_guide.html") {
+            "  📋 Build guide (assembly + continuity + 3D)"
         } else if f.extension().map(|e| e == "html").unwrap_or(false) {
             "  🌐 Preview (interactive)"
         } else {

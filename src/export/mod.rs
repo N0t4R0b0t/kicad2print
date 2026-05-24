@@ -44,9 +44,9 @@ pub fn export(mesh: &Mesh3D, pcb: &PcbData, pcb_input: &Path, stem: &str, config
     html::write(mesh, stem, &html_path)?;
     written.push(html_path);
 
-    // Generate assembly guide (always; uses auto steps if none configured)
-    let guide_path = out_dir.join(format!("{}_assembly.html", stem));
-    assembly::write(pcb, pcb_input, &config.assembly_steps, stem, &guide_path)?;
+    // Generate unified build guide (assembly + continuity + 3D tabs)
+    let guide_path = out_dir.join(format!("{}_guide.html", stem));
+    assembly::write(pcb, pcb_input, &config.assembly_steps, config.mode, stem, &guide_path)?;
     written.push(guide_path);
 
     Ok(written)

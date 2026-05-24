@@ -158,7 +158,7 @@ pub fn generate_model(pcb: &PcbData, config: &Config) -> Result<Mesh3D> {
     // Via holes: always treat as through-holes (merged into pad holes polygon)
     let via_holes = if !pcb.vias.is_empty() {
         union_circles(
-            &pcb.vias.iter().map(|v| Pad { center: v.center, drill: config.eyelet_diameter_mm }).collect::<Vec<_>>(),
+            &pcb.vias.iter().map(|v| Pad { center: v.center, drill: config.eyelet_diameter_mm, number: String::new(), net_name: None }).collect::<Vec<_>>(),
             config.eyelet_diameter_mm / 2.0,
             16,
         )

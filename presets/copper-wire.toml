@@ -1,0 +1,51 @@
+# kicad2print — Copper Wire Traces Preset
+#
+# Use this preset when you will lay physical copper wire into the grooves.
+# Suitable for 30 AWG Kynar wire (0.25 mm conductor, ~0.5 mm with insulation).
+#
+# Usage:
+#   kicad2print my_board.kicad_pcb --config presets/copper-wire.toml
+# Or select via CLI flag (uses these values when not overridden by the TOML above):
+#   kicad2print my_board.kicad_pcb --mode copper-wire
+
+mode = "copper-wire"
+
+# ============================================================================
+# TRACE CHANNEL CONFIGURATION
+# ============================================================================
+
+# Wide enough to lay 30 AWG Kynar wire into the groove.
+# Increase to 1.5 mm for 28 AWG wire.
+channel_width_mm = 1.2
+
+# Deep enough to hold the wire securely.
+channel_depth_mm = 0.5
+
+# ============================================================================
+# VIA / EYELET CONFIGURATION
+# ============================================================================
+
+# Shallow dimples guide eyelets without requiring post-print drilling.
+eyelet_style = "indent"
+eyelet_diameter_mm = 1.5
+indent_depth_mm = 0.3
+
+# ============================================================================
+# COMPONENT PAD CONFIGURATION
+# ============================================================================
+
+pad_hole_diameter_mm = 0.8
+
+# ============================================================================
+# BOARD CONFIGURATION
+# ============================================================================
+
+substrate_thickness_mm = 3.0
+scale_factor = 0.0  # 0 = auto-scale so trace widths fit the channel
+
+# ============================================================================
+# OUTPUT CONFIGURATION
+# ============================================================================
+
+output_format = "stl"
+output_dir = "./output"

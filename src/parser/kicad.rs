@@ -104,7 +104,10 @@ pub fn walk_kicad_tree(nodes: &[SexpNode]) -> Result<PcbData> {
                         if let Ok(fp) = parse_footprint(node) {
                             // Extract Edge.Cuts cutouts from within this footprint
                             collect_footprint_cutouts(node, &mut pcb.cutouts);
-                            pcb.pads.extend(fp.pads.iter().copied());
+                            // Only through-hole pads go into global geometry list (used for drill holes)
+                            for pad in fp.pads.iter().filter(|p| p.drill > 0.0) {
+                                pcb.pads.push(pad.clone());
+                            }
                             pcb.footprints.push(fp);
                         }
                     }
@@ -423,6 +426,28 @@ fn parse_footprint(node: &SexpNode) -> Result<Footprint> {
             if let Some(pad_list) = item.as_list() {
                 if let Some(pad_type) = pad_list.first().and_then(|n| n.as_atom()) {
                     if pad_type == "pad" {
+                        // Pad number is the second atom: (pad "1" thru_hole ...)
+                        let pad_number = pad_list.get(1)
+                            .and_then(|n| n.as_atom())
+                            .unwrap_or("")
+                            .to_string();
+
+                        // Net name from (net "NAME") or legacy (net INDEX "NAME")
+                        let net_name = item.get_child("net").and_then(|n| {
+                            // Try index 1 first (KiCad 7+: (net "NAME"))
+                            let v1 = n.nth(1).and_then(|x| x.as_atom());
+                            if let Some(s) = v1 {
+                                // If it parses as a number, it's the legacy format — grab index 2
+                                if s.parse::<i64>().is_ok() {
+                                    n.nth(2).and_then(|x| x.as_atom()).map(|s| s.to_string())
+                                } else {
+                                    Some(s.to_string())
+                                }
+                            } else {
+                                None
+                            }
+                        });
+
                         if let Some(at_node) = item.get_child("at") {
                             // Read pad position in raw KiCad coords (Y-down, no negation)
                             let pad_x = at_node.nth(1)
@@ -435,30 +460,30 @@ fn parse_footprint(node: &SexpNode) -> Result<Footprint> {
                                 .unwrap_or(0.0);
 
                             // Apply footprint rotation in KiCad Y-down space.
-                            // KiCad uses CCW-positive in its Y-down view, which in
-                            // Y-down coordinates uses the opposite sin sign vs standard
-                            // Y-up math (flipping Y reverses rotation handedness).
-                            // CCW in KiCad Y-down: x' = x*cos - y*(-sin) = x*cos + y*sin
-                            //                      y' = x*(-sin) + y*cos = -x*sin + y*cos
                             let rot_x = pad_x * fp_rot.cos() + pad_y * fp_rot.sin();
                             let rot_y = -pad_x * fp_rot.sin() + pad_y * fp_rot.cos();
                             let absolute_pos = Point2::new(
                                 fp_x + rot_x,
-                                -(fp_y + rot_y),  // Y-up conversion
+                                -(fp_y + rot_y),
                             );
 
-                            // Only include if pad has a drill
-                            if let Some(drill_node) = item.get_child("drill") {
-                                if let Some(drill_size) = drill_node
-                                    .nth(1)
-                                    .and_then(|n| n.as_atom())
-                                    .and_then(|s| s.parse::<f64>().ok())
-                                {
-                                    pads.push(Pad {
-                                        center: absolute_pos,
-                                        drill: drill_size,
-                                    });
-                                }
+                            let drill = item.get_child("drill")
+                                .and_then(|n| n.nth(1))
+                                .and_then(|n| n.as_atom())
+                                .and_then(|s| s.parse::<f64>().ok())
+                                .unwrap_or(0.0);
+
+                            // Include through-hole pads (drill > 0) always.
+                            // Include SMD pads (drill == 0) only when they carry a net,
+                            // so they appear in the continuity test even though they
+                            // don't need a substrate hole.
+                            if drill > 0.0 || net_name.is_some() {
+                                pads.push(Pad {
+                                    center: absolute_pos,
+                                    drill,
+                                    number: pad_number,
+                                    net_name,
+                                });
                             }
                         }
                     }
@@ -467,7 +492,7 @@ fn parse_footprint(node: &SexpNode) -> Result<Footprint> {
         }
     }
 
-    Ok(Footprint { reference, value, position, pads })
+    Ok(Footprint { reference, value, position, rotation_deg: fp_rot_deg, pads })
 }
 
 /// Attempts to chain outline segments into a closed polygon.

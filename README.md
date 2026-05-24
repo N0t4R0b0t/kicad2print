@@ -1,6 +1,6 @@
 # kicad2print
 
-Convert KiCad PCB designs into 3D-printable substrate models for the **hybrid PCB** construction method — a technique that replaces traditional PCB fabrication with 3D-printed substrates, copper wire traces, and copper eyelets.
+Convert KiCad PCB designs into 3D-printable substrate models for the **hybrid PCB** construction method — a technique that replaces traditional PCB fabrication with a 3D-printed substrate and copper traces, using either laid copper wire or electroplated copper.
 
 [![Build & Release](https://github.com/N0t4R0b0t/kicad2print/actions/workflows/release.yml/badge.svg)](https://github.com/N0t4R0b0t/kicad2print/actions/workflows/release.yml)
 
@@ -14,17 +14,31 @@ Convert KiCad PCB designs into 3D-printable substrate models for the **hybrid PC
 
 ## What is the hybrid PCB method?
 
-Instead of sending your board to a fab house, you:
+Instead of sending your board to a fab house, you print the substrate on an FDM printer and add copper traces yourself. kicad2print supports two construction modes:
+
+### Copper wire traces (`--mode copper-wire`, default)
 
 1. **Design your PCB normally in KiCad**
-2. **Print the substrate** — a 3D-printed board with grooved channels for traces and holes for component pads and vias
-3. **Lay copper wire** into the channels as traces
-4. **Press copper eyelets** into via holes to connect top and bottom layers
-5. **Solder your components** as you normally would
+2. **Print the substrate** — grooved channels for traces, holes for pads and vias
+3. **Lay 30 AWG copper wire** into each channel
+4. **Press copper eyelets** into via holes to bridge top and bottom layers
+5. **Solder your components**
 
-The result is a functional PCB you can produce at home in hours, with no chemicals, no etching, and no minimum order quantities.
+No chemicals, no etching, no minimum order. A functional PCB in a few hours.
 
-**kicad2print** handles step 2: it takes your `.kicad_pcb` file and produces the STL/3MF substrate model ready to slice and print.
+### Electroplated copper (`--mode electrolysis`)
+
+1. **Design your PCB normally in KiCad**
+2. **Print the substrate** — narrower grooves sized to the actual trace width
+3. **Apply conductive primer** to all trace grooves
+4. **Electroplate copper** into the grooves using a copper sulfate bath
+5. **Test traces**, then solder your components
+
+Produces thinner, more accurate traces and no wire handling. Requires a simple electrolysis setup.
+
+---
+
+**kicad2print** handles the substrate step: it takes your `.kicad_pcb` file and produces the STL/3MF model ready to slice and print, plus an HTML assembly guide tailored to whichever mode you choose.
 
 ---
 
@@ -56,14 +70,17 @@ cargo build --release
 ## Usage
 
 ```bash
-# Basic conversion — outputs STL/3MF + interactive HTML preview to ./output/
+# Basic conversion — copper wire mode (default)
 kicad2print my_board.kicad_pcb
 
-# With a config file
-kicad2print my_board.kicad_pcb --config my_settings.toml
+# Electrolysis mode — narrower channels, plating assembly guide
+kicad2print my_board.kicad_pcb --mode electrolysis
 
-# Override settings on the fly
-kicad2print my_board.kicad_pcb --channel-width 0.8 --eyelet-style hole
+# With a config file (copy a preset as a starting point)
+kicad2print my_board.kicad_pcb --config presets/electrolysis.toml
+
+# Override individual settings on top of a mode
+kicad2print my_board.kicad_pcb --mode electrolysis --channel-width 0.5
 
 # Generate both STL and 3MF
 kicad2print my_board.kicad_pcb --format both
@@ -81,48 +98,61 @@ Each run produces the following in `--output-dir` (default `./output/`):
 | `boardname.stl` | Binary STL for slicers (when format = `stl` or `both`) |
 | `boardname.3mf` | 3MF with metadata (when format = `3mf` or `both`) |
 | `boardname_preview.html` | Self-contained interactive 3D viewer (no server needed) |
+| `boardname_assembly.html` | Step-by-step assembly guide (wire-laying or plating, depending on mode) |
 
-Open the HTML file in any browser to inspect the substrate before printing.
+Open either HTML file in any browser — no server needed.
 
 ---
 
 ## Configuration
 
-Create a `kicad2print.toml` in your project directory (or copy `default_config.toml` from this repo):
+### Quick start with a preset
 
-```toml
-# Groove dimensions — must fit your wire gauge
-channel_width_mm  = 1.2   # 30 AWG Kynar: 1.0–1.2 mm | 28 AWG: 1.2–1.5 mm
-channel_depth_mm  = 0.5   # Typical: 0.4–0.8 mm
+Copy one of the presets from this repo as your starting point:
 
-# Via / eyelet style
-eyelet_style      = "indent"  # "hole" (drill post-print) or "indent" (dimple guide)
-eyelet_diameter_mm = 1.5      # Match your copper eyelet size (M0.9 / M1.3 / M2.0)
-indent_depth_mm   = 0.3       # Dimple depth (indent style only)
+```bash
+# Copper wire traces (default settings)
+cp presets/copper-wire.toml kicad2print.toml
 
-# Component pad holes
-pad_hole_diameter_mm = 0.8    # Slightly larger than component lead diameter
-
-# Board
-substrate_thickness_mm = 3.0  # Total board thickness (2.5–4.0 mm typical)
-scale_factor           = 0.0  # 0 = auto-scale to fit traces; >0 = exact scale
-
-# Output
-output_format = "3mf"         # "stl", "3mf", or "both"
-output_dir    = "./output"
+# Electroplated copper
+cp presets/electrolysis.toml kicad2print.toml
 ```
+
+Then edit `kicad2print.toml` to taste and run:
+
+```bash
+kicad2print my_board.kicad_pcb --config kicad2print.toml
+```
+
+Or skip the file entirely and use `--mode` for the preset defaults:
+
+```bash
+kicad2print my_board.kicad_pcb --mode electrolysis
+```
+
+### All settings
+
+| Setting | Copper wire default | Electrolysis default | Description |
+|---|---|---|---|
+| `mode` | `copper-wire` | `electrolysis` | Selects assembly guide style |
+| `channel_width_mm` | `1.2` | `0.7` | Groove width — wire diameter or trace width |
+| `channel_depth_mm` | `0.5` | `0.5` | Groove depth |
+| `eyelet_style` | `indent` | `hole` | Via representation (`indent` = dimple, `hole` = through-hole) |
+| `eyelet_diameter_mm` | `1.5` | `1.5` | Via hole or dimple diameter |
+| `indent_depth_mm` | `0.3` | `0.3` | Dimple depth (indent style only) |
+| `pad_hole_diameter_mm` | `0.8` | `0.8` | Minimum component pad hole diameter |
+| `substrate_thickness_mm` | `3.0` | `3.0` | Total board thickness |
+| `scale_factor` | `0.0` | `0.0` | `0` = true 1:1 scale; `>0` = exact multiplier |
+| `output_format` | `stl` | `stl` | `stl`, `3mf`, or `both` |
+| `output_dir` | `./output` | `./output` | Output directory |
 
 Settings are merged in order: **built-in defaults → TOML file → CLI flags**.
 
 ### Eyelet styles
 
-**`indent`** (recommended) — shallow dimples on the top and bottom surface mark via locations. No drilling required. Press copper eyelets straight in and solder. Faster to print and assemble.
+**`indent`** (copper wire default) — shallow dimples on top and bottom mark via locations. No drilling required. Faster to print and assemble.
 
-**`hole`** — full through-holes sized to accept your eyelets. Gives you the option to drill to a precise diameter after printing if your eyelet fit is off.
-
-### Auto-scaling
-
-If any trace on your board is narrower than `channel_width_mm`, kicad2print automatically scales the entire board up so the narrowest trace exactly fills one channel. Component spacing is preserved proportionally. Set `scale_factor > 0` to override with a fixed scale.
+**`hole`** (electrolysis default) — full through-holes sized to accept your eyelets. Required when the via hole walls need to be primed and plated.
 
 ---
 

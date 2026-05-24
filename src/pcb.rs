@@ -156,12 +156,16 @@ impl Via {
 /// Pads are the connection points for component leads (resistors, capacitors, etc.).
 /// This type only tracks through-hole pads; SMD (surface-mount) pads without holes
 /// are ignored since they don't require substrate modifications.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct Pad {
     /// Center point of the pad
     pub center: Point2,
     /// Drill hole diameter in millimeters
     pub drill: f64,
+    /// Pad number string (e.g. "1", "2", "A1")
+    pub number: String,
+    /// Net name this pad is connected to, if any
+    pub net_name: Option<String>,
 }
 
 impl Pad {
@@ -170,6 +174,8 @@ impl Pad {
         Pad {
             center: self.center.scale(factor),
             drill: self.drill * factor,
+            number: self.number.clone(),
+            net_name: self.net_name.clone(),
         }
     }
 }
@@ -183,6 +189,8 @@ pub struct Footprint {
     pub value: String,
     /// Center position of the footprint on the board
     pub position: Point2,
+    /// Rotation in degrees (KiCad CCW positive, Y-down convention)
+    pub rotation_deg: f64,
     /// Through-hole pads belonging to this footprint
     pub pads: Vec<Pad>,
 }
@@ -352,6 +360,7 @@ impl PcbData {
                 reference: f.reference.clone(),
                 value: f.value.clone(),
                 position: f.position.scale(factor),
+                rotation_deg: f.rotation_deg,
                 pads: f.pads.iter().map(|p| p.scale(factor)).collect(),
             }).collect(),
             cutouts: self.cutouts.iter().map(|c| match *c {

@@ -1,0 +1,63 @@
+# kicad2print — Copper Electrolysis (Electroplating) Preset
+#
+# Use this preset when you will electroplate copper into the grooves using
+# a conductive primer + copper sulfate electrolysis bath.
+#
+# Workflow overview:
+#   1. Print the substrate (narrower grooves than wire mode — copper fills them).
+#   2. Insert through-hole components.
+#   3. Apply conductive primer or paint to all trace grooves.
+#   4. Electroplate copper: connect board as cathode in CuSO4 bath, apply ~1–2 V.
+#   5. Test traces with a multimeter.
+#   6. Solder components.
+#
+# Usage:
+#   kicad2print my_board.kicad_pcb --config presets/electrolysis.toml
+# Or select via CLI flag (uses these values when not overridden by the TOML above):
+#   kicad2print my_board.kicad_pcb --mode electrolysis
+
+mode = "electrolysis"
+
+# ============================================================================
+# TRACE CHANNEL CONFIGURATION
+# ============================================================================
+
+# Narrower than wire mode — the groove defines the copper trace width.
+# Copper is deposited into the groove rather than a wire being laid in it.
+# Typical signal traces: 0.3–0.5 mm. Power traces: 0.5–1.0 mm.
+channel_width_mm = 0.7
+
+channel_depth_mm = 0.5
+
+# ============================================================================
+# VIA / EYELET CONFIGURATION
+# ============================================================================
+
+# Full holes are preferred for electrolysis — the conductive primer can coat
+# the hole walls, and eyelets bridge the layers more reliably than indents.
+eyelet_style = "hole"
+eyelet_diameter_mm = 1.5
+
+# ============================================================================
+# COMPONENT PAD CONFIGURATION
+# ============================================================================
+
+pad_hole_diameter_mm = 0.8
+
+# ============================================================================
+# BOARD CONFIGURATION
+# ============================================================================
+
+# Slightly thicker substrate for rigidity during the electrolysis bath process.
+substrate_thickness_mm = 3.0
+
+# For electrolysis, 1:1 scale is typical — the groove width directly sets the
+# trace width, so no scaling is needed. Set to 0 for auto-scale.
+scale_factor = 0.0
+
+# ============================================================================
+# OUTPUT CONFIGURATION
+# ============================================================================
+
+output_format = "stl"
+output_dir = "./output"

@@ -12,6 +12,43 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
+/// Construction mode — selects default geometry and assembly guide style.
+///
+/// Each mode ships with a preset TOML config (see `presets/`) and a tailored
+/// assembly guide. Individual settings can still be overridden via TOML or CLI.
+///
+/// # Values
+/// - `"copper-wire"` — lay 30 AWG wire into grooves (wider channels, standard wire-laying guide)
+/// - `"electrolysis"` — electroplate copper into grooves (narrower channels, plating guide)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum Mode {
+    #[default]
+    CopperWire,
+    Electrolysis,
+}
+
+impl std::fmt::Display for Mode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Mode::CopperWire => write!(f, "copper-wire"),
+            Mode::Electrolysis => write!(f, "electrolysis"),
+        }
+    }
+}
+
+impl std::str::FromStr for Mode {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "copper-wire" | "wire" => Ok(Mode::CopperWire),
+            "electrolysis" | "electro" => Ok(Mode::Electrolysis),
+            other => Err(format!("Unknown mode: '{}'. Use 'copper-wire' or 'electrolysis'", other)),
+        }
+    }
+}
+
 /// Specifies how via eyelets are represented in the 3D model.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -207,11 +244,21 @@ pub struct Config {
     #[serde(default = "default_generate_via_indents")]
     pub generate_via_indents: bool,
 
+    /// Construction mode — selects assembly guide style and recommended geometry defaults.
+    ///
+    /// - `"copper-wire"`: lay physical wire into grooves; wide channels (1.2 mm)
+    /// - `"electrolysis"`: electroplate copper into grooves; narrow channels (0.5 mm)
+    ///
+    /// This field does NOT override geometry settings already set in this config file.
+    /// Use `--mode` on the CLI (or copy a preset from `presets/`) to get mode defaults.
+    #[serde(default)]
+    pub mode: Mode,
+
     /// Optional assembly guide steps.
     ///
     /// When non-empty, kicad2print generates an HTML assembly guide alongside the 3D model.
     /// Each step highlights specific components or wire layers on an SVG board view.
-    /// If empty, a default guide is auto-generated (components first, then F.Cu wires, then B.Cu wires).
+    /// If empty, a default guide is auto-generated based on the selected `mode`.
     #[serde(default)]
     pub assembly_steps: Vec<AssemblyStep>,
 }
@@ -231,7 +278,6 @@ fn default_generate_pad_holes() -> bool { true }
 fn default_generate_via_indents() -> bool { true }
 
 impl Default for Config {
-    /// Creates a config with all default values.
     fn default() -> Self {
         Config {
             channel_width_mm: default_channel_width(),
@@ -246,6 +292,7 @@ impl Default for Config {
             output_dir: default_output_dir(),
             generate_pad_holes: default_generate_pad_holes(),
             generate_via_indents: default_generate_via_indents(),
+            mode: Mode::default(),
             assembly_steps: Vec::new(),
         }
     }
@@ -319,6 +366,33 @@ impl Config {
         if overrides.generate_via_indents.is_some() {
             self.generate_via_indents = overrides.generate_via_indents.unwrap();
         }
+        if let Some(mode) = overrides.mode {
+            // Apply mode and its geometry defaults, but only for fields not already
+            // explicitly set by the TOML config (i.e. still at their serde defaults).
+            self.mode = mode;
+            match mode {
+                Mode::Electrolysis => {
+                    if overrides.channel_width_mm.is_none()
+                        && (self.channel_width_mm - default_channel_width()).abs() < f64::EPSILON
+                    {
+                        self.channel_width_mm = 0.7;
+                    }
+                    if overrides.channel_depth_mm.is_none()
+                        && (self.channel_depth_mm - default_channel_depth()).abs() < f64::EPSILON
+                    {
+                        self.channel_depth_mm = 0.5;
+                    }
+                    if overrides.eyelet_style.is_none()
+                        && self.eyelet_style == default_eyelet_style()
+                    {
+                        self.eyelet_style = EyeletStyle::Hole;
+                    }
+                }
+                Mode::CopperWire => {
+                    // Copper-wire defaults are the same as the global defaults; nothing to adjust.
+                }
+            }
+        }
     }
 
     /// Prints the current configuration to stdout.
@@ -326,6 +400,7 @@ impl Config {
     /// Useful for debugging to confirm which settings are being used.
     pub fn print_summary(&self) {
         println!("=== Configuration ===");
+        println!("Mode:                {}", self.mode);
         println!("Channel width:       {:.2} mm", self.channel_width_mm);
         println!("Channel depth:       {:.2} mm", self.channel_depth_mm);
         println!("Eyelet style:        {}", self.eyelet_style);
@@ -361,4 +436,5 @@ pub struct CliOverrides {
     pub output_dir: Option<String>,
     pub generate_pad_holes: Option<bool>,
     pub generate_via_indents: Option<bool>,
+    pub mode: Option<Mode>,
 }
