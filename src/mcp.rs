@@ -493,9 +493,9 @@ pub struct AddTraceParams {
     /// Trace width in mm (default: 0.25)
     #[schemars(default)]
     pub width: Option<f64>,
-    /// Net number (default: 0 = unconnected)
+    /// Net name string (e.g. "GND", "VBUS"). Omit or leave empty for unconnected.
     #[schemars(default)]
-    pub net: Option<i32>,
+    pub net: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
@@ -585,6 +585,90 @@ pub struct GetPinPositionParams {
     /// Pin number to look up (e.g. "5") — if omitted returns all pins
     #[schemars(default)]
     pub pin: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct ListNetsParams {
+    /// Absolute path to the .kicad_pcb file
+    pub path: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct QueryPadsInRegionParams {
+    /// Absolute path to the .kicad_pcb file
+    pub path: String,
+    /// Left X boundary in mm
+    pub x1: f64,
+    /// Top Y boundary in mm
+    pub y1: f64,
+    /// Right X boundary in mm
+    pub x2: f64,
+    /// Bottom Y boundary in mm
+    pub y2: f64,
+    /// Filter to pads on this copper layer (e.g. "F.Cu", "B.Cu") — omit for all layers
+    #[schemars(default)]
+    pub layer: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct CheckTraceClearanceParams {
+    /// Absolute path to the .kicad_pcb file
+    pub path: String,
+    /// Proposed trace start X in mm
+    pub x1: f64,
+    /// Proposed trace start Y in mm
+    pub y1: f64,
+    /// Proposed trace end X in mm
+    pub x2: f64,
+    /// Proposed trace end Y in mm
+    pub y2: f64,
+    /// Copper layer the trace would be on (e.g. "F.Cu", "B.Cu")
+    pub layer: String,
+    /// Trace width in mm (default: 0.25)
+    #[schemars(default)]
+    pub width: Option<f64>,
+    /// Minimum required clearance from pad edges in mm (default: 0.1)
+    #[schemars(default)]
+    pub clearance: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct AddPowerSymbolParams {
+    /// Absolute path to the .kicad_sch schematic file
+    pub path: String,
+    /// Net name matching a KiCad power library symbol (e.g. "VBUS", "GND", "+5V")
+    pub net_name: String,
+    /// X position in schematic coordinates (mm)
+    pub x: f64,
+    /// Y position in schematic coordinates (mm)
+    pub y: f64,
+    /// Rotation in degrees (default: 0)
+    #[schemars(default)]
+    pub rotation: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct GetNetForPadParams {
+    /// Absolute path to the .kicad_pcb file
+    pub path: String,
+    /// Reference designator of the footprint (e.g. "U1", "JP1")
+    pub reference: String,
+    /// Pad number as a string (e.g. "1", "A3")
+    pub pad_number: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct VerifyConnectivityParams {
+    /// Absolute path to the .kicad_pcb file
+    pub path: String,
+    /// Reference designator of the first pad (e.g. "U1")
+    pub ref_a: String,
+    /// Pad number of the first pad (e.g. "30")
+    pub pad_a: String,
+    /// Reference designator of the second pad (e.g. "JP1")
+    pub ref_b: String,
+    /// Pad number of the second pad (e.g. "1")
+    pub pad_b: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -1832,7 +1916,10 @@ impl KiCadServer {
         match fs::read_to_string(&out_path).await {
             Ok(report) => {
                 let _ = fs::remove_file(&out_path).await;
-                Ok(CallToolResult::success(vec![Content::text(report)]))
+                let mut contents = vec![Content::text(report)];
+                // Append a board render so violations are visually obvious
+                contents.extend(self.render_board(&params.0.path).await);
+                Ok(CallToolResult::success(contents))
             }
             Err(_) => {
                 Ok(CallToolResult::error(vec![Content::text(format!(
@@ -2210,15 +2297,44 @@ impl KiCadServer {
             &p.path,
         ]).await?;
 
-        match fs::read_to_string(&out_path).await {
-            Ok(svg) => {
-                let _ = fs::remove_file(&out_path).await;
-                Ok(CallToolResult::success(vec![Content::text(svg)]))
-            }
-            Err(_) => Ok(CallToolResult::error(vec![Content::text(format!(
+        let svg_content = match fs::read_to_string(&out_path).await {
+            Ok(svg) => svg,
+            Err(_) => return Ok(CallToolResult::error(vec![Content::text(format!(
                 "SVG export failed (exit {code}):\n{stderr}"
             ))])),
+        };
+
+        let mut contents: Vec<Content> = Vec::new();
+
+        // Convert SVG → PNG via rsvg-convert for visual inspection
+        let png_path = out_path.with_extension("png");
+        let conv = Command::new("rsvg-convert")
+            .args([
+                "-w", "2400",
+                "-o", png_path.to_str().unwrap_or("/tmp/out.png"),
+                out_path.to_str().unwrap_or("/tmp/out.svg"),
+            ])
+            .output()
+            .await;
+
+        let _ = fs::remove_file(&out_path).await;
+
+        if conv.map(|o| o.status.success()).unwrap_or(false) {
+            if let Ok(bytes) = fs::read(&png_path).await {
+                let _ = fs::remove_file(&png_path).await;
+                contents.push(Content::text(format!("Layer SVG rendered — layers: {}", p.layers)));
+                contents.push(Content::image(BASE64_STANDARD.encode(&bytes), "image/png"));
+                // Also include raw SVG text for precise coordinate inspection
+                contents.push(Content::text(svg_content));
+                return Ok(CallToolResult::success(contents));
+            }
         }
+
+        // rsvg-convert not available — return SVG text only
+        contents.push(Content::text(format!(
+            "Layer SVG exported (rsvg-convert not available for PNG preview):\n{svg_content}"
+        )));
+        Ok(CallToolResult::success(contents))
     }
 
     // ---- Component-level PCB editing tools --------------------------------
@@ -4032,11 +4148,11 @@ print(json.dumps({{"changed": changed}}))
         };
 
         let width = p.width.unwrap_or(0.25);
-        let net = p.net.unwrap_or(0);
+        let net = p.net.as_deref().unwrap_or("").to_string();
         let ts = pcb_edit::new_tstamp();
 
         let segment = format!(
-            "  (segment (start {} {}) (end {} {})\n    (width {}) (layer \"{}\") (net {}) (tstamp {}))",
+            "\t(segment\n\t\t(start {} {})\n\t\t(end {} {})\n\t\t(width {})\n\t\t(layer \"{}\")\n\t\t(net \"{}\")\n\t\t(uuid \"{}\")\n\t)",
             p.x1, p.y1, p.x2, p.y2, width, p.layer, net, ts
         );
 
@@ -4649,6 +4765,449 @@ print('ok')
             Content::image(b64, "image/png"),
         ]))
     }
+
+    /// List all nets and their connected pads in a PCB file.
+    #[tool(description = "List all nets in a .kicad_pcb file with their connected pads. Use this BEFORE editing to discover correct net names — never guess a net name. Returns net→pad mapping.")]
+    async fn list_nets(
+        &self,
+        params: Parameters<ListNetsParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let content = match fs::read_to_string(&params.0.path).await {
+            Ok(c) => c,
+            Err(e) => return Ok(CallToolResult::error(vec![Content::text(format!("Failed to read: {e}"))])),
+        };
+
+        let all_pads = parse_pcb_pads(&content);
+        let mut net_map: std::collections::BTreeMap<String, Vec<String>> = Default::default();
+        for pad in &all_pads {
+            net_map.entry(pad.net.clone())
+                .or_default()
+                .push(format!("{}/{}", pad.reference, pad.pad_num));
+        }
+
+        let mut output = format!("Nets in {}:\n\n", params.0.path);
+        output.push_str(&format!("{:<45} {:>5}  {}\n", "Net name", "Pads", "Connected pads"));
+        output.push_str(&"-".repeat(90));
+        output.push('\n');
+        for (net, pads) in &net_map {
+            output.push_str(&format!("{:<45} {:>5}  {}\n",
+                format!("\"{net}\""), pads.len(), pads.join(", ")));
+        }
+        output.push_str(&format!("\nTotal: {} nets across {} pads\n", net_map.len(), all_pads.len()));
+
+        Ok(CallToolResult::success(vec![Content::text(output)]))
+    }
+
+    /// Query all pads within a rectangular region of a PCB.
+    #[tool(description = "Return all footprint pads whose centre falls inside a rectangular region of a .kicad_pcb. Use before routing to discover what pads exist along a proposed trace path. Returns reference, pad number, net name, absolute position, and size.")]
+    async fn query_pads_in_region(
+        &self,
+        params: Parameters<QueryPadsInRegionParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let p = params.0;
+        let content = match fs::read_to_string(&p.path).await {
+            Ok(c) => c,
+            Err(e) => return Ok(CallToolResult::error(vec![Content::text(format!("Failed to read: {e}"))])),
+        };
+
+        let all_pads = parse_pcb_pads(&content);
+        let x_min = p.x1.min(p.x2);
+        let x_max = p.x1.max(p.x2);
+        let y_min = p.y1.min(p.y2);
+        let y_max = p.y1.max(p.y2);
+
+        let matching: Vec<&PcbPad> = all_pads.iter()
+            .filter(|pad| pad.x >= x_min && pad.x <= x_max && pad.y >= y_min && pad.y <= y_max)
+            .filter(|pad| {
+                p.layer.as_ref().map_or(true, |l| pad.is_thru_hole || {
+                    // SMD pads: check their specific layer. We derive it from pad type heuristic.
+                    // Since we don't store layer directly, THT pads always match.
+                    // This is a best-effort filter; full accuracy needs layer stored per pad.
+                    pad.is_thru_hole || l.is_empty()
+                })
+            })
+            .collect();
+
+        if matching.is_empty() {
+            return Ok(CallToolResult::success(vec![Content::text(format!(
+                "No pads in region ({}, {}) → ({}, {})", p.x1, p.y1, p.x2, p.y2
+            ))]));
+        }
+
+        let mut output = format!("Pads in region ({}, {}) → ({}, {}):\n\n", p.x1, p.y1, p.x2, p.y2);
+        output.push_str(&format!("{:<10} {:<6} {:<35} {:>8} {:>8} {:>6} {:>6}  {}\n",
+            "Ref", "Pad", "Net", "X", "Y", "W(mm)", "H(mm)", "Type"));
+        output.push_str(&"-".repeat(95));
+        output.push('\n');
+        for pad in &matching {
+            output.push_str(&format!("{:<10} {:<6} {:<35} {:>8.3} {:>8.3} {:>6.3} {:>6.3}  {}\n",
+                pad.reference, pad.pad_num, pad.net,
+                pad.x, pad.y, pad.width, pad.height,
+                if pad.is_thru_hole { "THT" } else { "SMD" }));
+        }
+        output.push_str(&format!("\nTotal: {} pads\n", matching.len()));
+
+        Ok(CallToolResult::success(vec![Content::text(output)]))
+    }
+
+    /// Check if a proposed trace segment collides with or violates clearance from any pad.
+    #[tool(description = "Before adding a trace, check if it would collide with or come too close to any pad in a .kicad_pcb. Returns collisions (trace overlaps pad) and warnings (trace closer than clearance). Run this before add_trace to catch routing errors without a DRC cycle.")]
+    async fn check_trace_clearance(
+        &self,
+        params: Parameters<CheckTraceClearanceParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let p = params.0;
+        let content = match fs::read_to_string(&p.path).await {
+            Ok(c) => c,
+            Err(e) => return Ok(CallToolResult::error(vec![Content::text(format!("Failed to read: {e}"))])),
+        };
+
+        let width = p.width.unwrap_or(0.25);
+        let clearance = p.clearance.unwrap_or(0.1);
+        let half_trace = width / 2.0;
+        let all_pads = parse_pcb_pads(&content);
+
+        let mut collisions: Vec<String> = Vec::new();
+        let mut warnings: Vec<String> = Vec::new();
+
+        for pad in &all_pads {
+            // THT pads affect all layers; SMD pads we check regardless (conservative)
+            let dist = point_to_segment_dist(pad.x, pad.y, p.x1, p.y1, p.x2, p.y2);
+            let half_pad = (pad.width.max(pad.height)) / 2.0;
+            let collision_dist = half_trace + half_pad;
+            let warn_dist = collision_dist + clearance;
+
+            if dist < collision_dist {
+                collisions.push(format!(
+                    "  COLLISION  {:<10} pad {:>4}  net={:<30}  pos=({:.3},{:.3})  size={:.3}×{:.3}  dist={:.3}mm",
+                    pad.reference, pad.pad_num, pad.net, pad.x, pad.y, pad.width, pad.height, dist
+                ));
+            } else if dist < warn_dist {
+                warnings.push(format!(
+                    "  CLOSE      {:<10} pad {:>4}  net={:<30}  pos=({:.3},{:.3})  size={:.3}×{:.3}  dist={:.3}mm  (min={:.3}mm)",
+                    pad.reference, pad.pad_num, pad.net, pad.x, pad.y, pad.width, pad.height, dist, warn_dist
+                ));
+            }
+        }
+
+        let status = if collisions.is_empty() && warnings.is_empty() {
+            "CLEAR".to_string()
+        } else if !collisions.is_empty() {
+            format!("{} COLLISION(S)", collisions.len())
+        } else {
+            format!("{} WARNING(S)", warnings.len())
+        };
+
+        let mut output = format!(
+            "Clearance check [{status}]: ({}, {})→({}, {}) on {} w={:.3}mm gap={:.3}mm\n\n",
+            p.x1, p.y1, p.x2, p.y2, p.layer, width, clearance
+        );
+
+        if collisions.is_empty() && warnings.is_empty() {
+            output.push_str("No pads within collision or clearance distance. Safe to route.\n");
+        }
+        if !collisions.is_empty() {
+            output.push_str(&format!("COLLISIONS ({}) — trace physically overlaps these pads:\n", collisions.len()));
+            for c in &collisions { output.push_str(c); output.push('\n'); }
+        }
+        if !warnings.is_empty() {
+            output.push_str(&format!("\nCLEARANCE WARNINGS ({}) — closer than {:.3}mm gap:\n", warnings.len(), clearance));
+            for w in &warnings { output.push_str(w); output.push('\n'); }
+        }
+
+        Ok(CallToolResult::success(vec![Content::text(output)]))
+    }
+
+    /// Return the net name and position for a specific pad on a footprint.
+    #[tool(description = "Return the net name, absolute position, and size of a specific pad in a .kicad_pcb footprint. Use this to discover correct net names before routing or renaming nets.")]
+    async fn get_net_for_pad(
+        &self,
+        params: Parameters<GetNetForPadParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let p = params.0;
+        let content = match fs::read_to_string(&p.path).await {
+            Ok(c) => c,
+            Err(e) => return Ok(CallToolResult::error(vec![Content::text(format!("Failed to read: {e}"))])),
+        };
+
+        let fp_blocks = pcb_edit::find_footprint_blocks(&content);
+        let block_range = match fp_blocks.get(&p.reference) {
+            Some(r) => r.clone(),
+            None => return Ok(CallToolResult::error(vec![Content::text(format!(
+                "Footprint '{}' not found. Available refs: {}",
+                p.reference,
+                fp_blocks.keys().cloned().collect::<Vec<_>>().join(", ")
+            ))])),
+        };
+        let block = &content[block_range];
+
+        let (fp_x, fp_y, fp_rot) = pcb_edit::extract_at(block).unwrap_or((0.0, 0.0, 0.0));
+        let rot_rad = fp_rot.to_radians();
+
+        let pad_marker = format!("(pad \"{}\"", p.pad_number);
+        let rel = match block.find(&pad_marker) {
+            Some(r) => r,
+            None => {
+                // Collect available pad numbers for error message
+                let mut avail = Vec::new();
+                let mut s = 0;
+                while let Some(r) = block[s..].find("(pad \"") {
+                    let end = pcb_edit::block_end(block, s + r);
+                    if let Some(n) = extract_pad_number(&block[s + r..end]) {
+                        avail.push(n);
+                    }
+                    s = end;
+                }
+                return Ok(CallToolResult::error(vec![Content::text(format!(
+                    "Pad '{}' not found in '{}'. Available pads: {}",
+                    p.pad_number, p.reference, avail.join(", ")
+                ))]));
+            }
+        };
+
+        let pad_end = pcb_edit::block_end(block, rel);
+        let pad_block = &block[rel..pad_end];
+
+        let net = extract_pcb_pad_net(pad_block).unwrap_or_else(|| "(unconnected)".to_string());
+        let (dx, dy) = extract_pad_at(pad_block).unwrap_or((0.0, 0.0));
+        let (pw, ph) = extract_pad_size(pad_block).unwrap_or((0.0, 0.0));
+        let pad_type = if pad_block.contains("thru_hole") { "thru_hole" } else { "smd" };
+
+        let abs_x = fp_x + dx * rot_rad.cos() - dy * rot_rad.sin();
+        let abs_y = fp_y + dx * rot_rad.sin() + dy * rot_rad.cos();
+
+        let output = format!(
+            "Pad {}/{}: net=\"{}\"  pos=({:.3}, {:.3})mm  size={:.3}×{:.3}mm  type={}  (fp at ({:.3},{:.3}) rot={:.1}°)",
+            p.reference, p.pad_number, net, abs_x, abs_y, pw, ph, pad_type, fp_x, fp_y, fp_rot
+        );
+
+        Ok(CallToolResult::success(vec![Content::text(output)]))
+    }
+
+    /// Check if two pads are electrically connected by existing traces/vias.
+    #[tool(description = "Check whether two pads in a .kicad_pcb are electrically connected by existing traces and vias (i.e. would pass a connectivity/ratsnest check). Returns CONNECTED or DISCONNECTED with a path summary. Use after adding traces to confirm routing completeness before running full DRC.")]
+    async fn verify_connectivity(
+        &self,
+        params: Parameters<VerifyConnectivityParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let p = params.0;
+        let content = match fs::read_to_string(&p.path).await {
+            Ok(c) => c,
+            Err(e) => return Ok(CallToolResult::error(vec![Content::text(format!("Failed to read: {e}"))])),
+        };
+
+        let pads = parse_pcb_pads(&content);
+        let segments = parse_pcb_segments(&content);
+        let vias = parse_pcb_vias(&content);
+
+        let result = check_pad_connectivity(&pads, &segments, &vias,
+            &p.ref_a, &p.pad_a, &p.ref_b, &p.pad_b);
+
+        let output = match result {
+            Ok(true) => format!(
+                "CONNECTED: {}/{} ↔ {}/{} are electrically connected by existing traces/vias.\n\
+                 (Segments checked: {}, Vias checked: {})",
+                p.ref_a, p.pad_a, p.ref_b, p.pad_b, segments.len(), vias.len()
+            ),
+            Ok(false) => format!(
+                "DISCONNECTED: {}/{} ↔ {}/{} have no trace path between them.\n\
+                 A ratsnest line exists — routing is incomplete.\n\
+                 (Segments checked: {}, Vias checked: {})",
+                p.ref_a, p.pad_a, p.ref_b, p.pad_b, segments.len(), vias.len()
+            ),
+            Err(e) => format!("Error: {e}"),
+        };
+
+        Ok(CallToolResult::success(vec![Content::text(output)]))
+    }
+
+    /// Add a power symbol (net label) to a KiCad schematic, including its lib_symbols definition.
+    #[tool(description = "Add a power net symbol (e.g. VBUS, GND, +5V) to a .kicad_sch schematic. Looks up the symbol definition in the installed KiCad power library, embeds it in lib_symbols if not already present, and places an instance at the given position. Renders a schematic preview. Use this instead of manually editing the file to add power connections.")]
+    async fn add_power_symbol(
+        &self,
+        params: Parameters<AddPowerSymbolParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let p = params.0;
+        let path = PathBuf::from(&p.path);
+        let _guard = self.lock_file(&path).await;
+
+        let mut content = match fs::read_to_string(&path).await {
+            Ok(c) => c,
+            Err(e) => return Ok(CallToolResult::error(vec![Content::text(format!("Failed to read: {e}"))])),
+        };
+
+        // 1. Find and read the power symbol library
+        let lib_path = match find_power_symbol_lib() {
+            Some(p) => p,
+            None => return Ok(CallToolResult::error(vec![Content::text(
+                "KiCad power symbol library not found. Install kicad-symbols or check your KiCad installation.".to_string()
+            )])),
+        };
+        let lib_content = match std::fs::read_to_string(&lib_path) {
+            Ok(c) => c,
+            Err(e) => return Ok(CallToolResult::error(vec![Content::text(format!(
+                "Failed to read power library {}: {e}", lib_path.display()
+            ))])),
+        };
+
+        // 2. Extract the symbol definition block
+        let sym_def = match extract_lib_symbol(&lib_content, &p.net_name) {
+            Some(d) => d,
+            None => return Ok(CallToolResult::error(vec![Content::text(format!(
+                "Symbol 'power:{}' not found in {}.\n\
+                 Check the net name — it must exactly match a symbol in the KiCad power library.\n\
+                 Common names: GND, VBUS, +5V, +3.3V, VCC, PWR_FLAG",
+                p.net_name, lib_path.display()
+            ))])),
+        };
+
+        // 3. Check if lib_symbols already contains this symbol
+        let lib_id = format!("power:{}", p.net_name);
+        let already_in_lib = content.contains(&format!("(symbol \"{lib_id}\""));
+
+        if !already_in_lib {
+            // Insert the definition inside (lib_symbols ...)
+            let marker = "(lib_symbols";
+            if let Some(pos) = content.find(marker) {
+                // Find the opening paren and skip to just inside it
+                let insert_after = content[pos..].find('\n').map(|r| pos + r + 1).unwrap_or(pos + marker.len());
+                content.insert_str(insert_after, &format!("{sym_def}\n"));
+            } else {
+                return Ok(CallToolResult::error(vec![Content::text(
+                    "No (lib_symbols ...) section found in schematic. Is this a valid .kicad_sch file?".to_string()
+                )]));
+            }
+        }
+
+        // 4. Extract project name and root path UUID for the instance
+        let project_name = path.file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("project")
+            .to_string();
+
+        let root_uuid = {
+            // Find an existing (path "/UUID" ...) from any instance in the schematic
+            let mut found = String::from("00000000-0000-0000-0000-000000000000");
+            if let Some(pos) = content.find("(path \"/") {
+                let after = &content[pos + 8..];
+                if let Some(end) = after.find('"') {
+                    found = after[..end].to_string();
+                }
+            }
+            found
+        };
+
+        // 5. Find next available #PWR reference number
+        let mut max_pwr = 0u32;
+        let mut search_pwr = 0;
+        while let Some(rel) = content[search_pwr..].find("#PWR") {
+            let start = search_pwr + rel + 4;
+            let digits: String = content[start..].chars().take_while(|c| c.is_ascii_digit()).collect();
+            if let Ok(n) = digits.parse::<u32>() {
+                max_pwr = max_pwr.max(n);
+            }
+            search_pwr = start;
+        }
+        let pwr_ref = format!("#PWR{:03}", max_pwr + 1);
+
+        // 6. Generate UUIDs for the new instance
+        let inst_uuid = pcb_edit::new_tstamp();
+        let pin_uuid  = pcb_edit::new_tstamp();
+        let rotation  = p.rotation.unwrap_or(0.0);
+
+        // 7. Build the placed symbol instance S-expression
+        let desc_line = format!("Power symbol creates a global label with name \"{net}\"", net = p.net_name);
+        let instance_sexpr = format!(
+            "\n\t(symbol\n\
+             \t\t(lib_id \"{lib_id}\")\n\
+             \t\t(at {x} {y} {rot})\n\
+             \t\t(unit 1)\n\
+             \t\t(body_style 1)\n\
+             \t\t(exclude_from_sim no)\n\
+             \t\t(in_bom yes)\n\
+             \t\t(on_board yes)\n\
+             \t\t(in_pos_files yes)\n\
+             \t\t(dnp no)\n\
+             \t\t(fields_autoplaced yes)\n\
+             \t\t(uuid \"{inst_uuid}\")\n\
+             \t\t(property \"Reference\" \"{pwr_ref}\"\n\
+             \t\t\t(at {x} {py_ref} 0)\n\
+             \t\t\t(hide yes)\n\
+             \t\t\t(show_name no)\n\
+             \t\t\t(do_not_autoplace no)\n\
+             \t\t\t(effects (font (size 1.27 1.27)))\n\
+             \t\t)\n\
+             \t\t(property \"Value\" \"{net}\"\n\
+             \t\t\t(at {x} {py_val} 0)\n\
+             \t\t\t(show_name no)\n\
+             \t\t\t(do_not_autoplace no)\n\
+             \t\t\t(effects (font (size 1.27 1.27)))\n\
+             \t\t)\n\
+             \t\t(property \"Footprint\" \"\"\n\
+             \t\t\t(at {x} {y} 0)\n\
+             \t\t\t(hide yes)\n\
+             \t\t\t(show_name no)\n\
+             \t\t\t(do_not_autoplace no)\n\
+             \t\t\t(effects (font (size 1.27 1.27)))\n\
+             \t\t)\n\
+             \t\t(property \"Datasheet\" \"\"\n\
+             \t\t\t(at {x} {y} 0)\n\
+             \t\t\t(hide yes)\n\
+             \t\t\t(show_name no)\n\
+             \t\t\t(do_not_autoplace no)\n\
+             \t\t\t(effects (font (size 1.27 1.27)))\n\
+             \t\t)\n\
+             \t\t(property \"Description\" \"{desc}\"\n\
+             \t\t\t(at {x} {y} 0)\n\
+             \t\t\t(hide yes)\n\
+             \t\t\t(show_name no)\n\
+             \t\t\t(do_not_autoplace no)\n\
+             \t\t\t(effects (font (size 1.27 1.27)))\n\
+             \t\t)\n\
+             \t\t(pin \"1\" (uuid \"{pin_uuid}\"))\n\
+             \t\t(instances\n\
+             \t\t\t(project \"{proj}\"\n\
+             \t\t\t\t(path \"/{root}\"\n\
+             \t\t\t\t\t(reference \"{pwr_ref}\")\n\
+             \t\t\t\t\t(unit 1)\n\
+             \t\t\t\t)\n\
+             \t\t\t)\n\
+             \t\t)\n\
+             \t)",
+            lib_id = lib_id,
+            x = p.x, y = p.y, rot = rotation,
+            py_ref = p.y + 3.81, py_val = p.y - 3.556,
+            net = p.net_name,
+            pwr_ref = pwr_ref,
+            desc = desc_line,
+            inst_uuid = inst_uuid, pin_uuid = pin_uuid,
+            proj = project_name, root = root_uuid,
+        );
+
+        // Insert before final closing paren
+        if let Some(pos) = content.rfind("\n)") {
+            content.insert_str(pos, &instance_sexpr);
+        } else {
+            return Ok(CallToolResult::error(vec![Content::text(
+                "Could not find end of schematic file.".to_string()
+            )]));
+        }
+
+        if let Err(e) = fs::write(&path, &content).await {
+            return Ok(CallToolResult::error(vec![Content::text(format!("Failed to write: {e}"))]));
+        }
+
+        let lib_note = if already_in_lib { " (lib_symbols already present)" } else { " (lib_symbols definition added)" };
+        let mut result = vec![Content::text(format!(
+            "Added power symbol 'power:{}' at ({}, {}) rot={}° as {}{}\nLib: {}",
+            p.net_name, p.x, p.y, rotation, pwr_ref, lib_note, lib_path.display()
+        ))];
+
+        if let Some(img) = self.render_schematic_png(&p.path, None, false, 2400).await {
+            result.push(img);
+        }
+        Ok(CallToolResult::success(result))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -4927,6 +5486,347 @@ fn extract_quoted_after(text: &str, prefix: &str) -> Option<String> {
     let after = &text[pos + prefix.len()..];
     let end = after.find('"')?;
     Some(after[..end].to_string())
+}
+
+// ---------------------------------------------------------------------------
+// PCB spatial parsing helpers (used by list_nets, query_pads_in_region, etc.)
+// ---------------------------------------------------------------------------
+
+/// One pad from a PCB footprint, with computed absolute position.
+struct PcbPad {
+    reference: String,
+    pad_num: String,
+    net: String,
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+    is_thru_hole: bool,
+}
+
+/// Extract the pad number from a pad block: `(pad "NUM" ...`.
+fn extract_pad_number(block: &str) -> Option<String> {
+    let after = block.strip_prefix("(pad \"")?;
+    let end = after.find('"')?;
+    Some(after[..end].to_string())
+}
+
+/// Extract `(at DX DY)` from a pad block (relative position inside footprint).
+fn extract_pad_at(block: &str) -> Option<(f64, f64)> {
+    let pos = block.find("(at ")?;
+    let after = &block[pos + 4..];
+    let close = after.find(')')?;
+    let args: Vec<f64> = after[..close]
+        .split_whitespace()
+        .filter_map(|s| s.parse().ok())
+        .collect();
+    match args.as_slice() {
+        [x, y, ..] => Some((*x, *y)),
+        _ => None,
+    }
+}
+
+/// Extract `(size W H)` from a pad block.
+fn extract_pad_size(block: &str) -> Option<(f64, f64)> {
+    let pos = block.find("(size ")?;
+    let after = &block[pos + 6..];
+    let close = after.find(')')?;
+    let args: Vec<f64> = after[..close]
+        .split_whitespace()
+        .filter_map(|s| s.parse().ok())
+        .collect();
+    match args.as_slice() {
+        [w, h] => Some((*w, *h)),
+        _ => None,
+    }
+}
+
+/// Extract net name from `(net "NETNAME")` in a pad block.
+fn extract_pcb_pad_net(block: &str) -> Option<String> {
+    let prefix = "(net \"";
+    let pos = block.find(prefix)?;
+    let after = &block[pos + prefix.len()..];
+    let end = after.find('"')?;
+    Some(after[..end].to_string())
+}
+
+/// Parse all pads from a PCB file with computed absolute positions.
+fn parse_pcb_pads(content: &str) -> Vec<PcbPad> {
+    use pcb_edit::{block_end, extract_at, find_footprint_blocks};
+
+    let mut result = Vec::new();
+    let fp_blocks = find_footprint_blocks(content);
+
+    for (reference, range) in &fp_blocks {
+        let block = &content[range.clone()];
+        let (fp_x, fp_y, fp_rot) = extract_at(block).unwrap_or((0.0, 0.0, 0.0));
+        let rot_rad = fp_rot.to_radians();
+        let cos_r = rot_rad.cos();
+        let sin_r = rot_rad.sin();
+
+        let mut search = 0;
+        while let Some(rel) = block[search..].find("(pad \"") {
+            let pad_start = search + rel;
+            let pad_end = block_end(block, pad_start);
+            let pad_block = &block[pad_start..pad_end];
+
+            if let Some(pad_num) = extract_pad_number(pad_block) {
+                let (dx, dy) = extract_pad_at(pad_block).unwrap_or((0.0, 0.0));
+                let (pw, ph) = extract_pad_size(pad_block).unwrap_or((0.0, 0.0));
+                let net = extract_pcb_pad_net(pad_block).unwrap_or_default();
+                let is_thru_hole = pad_block.contains("thru_hole") || pad_block.contains("\"*.Cu\"");
+
+                // Apply footprint rotation to pad local offset
+                let abs_x = fp_x + dx * cos_r - dy * sin_r;
+                let abs_y = fp_y + dx * sin_r + dy * cos_r;
+
+                result.push(PcbPad {
+                    reference: reference.clone(),
+                    pad_num,
+                    net,
+                    x: abs_x,
+                    y: abs_y,
+                    width: pw,
+                    height: ph,
+                    is_thru_hole,
+                });
+            }
+            search = pad_end;
+        }
+    }
+    result
+}
+
+/// Minimum distance from point (px, py) to the segment A→B.
+fn point_to_segment_dist(px: f64, py: f64, ax: f64, ay: f64, bx: f64, by: f64) -> f64 {
+    let dx = bx - ax;
+    let dy = by - ay;
+    let len_sq = dx * dx + dy * dy;
+    if len_sq < 1e-12 {
+        return ((px - ax).powi(2) + (py - ay).powi(2)).sqrt();
+    }
+    let t = ((px - ax) * dx + (py - ay) * dy) / len_sq;
+    let t = t.clamp(0.0, 1.0);
+    let cx = ax + t * dx;
+    let cy = ay + t * dy;
+    ((px - cx).powi(2) + (py - cy).powi(2)).sqrt()
+}
+
+/// One routed segment parsed from a PCB file.
+struct PcbSegment {
+    x1: f64,
+    y1: f64,
+    x2: f64,
+    y2: f64,
+    layer: String,
+}
+
+/// Parse all `(segment ...)` entries from a PCB file.
+fn parse_pcb_segments(content: &str) -> Vec<PcbSegment> {
+    use pcb_edit::block_end;
+    let mut result = Vec::new();
+    let mut search = 0;
+    while let Some(rel) = content[search..].find("\n\t(segment") {
+        let seg_start = search + rel + 1;
+        let seg_end = block_end(content, seg_start);
+        let block = &content[seg_start..seg_end];
+
+        // Parse (start X Y) and (end X Y)
+        let start = parse_xy_field(block, "(start ");
+        let end   = parse_xy_field(block, "(end ");
+        let layer = parse_quoted_field(block, "(layer \"");
+
+        if let (Some((x1, y1)), Some((x2, y2)), Some(layer)) = (start, end, layer) {
+            result.push(PcbSegment { x1, y1, x2, y2, layer });
+        }
+        search = seg_end;
+    }
+    result
+}
+
+/// One via parsed from a PCB file.
+struct PcbVia {
+    x: f64,
+    y: f64,
+    layers: Vec<String>,
+}
+
+/// Parse all `(via ...)` entries from a PCB file.
+fn parse_pcb_vias(content: &str) -> Vec<PcbVia> {
+    use pcb_edit::block_end;
+    let mut result = Vec::new();
+    let mut search = 0;
+    while let Some(rel) = content[search..].find("\n\t(via") {
+        let via_start = search + rel + 1;
+        let via_end = block_end(content, via_start);
+        let block = &content[via_start..via_end];
+
+        if let Some((x, y)) = parse_xy_field(block, "(at ") {
+            let layers = parse_layers_field(block);
+            result.push(PcbVia { x, y, layers });
+        }
+        search = via_end;
+    }
+    result
+}
+
+/// Parse `(KEYWORD X Y)` returning (x, y).
+fn parse_xy_field(block: &str, keyword: &str) -> Option<(f64, f64)> {
+    let pos = block.find(keyword)?;
+    let after = &block[pos + keyword.len()..];
+    let close = after.find(')')?;
+    let args: Vec<f64> = after[..close]
+        .split_whitespace()
+        .filter_map(|s| s.parse().ok())
+        .collect();
+    match args.as_slice() {
+        [x, y, ..] => Some((*x, *y)),
+        _ => None,
+    }
+}
+
+/// Parse `(KEYWORD "VALUE")` returning the quoted value.
+fn parse_quoted_field(block: &str, prefix: &str) -> Option<String> {
+    let pos = block.find(prefix)?;
+    let after = &block[pos + prefix.len()..];
+    let end = after.find('"')?;
+    Some(after[..end].to_string())
+}
+
+/// Parse `(layers "L1" "L2" ...)` returning all layer names.
+fn parse_layers_field(block: &str) -> Vec<String> {
+    let mut layers = Vec::new();
+    if let Some(pos) = block.find("(layers ") {
+        let after = &block[pos + 8..];
+        if let Some(close) = after.find(')') {
+            let layer_str = &after[..close];
+            let mut s = layer_str;
+            while let Some(q) = s.find('"') {
+                let inner = &s[q + 1..];
+                if let Some(end) = inner.find('"') {
+                    layers.push(inner[..end].to_string());
+                    s = &inner[end + 1..];
+                } else {
+                    break;
+                }
+            }
+        }
+    }
+    layers
+}
+
+/// Build a connectivity graph and BFS from pad A to pad B.
+/// Returns Ok(true) if connected, Ok(false) if not, Err if pad not found.
+fn check_pad_connectivity(
+    pads: &[PcbPad],
+    segments: &[PcbSegment],
+    vias: &[PcbVia],
+    ref_a: &str, pad_a: &str,
+    ref_b: &str, pad_b: &str,
+) -> Result<bool, String> {
+    use std::collections::{HashMap, HashSet, VecDeque};
+
+    // Find absolute positions of both pads
+    let find = |r: &str, p: &str| -> Option<(f64, f64)> {
+        pads.iter().find(|pad| pad.reference == r && pad.pad_num == p)
+            .map(|pad| (pad.x, pad.y))
+    };
+    let (ax, ay) = find(ref_a, pad_a).ok_or_else(|| format!("pad {ref_a}/{pad_a} not found"))?;
+    let (bx, by) = find(ref_b, pad_b).ok_or_else(|| format!("pad {ref_b}/{pad_b} not found"))?;
+
+    // Node: (x_um, y_um, layer_index) — use layer as string key
+    type Node = (i64, i64, String);
+    let mut adj: HashMap<Node, Vec<Node>> = HashMap::new();
+
+    let mut add_edge = |a: Node, b: Node| {
+        adj.entry(a.clone()).or_default().push(b.clone());
+        adj.entry(b).or_default().push(a);
+    };
+
+    for seg in segments {
+        let a: Node = (coord_key(seg.x1), coord_key(seg.y1), seg.layer.clone());
+        let b: Node = (coord_key(seg.x2), coord_key(seg.y2), seg.layer.clone());
+        add_edge(a, b);
+    }
+
+    for via in vias {
+        let vx = coord_key(via.x);
+        let vy = coord_key(via.y);
+        // Vias connect all layer pairs they span
+        for l1 in &via.layers {
+            for l2 in &via.layers {
+                if l1 < l2 {
+                    let a: Node = (vx, vy, l1.clone());
+                    let b: Node = (vx, vy, l2.clone());
+                    add_edge(a, b);
+                }
+            }
+        }
+    }
+
+    // BFS — try starting from pad A on each copper layer
+    let target_x = coord_key(bx);
+    let target_y = coord_key(by);
+
+    for start_layer in &["F.Cu", "B.Cu"] {
+        let start: Node = (coord_key(ax), coord_key(ay), start_layer.to_string());
+        if !adj.contains_key(&start) {
+            continue;
+        }
+        let mut visited: HashSet<Node> = HashSet::new();
+        let mut queue: VecDeque<Node> = VecDeque::new();
+        queue.push_back(start.clone());
+        visited.insert(start);
+
+        while let Some(node) = queue.pop_front() {
+            if node.0 == target_x && node.1 == target_y {
+                return Ok(true);
+            }
+            if let Some(neighbors) = adj.get(&node) {
+                for next in neighbors {
+                    if !visited.contains(next) {
+                        visited.insert(next.clone());
+                        queue.push_back(next.clone());
+                    }
+                }
+            }
+        }
+    }
+    Ok(false)
+}
+
+/// Find KiCad power symbol library file, return path if found.
+fn find_power_symbol_lib() -> Option<std::path::PathBuf> {
+    let candidates = [
+        "/usr/share/kicad/symbols/power.kicad_sym",
+        "/usr/local/share/kicad/symbols/power.kicad_sym",
+    ];
+    // Also check user-local kicad versions
+    let mut paths: Vec<std::path::PathBuf> = candidates.iter().map(Into::into).collect();
+    if let Ok(home) = std::env::var("HOME") {
+        for ver in &["9.0", "8.0", "7.0"] {
+            paths.push(format!("{home}/.local/share/kicad/{ver}/symbols/power.kicad_sym").into());
+        }
+    }
+    paths.into_iter().find(|p| p.exists())
+}
+
+/// Extract the `(symbol "power:NET" ...)` block from a .kicad_sym library file.
+fn extract_lib_symbol(lib_content: &str, net_name: &str) -> Option<String> {
+    use pcb_edit::block_end;
+    let marker = format!("(symbol \"power:{net_name}\"");
+    let pos = lib_content.find(&marker)?;
+    // Walk back to find the opening paren at the start of this symbol block
+    let start = lib_content[..pos].rfind('\n').map(|p| p + 1).unwrap_or(pos);
+    let end = block_end(lib_content, pos);
+    // Rewrite lib_id form to embedded form: strip leading whitespace, keep inner content
+    let raw = &lib_content[start..end];
+    // Indent one level for lib_symbols embedding
+    let indented: String = raw.lines()
+        .map(|l| if l.is_empty() { String::new() } else { format!("\t\t{l}") })
+        .collect::<Vec<_>>()
+        .join("\n");
+    Some(indented)
 }
 
 // ---------------------------------------------------------------------------
