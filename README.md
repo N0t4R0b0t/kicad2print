@@ -34,7 +34,7 @@ No chemicals, no etching, no minimum order. A functional PCB in a few hours.
 4. **Electroplate copper** into the grooves using a copper sulfate bath
 5. **Test traces**, then solder your components
 
-Produces thinner, more accurate traces and no wire handling. Requires a simple electrolysis setup.
+Produces thinner, more accurate traces and no wire handling. Requires a simple electrolysis setup — see [docs/ELECTROLYSIS.md](docs/ELECTROLYSIS.md) for the full end-to-end procedure: seed paints, bath chemistry, sourcing, plating run, and installing eyelets before plating so they become part of the copper layer.
 
 ---
 
@@ -97,10 +97,17 @@ Each run produces the following in `--output-dir` (default `./output/`):
 |---|---|
 | `boardname.stl` | Binary STL for slicers (when format = `stl` or `both`) |
 | `boardname.3mf` | 3MF with metadata (when format = `3mf` or `both`) |
-| `boardname_preview.html` | Self-contained interactive 3D viewer (no server needed) |
-| `boardname_assembly.html` | Step-by-step assembly guide (wire-laying or plating, depending on mode) |
+| `boardname_guide.html` | Unified build guide — tabbed view with **assembly steps**, **continuity test**, and an interactive **3D preview**, tailored to the selected mode |
 
-Open either HTML file in any browser — no server needed.
+Open the guide in any browser — no server needed.
+
+### What's in the unified guide
+
+- **Assembly tab** — step-by-step instructions for the selected mode (wire-laying or plating), with images and the BOM.
+- **Continuity test tab** — an interactive SVG board diagram. Pick a net from the sidebar and probe dots pulse on every pad that should be electrically connected, so you can verify continuity with a multimeter after wiring or plating.
+  - Through-hole **and SMD pads** (e.g. SOIC, SOT, QFN) are included — anything with a net name gets a probe dot.
+  - **Power-rail nets** that KiCad didn't name in the schematic (the `unconnected-*` nets KiCad auto-creates when 2+ pads share a node) are detected and listed with a ⚠ marker, so power and ground continuity can still be verified.
+- **3D preview tab** — the same interactive three.js viewer, embedded directly in the guide.
 
 ---
 
@@ -170,7 +177,7 @@ Settings are merged in order: **built-in defaults → TOML file → CLI flags**.
 
 kicad2print also ships an MCP server that lets Claude Desktop read and make small edits to your KiCad project — useful for quick targeted changes like swapping a footprint, checking the BOM, or running DRC without opening KiCad.
 
-> **Important:** The MCP server is a convenience shortcut, not a replacement for KiCad. For anything beyond small, targeted edits — rerouting, schematic changes, major layout work — you need to open the project in KiCad directly. The MCP server is best used to inspect, tweak, and validate; KiCad is where you design.
+> **These tools will not replace KiCad and can make your board worse.** Read [docs/MCP_KICAD_TOOLS.md](docs/MCP_KICAD_TOOLS.md) before using them on a board you care about. Commit your work before starting any AI editing session.
 
 ### Setup
 
@@ -192,9 +199,10 @@ Restart Claude Desktop. The KiCad tools will appear automatically.
 ### What you can do
 
 - **Scan a project** — get a rendered board image, full BOM, and file list in one shot
+- **Inspect before routing** — query pad positions, check net names, verify clearances before touching traces
 - **Swap a footprint** — e.g. change an Arduino Uno to a Nano without opening KiCad
 - **Check the BOM** — export a CSV of all components and quantities
-- **Run DRC** — get a JSON report of design rule violations
+- **Run DRC** — get a JSON report of violations with a board render
 - **Convert to substrate** — generate the printable STL/3MF directly from the chat
 
 ### Example
@@ -203,36 +211,49 @@ Restart Claude Desktop. The KiCad tools will appear automatically.
 You:    Scan my project at /home/me/myboard/kicad
 Claude: [renders the board, shows BOM, lists all files]
 
-You:    Swap U1 from the Uno footprint to an Arduino Nano
-Claude: [searches libraries, reads PCB, replaces footprint,
-         writes back, renders updated board, runs DRC]
+You:    What nets are on this board and which pads carry VBUS?
+Claude: [calls list_nets — returns every net name and connected pad list]
+
+You:    Check if a 0.4mm trace from (97,63) to (113,63) on B.Cu is safe
+Claude: [calls check_trace_clearance — reports any pad collisions before routing]
 
 You:    Convert it to a printable substrate
 Claude: [runs kicad2print conversion, returns STL + preview]
 ```
 
-### Available tools
+### Key tools
 
 | Tool | Description |
 |---|---|
 | `scan_project` | **Start here** — renders board, returns BOM and file list |
+| `list_nets` | All nets with connected pads — **call before any edit** to get correct net names |
+| `get_net_for_pad` | Net name and absolute position of one pad |
+| `query_pads_in_region` | All pads in a bounding box — inspect an area before routing |
+| `check_trace_clearance` | Collision check for a proposed trace — run before `add_trace` |
+| `verify_connectivity` | Confirm two pads are physically wired by existing traces/vias |
+| `add_power_symbol` | Place a power net symbol with correct `lib_symbols` definition |
 | `render_pcb` | Render the board (top / bottom / side views) |
-| `run_drc` | Run Design Rules Check — JSON report of violations |
-| `export_bom` | Export Bill of Materials as CSV |
-| `export_netlist` | Export full component + net connectivity |
+| `run_drc` | Design Rules Check — JSON report + board render |
+| `export_layer_svg` | Export copper layers as SVG + PNG image |
 | `replace_footprint` | Swap a component footprint in the PCB file |
-| `move_component` | Move a component to new coordinates |
-| `search_footprint` | Search footprints by name across all libraries |
-| `list_footprint_libraries` | List all installed `.pretty` libraries |
-| `get_footprint` | Get the raw S-expression for a footprint |
-| `export_layer_svg` | Export PCB layers as SVG |
 | `convert_pcb` | Convert PCB to 3D-printable substrate (STL/3MF) |
-| `read_kicad_file` | Read any `.kicad_pcb` or `.kicad_sch` file |
-| `write_kicad_file` | Write a modified design file back to disk |
 
-> **Note:** `render_pcb` requires `kicad-cli` (part of KiCad 9+). Footprint search requires the `kicad-library` package (`sudo pacman -S kicad-library` on Arch/Manjaro).
+See [docs/MCP_KICAD_TOOLS.md](docs/MCP_KICAD_TOOLS.md) for the full tool list, risk levels, recommended workflow, and known limitations.
+
+> **Note:** `render_pcb` and `export_layer_svg` require `kicad-cli` (part of KiCad 9+). `export_layer_svg` PNG output requires `rsvg-convert` (`librsvg`). Footprint search requires the `kicad-library` package (`sudo pacman -S kicad-library` on Arch/Manjaro).
 
 ---
+
+## Troubleshooting
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| `Failed to read KiCad file` | Wrong path or unreadable file | Check the path; confirm the file is a `.kicad_pcb`, not a `.kicad_sch` |
+| `No board outline found` | Missing geometry on the `Edge.Cuts` layer | Add a board outline in KiCad (Place → Line on Edge.Cuts) |
+| Channels printed too narrow to fit wire | Source traces narrower than `channel_width_mm` and `scale_factor` is non-zero | Set `scale_factor = 0` to auto-scale, or increase `scale_factor` |
+| Eyelets won't press in | `eyelet_diameter_mm` smaller than your eyelets | Measure your eyelets with calipers and update the setting |
+| MCP `render_pcb` fails | `kicad-cli` not on `PATH` | Install KiCad 9+ |
+| MCP `search_footprint` returns nothing | KiCad footprint libraries not installed | Install `kicad-library` (e.g. `sudo pacman -S kicad-library` on Arch/Manjaro) |
 
 ## How the conversion works
 
