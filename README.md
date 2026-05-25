@@ -4,6 +4,12 @@ Convert KiCad PCB designs into 3D-printable substrate models for the **hybrid PC
 
 [![Build & Release](https://github.com/N0t4R0b0t/kicad2print/actions/workflows/release.yml/badge.svg)](https://github.com/N0t4R0b0t/kicad2print/actions/workflows/release.yml)
 
+<p align="center">
+  <img src="examples/ps2-serial-mouse-adapter/guide-demo.gif" alt="kicad2print unified build guide demo — assembly steps, interactive continuity test, and 3D preview" width="800"/>
+  <br/>
+  <em>The generated build guide: assembly steps, an interactive continuity test that pulses probe dots on every pad of the selected net, and an embedded 3D model — all in one self-contained HTML file.</em>
+</p>
+
 | 3D Substrate Preview | Assembly Guide |
 |:---:|:---:|
 | [![3D substrate preview](examples/ps2-serial-mouse-adapter/assembly.png)](https://github.com/N0t4R0b0t/kicad2print/blob/master/examples/ps2-serial-mouse-adapter/ps2-serial-mouse-adapter.stl) | [![Assembly guide](examples/ps2-serial-mouse-adapter/preview.png)](https://github.com/N0t4R0b0t/kicad2print/blob/master/examples/ps2-serial-mouse-adapter/preview.png) |

@@ -6,6 +6,7 @@
 *.stl
 *.3mf
 *_preview.html
+*_guide.html
 
 # Keep example files
 !examples/**/*.stl
@@ -21,3 +22,6 @@ desktop.ini
 logs/
 *.log
 .claude/
+
+# Personal / unpublished drafts
+LINKEDIN.md
