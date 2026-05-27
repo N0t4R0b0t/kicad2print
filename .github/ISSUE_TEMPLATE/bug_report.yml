@@ -1,0 +1,69 @@
+name: Bug report
+description: Something isn't working as expected
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to report a bug. Please fill in as much detail as possible so we can reproduce it quickly.
+
+  - type: input
+    id: version
+    attributes:
+      label: kicad2print version
+      description: Run `kicad2print --version` and paste the output.
+      placeholder: "e.g. 1.1.0"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating system
+      options:
+        - Linux x86-64
+        - Windows x86-64
+        - Other (describe below)
+    validations:
+      required: true
+
+  - type: textarea
+    id: command
+    attributes:
+      label: Command you ran
+      description: The exact command line, including flags and file name.
+      placeholder: "kicad2print my_board.kicad_pcb --mode electrolysis"
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behaviour
+      placeholder: "The STL should have been generated in the output folder."
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behaviour
+      description: Paste the full terminal output, including any error messages.
+      render: shell
+    validations:
+      required: true
+
+  - type: textarea
+    id: board
+    attributes:
+      label: Board details (optional)
+      description: >
+        If the bug is board-specific, describe the relevant properties (layer
+        count, pad types, net count) or attach a minimal reproducer `.kicad_pcb`
+        file. Do not share proprietary designs.
+
+  - type: textarea
+    id: extra
+    attributes:
+      label: Anything else?
+      description: Links, screenshots, related issues, workarounds you tried.
