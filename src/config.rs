@@ -380,7 +380,12 @@ impl Config {
                     if overrides.channel_depth_mm.is_none()
                         && (self.channel_depth_mm - default_channel_depth()).abs() < f64::EPSILON
                     {
-                        self.channel_depth_mm = 0.5;
+                        self.channel_depth_mm = 0.8;
+                    }
+                    if overrides.substrate_thickness_mm.is_none()
+                        && (self.substrate_thickness_mm - default_substrate_thickness()).abs() < f64::EPSILON
+                    {
+                        self.substrate_thickness_mm = 2.2;
                     }
                     if overrides.eyelet_style.is_none()
                         && self.eyelet_style == default_eyelet_style()
