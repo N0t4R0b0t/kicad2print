@@ -9,8 +9,8 @@
 //!   • Continuity Test — net-by-net probe guide with pad overlay on board image
 //!   • 3D Model        — interactive GLB viewer (requires kicad-cli)
 
-use crate::config::{AssemblyStep, Mode};
-use crate::pcb::{BoundingBox, PcbData, Point2};
+use crate::config::{AssemblyStep, Config, Mode};
+use crate::pcb::{ArcTrace, BoundingBox, PcbData, Point2};
 use anyhow::Result;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
@@ -101,10 +101,10 @@ fn export_board_svg_b64(pcb_input: &Path) -> Option<String> {
 
 // ── Assembly step helpers ────────────────────────────────────────────────────
 
-fn default_steps(pcb: &PcbData, mode: Mode) -> Vec<AssemblyStep> {
-    match mode {
+fn default_steps(pcb: &PcbData, config: &Config) -> Vec<AssemblyStep> {
+    match config.mode {
         Mode::CopperWire => default_steps_copper_wire(pcb),
-        Mode::Electrolysis => default_steps_electrolysis(pcb),
+        Mode::Electrolysis => default_steps_electrolysis(pcb, config),
     }
 }
 
@@ -145,7 +145,109 @@ fn default_steps_copper_wire(pcb: &PcbData) -> Vec<AssemblyStep> {
     steps
 }
 
-fn default_steps_electrolysis(pcb: &PcbData) -> Vec<AssemblyStep> {
+/// Copper plating statistics derived from the trace geometry and channel
+/// dimensions. Used to populate the electroplating step of the build guide so
+/// the user can calibrate their power supply and estimate plating time.
+struct PlatingStats {
+    /// Total length of all copper traces (F.Cu + B.Cu, straight + arc), mm.
+    length_mm: f64,
+    /// Top-projected copper area (length × channel width), cm².
+    projected_cm2: f64,
+    /// Wetted groove surface area (length × (width + 2·depth)), cm². This is the
+    /// surface the seed coat covers and where plating current flows.
+    wetted_cm2: f64,
+    /// Recommended plating current at the assumed current density, mA.
+    recommended_ma: f64,
+    /// Rough time to fill the grooves to channel depth, minutes.
+    fill_minutes: f64,
+}
+
+/// Assumed cathode current density for acid-copper plating, A/cm².
+/// 20 mA/cm² is a conservative mid-range value for hobby CuSO₄ baths.
+const PLATING_CURRENT_DENSITY: f64 = 0.020;
+
+/// Length of a three-point arc trace (mm), falling back to the chord length for
+/// degenerate (collinear) arcs.
+fn arc_length(a: &ArcTrace) -> f64 {
+    let (sx, sy) = (a.start.x, a.start.y);
+    let (mx, my) = (a.mid.x, a.mid.y);
+    let (ex, ey) = (a.end.x, a.end.y);
+    let d = 2.0 * (sx * (my - ey) + mx * (ey - sy) + ex * (sy - my));
+    if d.abs() < 1e-9 {
+        return ((ex - sx).powi(2) + (ey - sy).powi(2)).sqrt();
+    }
+    let s2 = sx * sx + sy * sy;
+    let m2 = mx * mx + my * my;
+    let e2 = ex * ex + ey * ey;
+    let ux = (s2 * (my - ey) + m2 * (ey - sy) + e2 * (sy - my)) / d;
+    let uy = (s2 * (ex - mx) + m2 * (sx - ex) + e2 * (mx - sx)) / d;
+    let r = ((sx - ux).powi(2) + (sy - uy).powi(2)).sqrt();
+    let norm = |x: f64| -> f64 {
+        let t = std::f64::consts::TAU;
+        ((x % t) + t) % t
+    };
+    let a1 = (sy - uy).atan2(sx - ux);
+    let a2 = (ey - uy).atan2(ex - ux);
+    let am = (my - uy).atan2(mx - ux);
+    let s_to_e = norm(a2 - a1);
+    let s_to_m = norm(am - a1);
+    let sweep = if s_to_m <= s_to_e { s_to_e } else { std::f64::consts::TAU - s_to_e };
+    r * sweep
+}
+
+/// Compute copper plating statistics from the PCB geometry and channel config.
+fn plating_stats(pcb: &PcbData, channel_w: f64, channel_d: f64) -> PlatingStats {
+    let mut length_mm = 0.0;
+    for t in pcb.traces_fcu.iter().chain(pcb.traces_bcu.iter()) {
+        length_mm += t.start.distance_to(t.end);
+    }
+    for a in &pcb.arc_traces {
+        length_mm += arc_length(a);
+    }
+
+    // mm² → cm² (÷100).
+    let projected_cm2 = length_mm * channel_w / 100.0;
+    let wetted_cm2 = length_mm * (channel_w + 2.0 * channel_d) / 100.0;
+
+    let current_a = wetted_cm2 * PLATING_CURRENT_DENSITY;
+    let recommended_ma = current_a * 1000.0;
+
+    // Faraday's law: charge to deposit enough copper to fill the grooves.
+    //   Q = m·n·F / M, with m = ρ·V, V = length × width × depth.
+    const M_CU: f64 = 63.55; // g/mol
+    const N: f64 = 2.0; // electrons per Cu²⁺
+    const FARADAY: f64 = 96485.0; // C/mol
+    const RHO_CU: f64 = 8.96; // g/cm³
+    const EFFICIENCY: f64 = 0.95; // current efficiency of acid-copper plating
+    let fill_volume_cm3 = length_mm * channel_w * channel_d / 1000.0; // mm³ → cm³
+    let mass_g = fill_volume_cm3 * RHO_CU;
+    let charge_c = mass_g * N * FARADAY / M_CU / EFFICIENCY;
+    let fill_minutes = if current_a > 0.0 { charge_c / current_a / 60.0 } else { 0.0 };
+
+    PlatingStats { length_mm, projected_cm2, wetted_cm2, recommended_ma, fill_minutes }
+}
+
+/// Build the electroplating step instruction, embedding the computed copper area
+/// and recommended power-supply settings.
+fn electroplate_instruction(s: &PlatingStats, channel_d: f64) -> String {
+    format!(
+        "Connect the board as cathode in a copper sulfate (CuSO₄) bath. \
+Copper to plate: ≈ {wetted:.1} cm² wetted groove surface ({proj:.1} cm² projected, {len:.0} mm total trace). \
+Recommended current: ≈ {ma:.0} mA (at {cd:.0} mA/cm²), 1–2 V. \
+Rough time to fill the {depth:.1} mm grooves: ≈ {mins:.0} min — scales inversely with current and is only an estimate \
+(the wetted area shrinks as grooves fill), so finish by visual fill + continuity check rather than the clock. \
+Rinse and dry when done.",
+        wetted = s.wetted_cm2,
+        proj = s.projected_cm2,
+        len = s.length_mm,
+        ma = s.recommended_ma,
+        cd = PLATING_CURRENT_DENSITY * 1000.0,
+        depth = channel_d,
+        mins = s.fill_minutes,
+    )
+}
+
+fn default_steps_electrolysis(pcb: &PcbData, config: &Config) -> Vec<AssemblyStep> {
     let mut steps = Vec::new();
     if !pcb.footprints.is_empty() {
         steps.push(AssemblyStep {
@@ -172,11 +274,12 @@ fn default_steps_electrolysis(pcb: &PcbData) -> Vec<AssemblyStep> {
         });
     }
     if !pcb.traces_fcu.is_empty() || !pcb.traces_bcu.is_empty() {
+        let stats = plating_stats(pcb, config.channel_width_mm, config.channel_depth_mm);
         steps.push(AssemblyStep {
             name: "Electroplate copper".to_string(),
             components: vec![],
             wire_layer: None,
-            instruction: "Connect the board as cathode in a copper sulfate bath. Apply current until grooves are filled. Rinse and dry.".to_string(),
+            instruction: electroplate_instruction(&stats, config.channel_depth_mm),
         });
     }
     if !pcb.vias.is_empty() {
@@ -428,11 +531,11 @@ fn collect_continuity(pcb: &PcbData, board_svg_b64: &Option<String>) -> Option<C
 
 // ── Main write function ──────────────────────────────────────────────────────
 
-pub fn write(pcb: &PcbData, pcb_input: &Path, steps_cfg: &[AssemblyStep], mode: Mode, stem: &str, path: &Path) -> Result<()> {
-    let steps: Vec<AssemblyStep> = if steps_cfg.is_empty() {
-        default_steps(pcb, mode)
+pub fn write(pcb: &PcbData, pcb_input: &Path, config: &Config, stem: &str, path: &Path) -> Result<()> {
+    let steps: Vec<AssemblyStep> = if config.assembly_steps.is_empty() {
+        default_steps(pcb, config)
     } else {
-        steps_cfg.to_vec()
+        config.assembly_steps.to_vec()
     };
     if steps.is_empty() { return Ok(()); }
 
@@ -458,8 +561,8 @@ pub fn write(pcb: &PcbData, pcb_input: &Path, steps_cfg: &[AssemblyStep], mode: 
 
     let stem_esc = html_escape(stem);
     let a_total = steps.len();
-    let glb_data_uri = match &glb_b64 {
-        Some(b64) => format!("\"data:model/gltf-binary;base64,{b64}\""),
+    let glb_b64_literal = match &glb_b64 {
+        Some(b64) => format!("\"{b64}\""),
         None => "null".to_string(),
     };
 
@@ -599,7 +702,7 @@ pub fn write(pcb: &PcbData, pcb_input: &Path, steps_cfg: &[AssemblyStep], mode: 
         html.push_str("const C_PADS=[];\nconst C_STEPS=[];\nconst C_TOTAL=0;\n");
     }
 
-    let _ = write!(html, "const GLB_DATA_URI={glb_data_uri};\n");
+    let _ = write!(html, "const GLB_B64={glb_b64_literal};\n");
 
     html.push_str(ASSEMBLY_JS);
     html.push_str(CONTINUITY_JS);
@@ -883,7 +986,7 @@ const THREED_JS: &str = r#"
 let renderer3d = null;
 function init3d() {
   if (renderer3d) return;
-  if (!GLB_DATA_URI) {
+  if (!GLB_B64) {
     document.getElementById('canvas3d').style.display = 'none';
     document.getElementById('no-3d').style.display = 'block';
     return;
@@ -903,7 +1006,11 @@ function init3d() {
   const dl2 = new THREE.DirectionalLight(0xffffff, 0.5); dl2.position.set(-10,-10,-5); scene.add(dl2);
   let boardObj = null;
   const loader = new THREE.GLTFLoader();
-  loader.load(GLB_DATA_URI, gltf => {
+  // Decode the embedded base64 GLB to an ArrayBuffer and parse it directly.
+  // Using loader.parse() (not loader.load() with a data: URI) avoids three.js
+  // resolving a resource path against the document, which the browser blocks
+  // as a cross-origin file:// load when the page is opened from disk.
+  const onLoad = gltf => {
     boardObj = gltf.scene; scene.add(boardObj);
     const box = new THREE.Box3().setFromObject(boardObj);
     const center = new THREE.Vector3(); box.getCenter(center);
@@ -913,10 +1020,19 @@ function init3d() {
     const camDist = Math.abs(maxDim/2/Math.tan(camera.fov*Math.PI/360))*1.8;
     camera.position.set(0, camDist*0.4, camDist);
     camera.lookAt(0,0,0);
-  }, undefined, () => {
+  };
+  const onError = () => {
     document.getElementById('canvas3d').style.display = 'none';
     document.getElementById('no-3d').style.display = 'block';
-  });
+  };
+  try {
+    const bin = atob(GLB_B64);
+    const bytes = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+    loader.parse(bytes.buffer, '', onLoad, onError);
+  } catch (e) {
+    onError();
+  }
   let isDragging=false, isPanning=false, prev={x:0,y:0};
   const rot={x:0.3,y:0};
   canvas.addEventListener('mousedown', e => { isDragging=e.button===0; isPanning=e.button===2; prev={x:e.clientX,y:e.clientY}; });
