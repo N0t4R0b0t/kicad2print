@@ -31,12 +31,12 @@ No chemicals, no etching, no minimum order. A functional PCB in a few hours.
 ### Electroplated copper (`--mode electrolysis`)
 
 1. **Design your PCB normally in KiCad**
-2. **Print the substrate** — narrower grooves sized to the actual trace width
-3. **Apply conductive primer** to all trace grooves
+2. **Print the substrate** — narrower grooves sized to the actual trace width — plus the **snap-on stencil** kicad2print generates alongside it
+3. **Apply conductive primer** — snap on the stencil and squeegee paint so it lands only in the grooves; the stencil also lays down a temporary bus that shorts every trace for plating
 4. **Electroplate copper** into the grooves using a copper sulfate bath
-5. **Test traces**, then solder your components
+5. **Grind off the bus**, **test traces**, then solder your components
 
-Produces thinner, more accurate traces and no wire handling. Requires a simple electrolysis setup — see [docs/ELECTROLYSIS.md](docs/ELECTROLYSIS.md) for the full end-to-end procedure: seed paints, bath chemistry, sourcing, plating run, and installing eyelets before plating so they become part of the copper layer.
+Produces thinner, more accurate traces and no wire handling. The auto-generated stencil keeps paint out of the flat areas (minimal cleanup) and handles the "every net must reach the cathode" rule for you. Requires a simple electrolysis setup — see [docs/ELECTROLYSIS.md](docs/ELECTROLYSIS.md) for the full end-to-end procedure: seed paints, bath chemistry, sourcing, plating run, and installing eyelets before plating so they become part of the copper layer.
 
 ---
 

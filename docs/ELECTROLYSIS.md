@@ -61,7 +61,7 @@ Steps 1–2 are software/printer; steps 3–7 are the wet workflow; step 8 is no
 >
 > If you forget a bridge on even one net, that entire net will not plate — you'll have copper everywhere except on the one trace you forgot, and you won't notice until you do the post-plating continuity check.
 >
-> This is currently a **manual KiCad design step**: add the bridges as regular traces on a sacrificial "plating bus" net before running kicad2print, then cut them physically after plating. A future kicad2print feature could auto-generate these — see [Open improvements](#open-improvements) below.
+> **kicad2print can build this bus for you.** In `--mode electrolysis` it emits a snap-on **stencil** (`boardname_stencil_top.stl`/`_stencil_bottom.stl`) carrying a perimeter rail plus one stub to every electrically-isolated trace — a single cathode contact for the whole side, derived automatically from the geometry. After plating you grind the rail flush to restore isolation. See [the plating bus and sacrificial bridges](#the-plating-bus-and-sacrificial-bridges). You can still do it by hand in KiCad if you prefer (also documented there).
 
 ### What's happening physically
 
@@ -132,6 +132,8 @@ kicad2print my_board.kicad_pcb --config kicad2print.toml
 
 The generated `boardname_guide.html` includes a continuity-test tab that's especially valuable for plating: you'll use it at steps 5 and 7 to verify every net.
 
+Electrolysis mode also emits a **snap-on paint stencil** alongside the substrate — `boardname_stencil_top.stl` (and `_stencil_bottom.stl` for two-sided boards). This masks the board for seeding and carries the temporary plating bus; see [step 3](#the-plating-bus-and-sacrificial-bridges) for what it does and [step 4](#step-4--apply-seed-paint) for how to use it. Set `generate_stencil = false` (or omit the `--stencil` flag in other modes) to skip it.
+
 ---
 
 ## Step 2 — Print the substrate
@@ -163,7 +165,27 @@ Press each eyelet into its through-hole until the flange sits flush on the top s
 
 ### The plating bus and sacrificial bridges
 
-As called out in the [design rule above](#-the-most-important-design-rule-every-net-must-reach-the-cathode), every net needs a path to a single cathode-contact point. The standard way to do this:
+As called out in the [design rule above](#-the-most-important-design-rule-every-net-must-reach-the-cathode), every net needs a path to a single cathode-contact point. You can let kicad2print build this bus for you as a **snap-on stencil**, or draw it by hand in KiCad. The stencil is the recommended path — it also doubles as a seeding mask.
+
+#### Automated — the snap-on stencil (recommended)
+
+`--mode electrolysis` automatically emits a stencil for each copper side that has traces:
+
+- `boardname_stencil_top.stl`
+- `boardname_stencil_bottom.stl` (only if the board has back-copper traces)
+
+Print it in any filament — it's a reusable tool, not part of the board — and it does two jobs at once:
+
+1. **Masks the board for seeding.** Through-slots sit exactly over every groove. Snap the stencil onto the printed substrate (a perimeter lip grips the board edge), squeegee seed paint across it, then lift it off — paint lands only in the channels. No spray-and-sand, almost no cleanup (see step 4).
+2. **Adds the temporary bus.** Extra slots form a perimeter rail just inside the board edge plus one short stub to **every electrically-isolated trace**. kicad2print finds those isolated traces geometrically, so you don't have to think about nets at all. After seeding, the rail and stubs become raised conductive bars that short every trace together, so the whole side plates from a single cathode clip on the rail.
+
+After plating you **grind the rail and stubs off** to restore isolation (see step 7). Because the bus bars sit proud on the flat substrate — while the real traces are recessed in their grooves — grinding the surface flush removes the bus without touching the traces.
+
+Tune it in the preset/config via the `stencil_*` and `bus_*` keys (plate/slot/lip dimensions, bus width and inset); the defaults are a good starting point for a well-tuned printer. Best on rectangular outlines — the rail follows the board's bounding box.
+
+#### Manual — KiCad bridges (alternative)
+
+If you'd rather bake the bus into the design (e.g. a strongly non-rectangular board, or you want the bridges at specific points):
 
 - **Pick one location** on the board edge for the cathode clip — a bus eyelet works well, or a wide pad.
 - **In KiCad, before generating the substrate**, draw thin "bridge" traces from this bus point to **one pad on every net**. Treat them as part of the design.
@@ -230,7 +252,17 @@ For a first attempt, **guitar shielding paint** is the sweet spot: brushable, st
 
 ### Application
 
-**Brush-on (recommended for most boards):**
+**Snap-on stencil (recommended — see [step 3](#the-plating-bus-and-sacrificial-bridges)):**
+
+1. Stir the paint thoroughly — conductive particles settle.
+2. Snap the printed stencil onto the substrate; the perimeter lip locates it over the grooves.
+3. Spread paint across the stencil with a squeegee or stiff card, working it into the slots (grooves + bus rail + stubs).
+4. Lift the stencil straight off before the paint skins over. Paint is now only in the channels and the bus — the flat surface stays clean.
+5. Let it cure, then add a second pass if any groove looks thin. Touch up the trace-to-eyelet transitions by hand if the slot didn't fully reach the flange.
+
+This is the lowest-cleanup method and gives the most consistent trace width, since the slot — not your brush — defines the paint edge.
+
+**Brush-on (recommended when you don't have the stencil):**
 
 1. Stir the paint thoroughly — conductive particles settle.
 2. With a fine brush, paint every groove. Make sure the paint **fully bridges from the trace into the eyelet flange** — gaps here will become breaks in the plated copper.
@@ -399,9 +431,14 @@ If a net shows higher than expected resistance, look for places where the seed d
 
 ---
 
-### Cut the sacrificial bridges
+### Remove the plating bus
 
-Before soldering components, **cut every plating bridge** to restore the net isolation your design needs. A sharp hobby knife works for thin bridges; a Dremel cut-off wheel is faster for many bridges. After cutting, re-run the continuity check from step 7 — now you should see:
+Before soldering components, **remove the temporary bus** to restore the net isolation your design needs.
+
+- **Stencil bus (automated):** the rail and stubs are raised bars on the otherwise-flat surface, while the real traces sit recessed in their grooves. Grind or sand the surface flush — a Dremel with a sanding drum, or hand-sanding with a flat block — until the rail and every stub are gone. The recessed traces are below the surface, so they're untouched. Work the board edge (where the rail runs) and each stub takeoff.
+- **KiCad bridges (manual):** **cut every plating bridge.** A sharp hobby knife works for thin bridges; a Dremel cut-off wheel is faster for many bridges.
+
+After removal, re-run the continuity check from step 7 — now you should see:
 
 - Continuity within each net (still good)
 - **Open circuit between different nets** (now correct, where before it was shorted via the bridges)
@@ -491,8 +528,9 @@ After copper plating, swap to a nickel sulfamate or Watts nickel bath and plate 
 
 Two viable styles:
 
-- **Brush seed only into grooves and onto eyelet flanges** — cleaner, no sanding step, lower seed material usage. Recommended for most projects.
-- **Spray seed over the whole surface, then sand the flat areas off** — easier to apply (no precision brushwork), trace edges come out crisp because the groove walls protect the seed. Recommended if you have many fine traces and don't mind the sanding step.
+- **Snap-on stencil** — squeegee seed across the printed stencil so it lands only in the grooves and bus. No brushwork, no whole-surface sanding, crispest trace edges, and it builds the plating bus at the same time. Recommended whenever the stencil applies (rectangular boards). See [step 4](#step-4--apply-seed-paint).
+- **Brush seed only into grooves and onto eyelet flanges** — cleaner than spraying, no sanding step, lower seed material usage. Good when you don't have the stencil.
+- **Spray seed over the whole surface, then sand the flat areas off** — easier to apply (no precision brushwork), trace edges come out crisp because the groove walls protect the seed. Good for many fine traces if you don't mind the sanding step.
 
 ### Why eyelets go in before plating, not after
 
@@ -512,7 +550,7 @@ If you install eyelets after plating, you have to make a separate electrical con
 
 Things this guide identifies as manual steps today that could become tooling:
 
-- **Auto-generate plating bridges in kicad2print.** A `--plating-bus <edge>` flag could detect every net, route a thin sacrificial bridge from each net's nearest pad to a bus rail along the specified board edge, and add visible cut markers in the substrate model. This would make the "every net must reach the cathode" rule a property of the generator instead of a design discipline the user has to remember.
+- ✅ **Auto-generate the plating bus** — *shipped.* `--mode electrolysis` (or `--stencil`) emits a snap-on stencil with a perimeter bus rail plus one stub to every electrically-isolated trace, found geometrically from the unioned traces (no netlist needed). The bus is removed by grinding the raised bars flush after plating rather than cutting marked bridges. Possible follow-ups: route the bus into the substrate itself as an option, and bias the rail to a chosen edge on non-rectangular boards.
 - **Bridge cut markers in the unified guide.** The continuity-test tab could highlight bridge locations and walk the user through cutting them after plating, with an explicit "bridges cut?" verification mode that flips the expected continuity for previously-bridged net pairs from "connected" to "isolated".
 - **Plating bus continuity check before bath.** A guide mode that explicitly walks every net → bus, ticking off each net as verified, to catch missing bridges before any chemistry is mixed.
 

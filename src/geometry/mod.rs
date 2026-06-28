@@ -24,7 +24,7 @@ use geo::{BooleanOps, Coord, LineString, MultiPolygon, Polygon};
 // No external clipper fallback available; use guarded geo unions.
 
 use crate::config::Config;
-use crate::pcb::{BoardOutline, CutoutShape, Pad, PcbData, Point2, Trace};
+use crate::pcb::{BoardOutline, CopperLayer, CutoutShape, Pad, PcbData, Point2, Trace};
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -492,6 +492,32 @@ fn add_channel(
     }
 }
 
+/// Axis-aligned rectangle as a CCW polygon ring (no holes).
+fn rect_poly(x0: f64, y0: f64, x1: f64, y1: f64) -> Polygon {
+    Polygon::new(
+        LineString::new(vec![
+            Coord { x: x0, y: y0 },
+            Coord { x: x1, y: y0 },
+            Coord { x: x1, y: y1 },
+            Coord { x: x0, y: y1 },
+            Coord { x: x0, y: y0 },
+        ]),
+        vec![],
+    )
+}
+
+/// Nearest point to `p` on segment `a`→`b` (clamped to the endpoints).
+fn nearest_on_segment(p: Point2, a: Point2, b: Point2) -> Point2 {
+    let abx = b.x - a.x;
+    let aby = b.y - a.y;
+    let len2 = abx * abx + aby * aby;
+    if len2 < 1e-12 {
+        return a;
+    }
+    let t = (((p.x - a.x) * abx + (p.y - a.y) * aby) / len2).clamp(0.0, 1.0);
+    Point2::new(a.x + t * abx, a.y + t * aby)
+}
+
 /// Vertical quads along a coordinate ring.
 /// `exterior = true`  → inward-facing normals  (CCW ring, normals point left-of-travel).
 /// `exterior = false` → outward-facing normals (interior ring, reversed winding).
@@ -549,5 +575,181 @@ fn push_ring(ring: &geo::LineString, verts: &mut Vec<f64>) {
         verts.push(c.x);
         verts.push(c.y);
     }
+}
+
+// ---------------------------------------------------------------------------
+// Snap-on conductive-paint stencil + temporary plating bus
+// ---------------------------------------------------------------------------
+
+/// Generate a snap-on conductive-paint stencil for a single copper layer.
+///
+/// The stencil is a thin plate that registers over the substrate top via a
+/// perimeter snap-lip. Through-slots sit over every trace groove so conductive
+/// paint squeegees only into the channels (minimal cleanup). Additional slots
+/// form a temporary plating bus — a perimeter rail plus one stub to each
+/// electrically-isolated trace island — so the entire layer plates from a
+/// single cathode contact. The bus bars sit proud on the flat substrate and are
+/// ground off after plating to isolate the traces.
+///
+/// Trace islands are found purely geometrically: after unioning the layer's
+/// traces, each resulting polygon is one electrically-connected island, so no
+/// net information is required.
+///
+/// Returns `Ok(None)` when the layer has no traces.
+pub fn generate_stencil(
+    pcb: &PcbData,
+    config: &Config,
+    layer: CopperLayer,
+) -> Result<Option<Mesh3D>> {
+    let traces = match layer {
+        CopperLayer::FCu => &pcb.traces_fcu,
+        CopperLayer::BCu => &pcb.traces_bcu,
+    };
+    if traces.is_empty() {
+        return Ok(None);
+    }
+
+    let outline = pcb
+        .outline
+        .as_ref()
+        .ok_or_else(|| anyhow!("No board outline found — cannot generate stencil"))?;
+    let bbox = &outline.bbox;
+    let ctx = Ctx {
+        ox: bbox.min_x,
+        oy: bbox.min_y,
+    };
+
+    let slot_w = config.channel_width_mm + 2.0 * config.stencil_slot_clearance_mm;
+    let bus_w = config.bus_width_mm;
+    let inset = config.bus_inset_mm;
+    let plate_t = config.stencil_thickness_mm as f32;
+
+    // True board region — keeps bus features on the board.
+    let board_mp = MultiPolygon::new(vec![outline_to_geo(outline)]);
+
+    // ── Trace slots: each unioned polygon is one isolated copper island ─────
+    let trace_slots = union_traces(traces, slot_w);
+
+    // ── Perimeter bus rail: a rectangular ring band inset from the bbox ─────
+    let (rx0, ry0) = (bbox.min_x + inset, bbox.min_y + inset);
+    let (rx1, ry1) = (bbox.max_x - inset, bbox.max_y - inset);
+    let rail_mp = if rx1 - rx0 > 2.5 * bus_w && ry1 - ry0 > 2.5 * bus_w {
+        let outer = MultiPolygon::new(vec![rect_poly(rx0, ry0, rx1, ry1)]);
+        let inner = MultiPolygon::new(vec![rect_poly(
+            rx0 + bus_w,
+            ry0 + bus_w,
+            rx1 - bus_w,
+            ry1 - bus_w,
+        )]);
+        outer.difference(&inner).intersection(&board_mp)
+    } else {
+        // Board too small for a ring — fall back to a single bus bar along one edge.
+        MultiPolygon::new(vec![rect_poly(rx0, ry0, rx1, ry0 + bus_w)]).intersection(&board_mp)
+    };
+
+    // Rail centerline rectangle (used to route the shortest stub per island).
+    // Note: on a strongly non-rectangular outline the rail is clipped to the
+    // board (above) but this centerline is not, so a stub could aim at a clipped
+    // span. Rectangular boards — the electrolysis common case — are unaffected.
+    let cx0 = rx0 + bus_w / 2.0;
+    let cy0 = ry0 + bus_w / 2.0;
+    let cx1 = rx1 - bus_w / 2.0;
+    let cy1 = ry1 - bus_w / 2.0;
+    let rail_segments = [
+        (Point2::new(cx0, cy0), Point2::new(cx1, cy0)),
+        (Point2::new(cx1, cy0), Point2::new(cx1, cy1)),
+        (Point2::new(cx1, cy1), Point2::new(cx0, cy1)),
+        (Point2::new(cx0, cy1), Point2::new(cx0, cy0)),
+    ];
+
+    // ── Stubs: shortest bridge from each island to the bus rail ─────────────
+    let mut stub_polys: Vec<Polygon> = Vec::new();
+    for island in trace_slots.iter() {
+        let mut best: Option<(f64, Point2, Point2)> = None;
+        for c in island.exterior().coords() {
+            let p = Point2::new(c.x, c.y);
+            for (a, b) in &rail_segments {
+                let q = nearest_on_segment(p, *a, *b);
+                let d = p.distance_to(q);
+                if best.map(|(bd, _, _)| d < bd).unwrap_or(true) {
+                    best = Some((d, p, q));
+                }
+            }
+        }
+        if let Some((_, p, q)) = best {
+            let stub = Trace {
+                layer,
+                start: p,
+                end: q,
+                width: bus_w,
+            };
+            if let Some(poly) = trace_rect(&stub, bus_w) {
+                stub_polys.push(poly);
+            }
+        }
+    }
+    let stub_mp = union_polys(stub_polys);
+
+    // All through-slots in the plate = traces ∪ rail ∪ stubs.
+    let slots = trace_slots.union(&rail_mp).union(&stub_mp);
+
+    // ── Build the stencil as a single watertight shell ──────────────────────
+    //
+    // Cross-section (one closed manifold — no internal faces):
+    //
+    //   plate_t ┤   ┌───────────────────────────────┐   ← top face (slots punched)
+    //           │   │     plate + lip (solid)        │
+    //        0  ┤   ├───────────┐         ┌──────────┤   ← cavity underside (rests on board)
+    //           │   │ lip wall  │ cavity  │ lip wall │
+    //      −wh  ┤   └───────────┘         └──────────┘   ← lip bottom rim
+    //               │←  wt  →│←  board+clr  →│←  wt  →│
+    //
+    let mut mesh = Mesh3D::default();
+
+    let clr = config.stencil_fit_clearance_mm;
+    let wt = config.stencil_wall_thickness_mm;
+    let wh = config.stencil_wall_height_mm as f32;
+
+    // Cavity the board snaps into (bbox + fit clearance) and the full plate
+    // footprint (cavity + lip wall on every side).
+    let lip_inner = rect_poly(
+        bbox.min_x - clr,
+        bbox.min_y - clr,
+        bbox.max_x + clr,
+        bbox.max_y + clr,
+    );
+    let plate_outer = rect_poly(
+        bbox.min_x - clr - wt,
+        bbox.min_y - clr - wt,
+        bbox.max_x + clr + wt,
+        bbox.max_y + clr + wt,
+    );
+    let lip_inner_mp = MultiPolygon::new(vec![lip_inner.clone()]);
+    let plate_mp = MultiPolygon::new(vec![plate_outer.clone()]);
+
+    // Slots live inside the board outline ⊂ cavity; clip so each is a clean
+    // through-hole between the top face and the cavity-side underside.
+    let slots = slots.intersection(&lip_inner_mp);
+
+    // Horizontal faces.
+    add_flat(&mut mesh, &plate_mp.difference(&slots), &ctx, plate_t, true); // top
+    add_flat(&mut mesh, &lip_inner_mp.difference(&slots), &ctx, 0.0, false); // cavity underside
+    add_flat(&mut mesh, &plate_mp.difference(&lip_inner_mp), &ctx, -wh, false); // lip bottom rim
+
+    // Outer perimeter wall, full height (−wh → plate top); cavity wall the board
+    // snaps against (−wh → 0), facing inward.
+    add_ring_walls(&mut mesh, plate_outer.exterior().coords(), -wh, plate_t, false, &ctx);
+    add_ring_walls(&mut mesh, lip_inner.exterior().coords(), -wh, 0.0, true, &ctx);
+
+    // Slot through-walls (top → cavity underside), same winding as the
+    // substrate's through-holes in generate_model().
+    for poly in slots.iter() {
+        add_ring_walls(&mut mesh, poly.exterior().coords(), 0.0, plate_t, false, &ctx);
+        for interior in poly.interiors() {
+            add_ring_walls(&mut mesh, interior.coords(), 0.0, plate_t, true, &ctx);
+        }
+    }
+
+    Ok(Some(mesh))
 }
 

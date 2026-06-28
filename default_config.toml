@@ -118,3 +118,43 @@ output_format = "stl"
 #
 # Will be created if it doesn't exist
 output_dir = "./output"
+
+
+# ============================================================================
+# SNAP-ON PAINT STENCIL + TEMPORARY PLATING BUS  (mainly for electrolysis)
+# ============================================================================
+#
+# When enabled, kicad2print also emits a snap-on stencil for each copper side
+# that has traces (<board>_stencil_top.stl / _stencil_bottom.stl). The stencil
+# registers over the substrate via a perimeter snap-lip and has:
+#
+#   - Through-slots over every trace groove, so you can squeegee conductive
+#     paint only into the channels and then lift the stencil off (minimal
+#     cleanup), and
+#   - A temporary plating bus: a perimeter rail plus one stub to each
+#     electrically-isolated trace, so the whole side electroplates from a
+#     single cathode contact. The bus bars sit proud on the flat substrate —
+#     grind them off after plating to isolate the traces.
+#
+# Off by default; auto-enabled when --mode electrolysis is used. You can also
+# force it on with the --stencil CLI flag.
+generate_stencil = false
+
+# Stencil plate thickness (also the deposited height of the grind-off bus bars).
+stencil_thickness_mm = 0.5
+
+# Extra width per side added to each trace slot (paint flow + print tolerance).
+stencil_slot_clearance_mm = 0.1
+
+# Perimeter snap-lip that wraps down over the board edge.
+# wall_height should be >= substrate_thickness_mm so the lip grips the sides.
+stencil_wall_height_mm = 3.0
+stencil_wall_thickness_mm = 1.5
+
+# Clearance between the snap-lip inner wall and the board edge.
+# Smaller = tighter snap; tune to your printer (typ. 0.1–0.2 mm).
+stencil_fit_clearance_mm = 0.15
+
+# Temporary plating bus geometry.
+bus_width_mm = 1.0   # width of the rail and the stubs
+bus_inset_mm = 1.5   # how far the rail sits inside the board edge

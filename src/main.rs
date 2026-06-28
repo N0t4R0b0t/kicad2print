@@ -160,6 +160,11 @@ struct Args {
     /// Disable via/eyelet indent guides
     #[arg(long)]
     no_via_indents: bool,
+
+    /// Also generate a snap-on conductive-paint stencil with a temporary plating
+    /// bus (auto-enabled in electrolysis mode). Emits <stem>_stencil_top/bottom.stl
+    #[arg(long)]
+    stencil: bool,
 }
 
 impl Args {
@@ -202,6 +207,7 @@ impl Args {
             output_dir: self.output_dir.clone(),
             generate_pad_holes: if self.no_pad_holes { Some(false) } else { None },
             generate_via_indents: if self.no_via_indents { Some(false) } else { None },
+            generate_stencil: if self.stencil { Some(true) } else { None },
             mode,
         })
     }
@@ -388,14 +394,43 @@ fn cli_main() -> Result<()> {
         stem_suffix
     );
 
-    let written = export::export(&mesh, &geometry_pcb, &args.input, &stem, &config)
+    let mut written = export::export(&mesh, &geometry_pcb, &args.input, &stem, &config)
         .context("Failed to export 3D model")?;
+
+    // Step 7b: Optionally generate the snap-on paint stencil(s) + plating bus.
+    if config.generate_stencil {
+        if args.verbose {
+            println!("\n🩹 Generating snap-on paint stencil(s)...");
+        }
+        let out_dir = std::path::Path::new(&config.output_dir);
+        for (layer, suffix) in [
+            (pcb::CopperLayer::FCu, "_stencil_top"),
+            (pcb::CopperLayer::BCu, "_stencil_bottom"),
+        ] {
+            if let Some(smesh) = geometry::generate_stencil(&geometry_pcb, &config, layer)
+                .context("Failed to generate stencil geometry")?
+            {
+                let path = out_dir.join(format!("{}{}.stl", stem, suffix));
+                export::stl::write(&smesh, &path).context("Failed to write stencil STL")?;
+                if args.verbose {
+                    println!(
+                        "   {} ({} triangles)",
+                        path.display(),
+                        smesh.triangle_count()
+                    );
+                }
+                written.push(path);
+            }
+        }
+    }
 
     println!("\n✅ Done! Generated:");
     for f in &written {
         let name = f.file_name().and_then(|n| n.to_str()).unwrap_or("");
         let label = if name.ends_with("_guide.html") {
             "  📋 Build guide (assembly + continuity + 3D)"
+        } else if name.contains("_stencil_") {
+            "  🩹 Paint stencil + plating bus (snap-on)"
         } else if f.extension().map(|e| e == "html").unwrap_or(false) {
             "  🌐 Preview (interactive)"
         } else {

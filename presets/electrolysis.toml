@@ -56,6 +56,43 @@ substrate_thickness_mm = 2.2
 scale_factor = 0.0
 
 # ============================================================================
+# SNAP-ON PAINT STENCIL + TEMPORARY PLATING BUS
+# ============================================================================
+#
+# Generates a separate snap-on stencil (one per copper side that has traces:
+# <board>_stencil_top.stl / _stencil_bottom.stl) that registers over the
+# substrate via a perimeter snap-lip.
+#
+#   - Through-slots over every trace groove let you squeegee conductive paint
+#     only into the channels, then lift the stencil off — minimal cleanup.
+#   - Extra slots form a temporary bus: a perimeter rail plus one stub to each
+#     electrically-isolated trace, so the whole side plates from one cathode
+#     contact. The bus bars sit proud on the flat substrate; grind them off
+#     after plating to isolate the traces.
+#
+# Enabled by default in electrolysis mode.
+generate_stencil = true
+
+# Stencil plate thickness (also the deposited height of the grind-off bus bars).
+stencil_thickness_mm = 0.5
+
+# Extra width per side added to each trace slot (paint flow + print tolerance).
+stencil_slot_clearance_mm = 0.1
+
+# Perimeter snap-lip that wraps down over the board edge.
+# wall_height should be >= substrate_thickness_mm so the lip grips the sides.
+stencil_wall_height_mm = 3.0
+stencil_wall_thickness_mm = 1.5
+
+# Clearance between the snap-lip inner wall and the board edge.
+# Smaller = tighter snap; tune to your printer (typ. 0.1–0.2 mm).
+stencil_fit_clearance_mm = 0.15
+
+# Temporary plating bus geometry.
+bus_width_mm = 1.0   # width of the rail and the stubs
+bus_inset_mm = 1.5   # how far the rail sits inside the board edge
+
+# ============================================================================
 # OUTPUT CONFIGURATION
 # ============================================================================
 

@@ -249,6 +249,7 @@ Rinse and dry when done.",
 
 fn default_steps_electrolysis(pcb: &PcbData, config: &Config) -> Vec<AssemblyStep> {
     let mut steps = Vec::new();
+    let stencil = config.generate_stencil;
     if !pcb.footprints.is_empty() {
         steps.push(AssemblyStep {
             name: "Place components".to_string(),
@@ -262,7 +263,11 @@ fn default_steps_electrolysis(pcb: &PcbData, config: &Config) -> Vec<AssemblySte
             name: "Prime front-copper grooves (F.Cu)".to_string(),
             components: vec![],
             wire_layer: Some("F.Cu".to_string()),
-            instruction: "Apply conductive primer to all highlighted grooves on the TOP surface. Let dry completely.".to_string(),
+            instruction: if stencil {
+                "Snap the TOP stencil (boardname_stencil_top.stl) onto the substrate, squeegee conductive seed paint across it so it fills the highlighted grooves and the bus rail/stubs, then lift it off. Let dry completely.".to_string()
+            } else {
+                "Apply conductive primer to all highlighted grooves on the TOP surface. Let dry completely.".to_string()
+            },
         });
     }
     if !pcb.traces_bcu.is_empty() {
@@ -270,7 +275,11 @@ fn default_steps_electrolysis(pcb: &PcbData, config: &Config) -> Vec<AssemblySte
             name: "Prime back-copper grooves (B.Cu)".to_string(),
             components: vec![],
             wire_layer: Some("B.Cu".to_string()),
-            instruction: "Apply conductive primer to all highlighted grooves on the BOTTOM surface. Let dry completely.".to_string(),
+            instruction: if stencil {
+                "Snap the BOTTOM stencil (boardname_stencil_bottom.stl) onto the substrate, squeegee conductive seed paint across it so it fills the highlighted grooves and the bus rail/stubs, then lift it off. Let dry completely.".to_string()
+            } else {
+                "Apply conductive primer to all highlighted grooves on the BOTTOM surface. Let dry completely.".to_string()
+            },
         });
     }
     if !pcb.traces_fcu.is_empty() || !pcb.traces_bcu.is_empty() {
@@ -281,6 +290,14 @@ fn default_steps_electrolysis(pcb: &PcbData, config: &Config) -> Vec<AssemblySte
             wire_layer: None,
             instruction: electroplate_instruction(&stats, config.channel_depth_mm),
         });
+        if stencil {
+            steps.push(AssemblyStep {
+                name: "Grind off the plating bus".to_string(),
+                components: vec![],
+                wire_layer: None,
+                instruction: "Sand or grind the raised bus rail and stubs flush with the surface to isolate the traces. The traces sit recessed in their grooves, so they stay untouched. Re-check continuity afterward — adjacent nets should now read open.".to_string(),
+            });
+        }
     }
     if !pcb.vias.is_empty() {
         steps.push(AssemblyStep {

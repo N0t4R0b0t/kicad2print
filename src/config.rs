@@ -244,6 +244,51 @@ pub struct Config {
     #[serde(default = "default_generate_via_indents")]
     pub generate_via_indents: bool,
 
+    /// Whether to also generate a snap-on conductive-paint stencil plus a
+    /// temporary plating bus (one stencil per copper side that has traces).
+    ///
+    /// The stencil registers over the substrate top via a perimeter snap-lip.
+    /// Through-slots over every trace groove let conductive paint squeegee only
+    /// into the channels (minimal cleanup). Extra slots form a temporary bus —
+    /// a perimeter rail plus one stub to each electrically-isolated trace island
+    /// — so the whole layer plates from one cathode contact. The bus bars sit
+    /// proud on the flat substrate and are ground off after plating.
+    /// Default: false (auto-enabled in electrolysis mode).
+    #[serde(default = "default_generate_stencil")]
+    pub generate_stencil: bool,
+
+    /// Thickness of the printed stencil plate (mm). Also sets the deposited
+    /// thickness of the temporary bus bars that get ground off after plating.
+    #[serde(default = "default_stencil_thickness")]
+    pub stencil_thickness_mm: f64,
+
+    /// Extra width added to each trace slot in the stencil, per side (mm).
+    /// Eases paint flow into the groove and absorbs print tolerance.
+    #[serde(default = "default_stencil_slot_clearance")]
+    pub stencil_slot_clearance_mm: f64,
+
+    /// Height of the perimeter snap-lip that wraps down over the board edge (mm).
+    /// Should be ≥ the substrate thickness so the lip grips the board sides.
+    #[serde(default = "default_stencil_wall_height")]
+    pub stencil_wall_height_mm: f64,
+
+    /// Wall thickness of the perimeter snap-lip (mm).
+    #[serde(default = "default_stencil_wall_thickness")]
+    pub stencil_wall_thickness_mm: f64,
+
+    /// Clearance between the snap-lip inner wall and the board edge (mm).
+    /// Smaller = tighter snap fit; larger = looser. Tune to your printer.
+    #[serde(default = "default_stencil_fit_clearance")]
+    pub stencil_fit_clearance_mm: f64,
+
+    /// Width of the temporary plating bus rail and its stubs (mm).
+    #[serde(default = "default_bus_width")]
+    pub bus_width_mm: f64,
+
+    /// Distance the bus rail is inset from the board edge (mm).
+    #[serde(default = "default_bus_inset")]
+    pub bus_inset_mm: f64,
+
     /// Construction mode — selects assembly guide style and recommended geometry defaults.
     ///
     /// - `"copper-wire"`: lay physical wire into grooves; wide channels (1.2 mm)
@@ -276,6 +321,14 @@ fn default_output_format() -> OutputFormat { OutputFormat::Stl }
 fn default_output_dir() -> String { "./output".to_string() }
 fn default_generate_pad_holes() -> bool { true }
 fn default_generate_via_indents() -> bool { true }
+fn default_generate_stencil() -> bool { false }
+fn default_stencil_thickness() -> f64 { 0.5 }
+fn default_stencil_slot_clearance() -> f64 { 0.1 }
+fn default_stencil_wall_height() -> f64 { 3.0 }
+fn default_stencil_wall_thickness() -> f64 { 1.5 }
+fn default_stencil_fit_clearance() -> f64 { 0.15 }
+fn default_bus_width() -> f64 { 1.0 }
+fn default_bus_inset() -> f64 { 1.5 }
 
 impl Default for Config {
     fn default() -> Self {
@@ -292,6 +345,14 @@ impl Default for Config {
             output_dir: default_output_dir(),
             generate_pad_holes: default_generate_pad_holes(),
             generate_via_indents: default_generate_via_indents(),
+            generate_stencil: default_generate_stencil(),
+            stencil_thickness_mm: default_stencil_thickness(),
+            stencil_slot_clearance_mm: default_stencil_slot_clearance(),
+            stencil_wall_height_mm: default_stencil_wall_height(),
+            stencil_wall_thickness_mm: default_stencil_wall_thickness(),
+            stencil_fit_clearance_mm: default_stencil_fit_clearance(),
+            bus_width_mm: default_bus_width(),
+            bus_inset_mm: default_bus_inset(),
             mode: Mode::default(),
             assembly_steps: Vec::new(),
         }
@@ -366,6 +427,9 @@ impl Config {
         if overrides.generate_via_indents.is_some() {
             self.generate_via_indents = overrides.generate_via_indents.unwrap();
         }
+        if overrides.generate_stencil.is_some() {
+            self.generate_stencil = overrides.generate_stencil.unwrap();
+        }
         if let Some(mode) = overrides.mode {
             // Apply mode and its geometry defaults, but only for fields not already
             // explicitly set by the TOML config (i.e. still at their serde defaults).
@@ -391,6 +455,11 @@ impl Config {
                         && self.eyelet_style == default_eyelet_style()
                     {
                         self.eyelet_style = EyeletStyle::Hole;
+                    }
+                    // Electroplating needs every trace shorted to one cathode —
+                    // enable the snap-on stencil + bus by default in this mode.
+                    if overrides.generate_stencil.is_none() && !self.generate_stencil {
+                        self.generate_stencil = true;
                     }
                 }
                 Mode::CopperWire => {
@@ -441,5 +510,6 @@ pub struct CliOverrides {
     pub output_dir: Option<String>,
     pub generate_pad_holes: Option<bool>,
     pub generate_via_indents: Option<bool>,
+    pub generate_stencil: Option<bool>,
     pub mode: Option<Mode>,
 }
