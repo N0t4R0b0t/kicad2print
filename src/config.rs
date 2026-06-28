@@ -268,7 +268,8 @@ pub struct Config {
     pub stencil_slot_clearance_mm: f64,
 
     /// Height of the perimeter snap-lip that wraps down over the board edge (mm).
-    /// Should be ≥ the substrate thickness so the lip grips the board sides.
+    /// Only needs to be a shallow grip to keep the stencil located — it does not
+    /// need to reach the full substrate thickness. Default: 1.2 mm.
     #[serde(default = "default_stencil_wall_height")]
     pub stencil_wall_height_mm: f64,
 
@@ -324,7 +325,7 @@ fn default_generate_via_indents() -> bool { true }
 fn default_generate_stencil() -> bool { false }
 fn default_stencil_thickness() -> f64 { 0.5 }
 fn default_stencil_slot_clearance() -> f64 { 0.1 }
-fn default_stencil_wall_height() -> f64 { 3.0 }
+fn default_stencil_wall_height() -> f64 { 1.2 }
 fn default_stencil_wall_thickness() -> f64 { 1.5 }
 fn default_stencil_fit_clearance() -> f64 { 0.15 }
 fn default_bus_width() -> f64 { 1.0 }

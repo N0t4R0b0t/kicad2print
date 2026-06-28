@@ -741,8 +741,12 @@ pub fn generate_stencil(
     add_ring_walls(&mut mesh, plate_outer.exterior().coords(), -wh, plate_t, false, &ctx);
     add_ring_walls(&mut mesh, lip_inner.exterior().coords(), -wh, 0.0, true, &ctx);
 
-    // Slot through-walls (top → cavity underside), same winding as the
-    // substrate's through-holes in generate_model().
+    // Slot through-walls (top → cavity underside). Winding here is best-effort —
+    // earcut re-triangulates the faces independently, so wall/face boundaries
+    // can disagree on direction. make_outward_consistent() below re-orients the
+    // whole shell into a single consistent outward manifold, which is what makes
+    // the difference between "preview shows slots" and "slice comes out blank":
+    // a slicer (Cura) fills holes whose walls face the wrong way.
     for poly in slots.iter() {
         add_ring_walls(&mut mesh, poly.exterior().coords(), 0.0, plate_t, false, &ctx);
         for interior in poly.interiors() {
@@ -750,6 +754,101 @@ pub fn generate_stencil(
         }
     }
 
+    // Force a single, consistently-outward orientation so the STL slices cleanly.
+    make_outward_consistent(&mut mesh);
+
     Ok(Some(mesh))
+}
+
+/// Re-orient an edge-manifold mesh so every triangle winds consistently and all
+/// normals point outward. Flood-fills winding agreement across shared edges, then
+/// flips globally if the enclosed signed volume came out negative. This frees the
+/// face/wall generators from having to agree on winding up front — they only need
+/// to produce an edge-paired (watertight) surface.
+fn make_outward_consistent(mesh: &mut Mesh3D) {
+    use std::collections::HashMap;
+    let n = mesh.triangles.len();
+    if n == 0 {
+        return;
+    }
+    let key = |v: [f32; 3]| (v[0].to_bits(), v[1].to_bits(), v[2].to_bits());
+
+    // Undirected edge → the (triangle, directed a→b) incidences that share it.
+    type V = (u32, u32, u32);
+    let mut edges: HashMap<(V, V), Vec<(usize, V, V)>> = HashMap::new();
+    for (ti, t) in mesh.triangles.iter().enumerate() {
+        for k in 0..3 {
+            let a = key(t.vertices[k]);
+            let b = key(t.vertices[(k + 1) % 3]);
+            let und = if a <= b { (a, b) } else { (b, a) };
+            edges.entry(und).or_default().push((ti, a, b));
+        }
+    }
+
+    // Adjacency with an "already consistent?" flag (shared edge runs opposite ways).
+    let mut adj: Vec<Vec<(usize, bool)>> = vec![Vec::new(); n];
+    for inc in edges.values() {
+        if inc.len() == 2 {
+            let (t0, a0, b0) = inc[0];
+            let (t1, a1, b1) = inc[1];
+            let consistent = a0 == b1 && b0 == a1;
+            adj[t0].push((t1, consistent));
+            adj[t1].push((t0, consistent));
+        }
+    }
+
+    // Flood-fill a flip flag across every connected component.
+    let mut flip = vec![false; n];
+    let mut seen = vec![false; n];
+    for start in 0..n {
+        if seen[start] {
+            continue;
+        }
+        seen[start] = true;
+        let mut stack = vec![start];
+        while let Some(t) = stack.pop() {
+            for &(nb, consistent) in &adj[t] {
+                if !seen[nb] {
+                    seen[nb] = true;
+                    flip[nb] = if consistent { flip[t] } else { !flip[t] };
+                    stack.push(nb);
+                }
+            }
+        }
+    }
+    for (ti, t) in mesh.triangles.iter_mut().enumerate() {
+        if flip[ti] {
+            t.vertices.swap(1, 2);
+        }
+    }
+
+    // Orient outward: a closed surface with outward normals encloses positive volume.
+    let vol: f64 = mesh
+        .triangles
+        .iter()
+        .map(|t| {
+            let [a, b, c] = t.vertices;
+            (a[0] * (b[1] * c[2] - b[2] * c[1]) - a[1] * (b[0] * c[2] - b[2] * c[0])
+                + a[2] * (b[0] * c[1] - b[1] * c[0])) as f64
+        })
+        .sum();
+    if vol < 0.0 {
+        for t in mesh.triangles.iter_mut() {
+            t.vertices.swap(1, 2);
+        }
+    }
+
+    // Recompute normals from the final winding.
+    for t in mesh.triangles.iter_mut() {
+        let e1 = sub(t.vertices[1], t.vertices[0]);
+        let e2 = sub(t.vertices[2], t.vertices[0]);
+        let nrm = cross(e1, e2);
+        let len = (nrm[0] * nrm[0] + nrm[1] * nrm[1] + nrm[2] * nrm[2]).sqrt();
+        t.normal = if len < 1e-10 {
+            [0.0, 0.0, 1.0]
+        } else {
+            [nrm[0] / len, nrm[1] / len, nrm[2] / len]
+        };
+    }
 }
 
