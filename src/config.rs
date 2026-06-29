@@ -290,6 +290,20 @@ pub struct Config {
     #[serde(default = "default_bus_inset")]
     pub bus_inset_mm: f64,
 
+    /// Width of each tie-bar: a solid plate bridge that crosses the bus-rail ring
+    /// so the plate inside the ring stays attached to the outer frame (otherwise
+    /// it prints as a loose body and tears off when peeling the print). Each
+    /// tie-bar interrupts the painted rail at that point. Default: 2.5 mm.
+    #[serde(default = "default_bus_tie_width")]
+    pub bus_tie_width_mm: f64,
+
+    /// Number of tie-bars across the rail. 0 = auto (1 for small boards, 2 for
+    /// larger ones). Note: with 2+ tie-bars the rail is split into that many
+    /// separate arcs — clip the plating cathode to each arc. Use 1 to keep the
+    /// rail a single conductor needing only one cathode clip. Default: 0 (auto).
+    #[serde(default = "default_bus_tie_count")]
+    pub bus_tie_count: u32,
+
     /// Construction mode — selects assembly guide style and recommended geometry defaults.
     ///
     /// - `"copper-wire"`: lay physical wire into grooves; wide channels (1.2 mm)
@@ -330,6 +344,8 @@ fn default_stencil_wall_thickness() -> f64 { 1.5 }
 fn default_stencil_fit_clearance() -> f64 { 0.15 }
 fn default_bus_width() -> f64 { 1.0 }
 fn default_bus_inset() -> f64 { 1.5 }
+fn default_bus_tie_width() -> f64 { 2.5 }
+fn default_bus_tie_count() -> u32 { 0 }
 
 impl Default for Config {
     fn default() -> Self {
@@ -354,6 +370,8 @@ impl Default for Config {
             stencil_fit_clearance_mm: default_stencil_fit_clearance(),
             bus_width_mm: default_bus_width(),
             bus_inset_mm: default_bus_inset(),
+            bus_tie_width_mm: default_bus_tie_width(),
+            bus_tie_count: default_bus_tie_count(),
             mode: Mode::default(),
             assembly_steps: Vec::new(),
         }

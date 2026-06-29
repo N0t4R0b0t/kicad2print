@@ -93,6 +93,14 @@ stencil_fit_clearance_mm = 0.15
 bus_width_mm = 1.0   # width of the rail and the stubs
 bus_inset_mm = 1.5   # how far the rail sits inside the board edge
 
+# Tie-bars bridge the plate inside the bus rail to the outer frame so it doesn't
+# print as a loose body that tears off when peeling. Each tie spans (and so
+# interrupts) the painted rail, splitting it into that many arcs — clip the
+# plating cathode to each arc. Extra loose islands are tied automatically only
+# where needed.
+bus_tie_width_mm = 2.5   # width of each tie bridge
+bus_tie_count = 0        # 0 = auto (1 small board / 2 larger); set 1 for a single cathode clip
+
 # ============================================================================
 # OUTPUT CONFIGURATION
 # ============================================================================

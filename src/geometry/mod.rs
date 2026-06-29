@@ -647,7 +647,7 @@ pub fn generate_stencil(
         MultiPolygon::new(vec![rect_poly(rx0, ry0, rx1, ry0 + bus_w)]).intersection(&board_mp)
     };
 
-    // Rail centerline rectangle (used to route the shortest stub per island).
+    // Rail centerline rectangle — used to route stubs and to place tie-bars.
     // Note: on a strongly non-rectangular outline the rail is clipped to the
     // board (above) but this centerline is not, so a stub could aim at a clipped
     // span. Rectangular boards — the electrolysis common case — are unaffected.
@@ -661,6 +661,53 @@ pub fn generate_stencil(
         (Point2::new(cx1, cy1), Point2::new(cx0, cy1)),
         (Point2::new(cx0, cy1), Point2::new(cx0, cy0)),
     ];
+
+    // ── Tie-bars: solid plate bridges across the rail ring ──────────────────
+    // The rail ring fences the plate inside it off from the outer frame, leaving
+    // it a loose body that tears off when peeling the print. Each tie-bar is a
+    // span where the rail slot is removed so plate connects inner→outer. Placed
+    // on opposite long edges for the widest support; each one interrupts the
+    // painted rail (see config docs on cathode arcs).
+    let pad = bus_w.max(1.0);
+    let board_w = bbox.max_x - bbox.min_x;
+    let board_h = bbox.max_y - bbox.min_y;
+    let max_dim = board_w.max(board_h);
+    // Auto count for the main inner island: 1 tie (small) or 2 on the long edges.
+    // Any further loose bodies are tied on demand by bridge_loose_bodies() below,
+    // so we keep the always-on ties (and thus cathode arcs) to a minimum here.
+    let n_ties = if config.bus_tie_count > 0 {
+        config.bus_tie_count as usize
+    } else if max_dim > 30.0 {
+        2
+    } else {
+        1
+    };
+    let tie_w = config.bus_tie_width_mm;
+    // Candidate mid-edge targets, long edges first (those hold the inner island).
+    let xmid = (rx0 + rx1) / 2.0;
+    let ymid = (ry0 + ry1) / 2.0;
+    let candidates: [Point2; 4] = if board_w >= board_h {
+        [
+            Point2::new(xmid, cy0), // bottom
+            Point2::new(xmid, cy1), // top
+            Point2::new(cx0, ymid), // left
+            Point2::new(cx1, ymid), // right
+        ]
+    } else {
+        [
+            Point2::new(cx0, ymid), // left
+            Point2::new(cx1, ymid), // right
+            Point2::new(xmid, cy0), // bottom
+            Point2::new(xmid, cy1), // top
+        ]
+    };
+    let tie_mp = MultiPolygon::new(
+        candidates
+            .iter()
+            .take(n_ties.min(4))
+            .map(|t| rail_tie_rect(&rail_segments, bus_w, tie_w, *t, pad))
+            .collect(),
+    );
 
     // ── Stubs: shortest bridge from each island to the bus rail ─────────────
     let mut stub_polys: Vec<Polygon> = Vec::new();
@@ -728,8 +775,16 @@ pub fn generate_stencil(
     let plate_mp = MultiPolygon::new(vec![plate_outer.clone()]);
 
     // Slots live inside the board outline ⊂ cavity; clip so each is a clean
-    // through-hole between the top face and the cavity-side underside.
-    let slots = slots.intersection(&lip_inner_mp);
+    // through-hole between the top face and the cavity-side underside. Then carve
+    // out the rail tie-bars so the plate inside the rail stays bridged to the frame.
+    let slots = slots.intersection(&lip_inner_mp).difference(&tie_mp);
+
+    // Bridge any remaining loose plate bodies (small islands the bus fences off)
+    // to the frame with a tie across the rail, so nothing prints as a detached
+    // piece that tears away when peeling.
+    let top_face = plate_mp.difference(&slots);
+    let extra_ties = bridge_loose_bodies(&top_face, &rail_segments, bus_w, tie_w, pad);
+    let slots = slots.difference(&extra_ties);
 
     // Horizontal faces.
     add_flat(&mut mesh, &plate_mp.difference(&slots), &ctx, plate_t, true); // top
@@ -758,6 +813,150 @@ pub fn generate_stencil(
     make_outward_consistent(&mut mesh);
 
     Ok(Some(mesh))
+}
+
+/// Find plate regions that print as loose bodies (fully fenced off by slots) and
+/// return tie-bar rectangles that bridge each one across the bus rail to the outer
+/// frame, so the whole plate survives printing and peeling as a single piece.
+///
+/// Connectivity is measured on the triangulated mesh (triangle-edge adjacency),
+/// not on the geo polygons — geo can report two regions joined only at a pinch
+/// point as a single polygon, but a pinch has no real strength and prints loose.
+///
+/// Only loose bodies that actually border the rail can be tied — the tie spans the
+/// (sacrificial) rail band, never a real trace groove. Bodies fenced in purely by
+/// traces are counted and reported instead. Sliver components (< 1 mm²) are ignored.
+fn bridge_loose_bodies(
+    top_face: &MultiPolygon,
+    rail_segments: &[(Point2, Point2); 4],
+    bus_w: f64,
+    tie_w: f64,
+    pad: f64,
+) -> MultiPolygon {
+    use std::collections::HashMap;
+    let tris: Vec<[Coord; 3]> = top_face
+        .iter()
+        .flat_map(triangulate_polygon)
+        .collect();
+    if tris.is_empty() {
+        return MultiPolygon::new(vec![]);
+    }
+
+    // Group triangles into edge-connected components.
+    let key = |c: &Coord| ((c.x * 1000.0).round() as i64, (c.y * 1000.0).round() as i64);
+    let mut edges: HashMap<((i64, i64), (i64, i64)), Vec<usize>> = HashMap::new();
+    for (i, t) in tris.iter().enumerate() {
+        for k in 0..3 {
+            let (a, b) = (key(&t[k]), key(&t[(k + 1) % 3]));
+            edges.entry(if a <= b { (a, b) } else { (b, a) }).or_default().push(i);
+        }
+    }
+    let n = tris.len();
+    let mut adj = vec![Vec::new(); n];
+    for inc in edges.values() {
+        if inc.len() == 2 {
+            adj[inc[0]].push(inc[1]);
+            adj[inc[1]].push(inc[0]);
+        }
+    }
+    let mut comp = vec![usize::MAX; n];
+    let mut comps: Vec<Vec<usize>> = Vec::new();
+    for s in 0..n {
+        if comp[s] != usize::MAX {
+            continue;
+        }
+        let id = comps.len();
+        let mut stack = vec![s];
+        comp[s] = id;
+        let mut members = Vec::new();
+        while let Some(u) = stack.pop() {
+            members.push(u);
+            for &w in &adj[u] {
+                if comp[w] == usize::MAX {
+                    comp[w] = id;
+                    stack.push(w);
+                }
+            }
+        }
+        comps.push(members);
+    }
+    if comps.len() <= 1 {
+        return MultiPolygon::new(vec![]);
+    }
+
+    let tri_area = |t: &[Coord; 3]| {
+        ((t[1].x - t[0].x) * (t[2].y - t[0].y) - (t[2].x - t[0].x) * (t[1].y - t[0].y)).abs() / 2.0
+    };
+    let area_of = |c: &Vec<usize>| c.iter().map(|&i| tri_area(&tris[i])).sum::<f64>();
+    let main = (0..comps.len())
+        .max_by(|&i, &j| area_of(&comps[i]).total_cmp(&area_of(&comps[j])))
+        .unwrap();
+    let dist_to_rail = |p: Point2| {
+        rail_segments
+            .iter()
+            .map(|(a, b)| p.distance_to(nearest_on_segment(p, *a, *b)))
+            .fold(f64::INFINITY, f64::min)
+    };
+
+    let mut ties: Vec<Polygon> = Vec::new();
+    let mut unbridged = 0usize;
+    for (ci, members) in comps.iter().enumerate() {
+        if ci == main || area_of(members) < 1.0 {
+            continue;
+        }
+        // The component's boundary vertex that sits on the rail (within half the
+        // bus width of the centerline) and is closest to it — tie there.
+        let mut target: Option<(f64, Point2)> = None;
+        for &ti in members {
+            for v in &tris[ti] {
+                let p = Point2::new(v.x, v.y);
+                let d = dist_to_rail(p);
+                if d <= bus_w / 2.0 + 0.25 && target.map(|(bd, _)| d < bd).unwrap_or(true) {
+                    target = Some((d, p));
+                }
+            }
+        }
+        match target {
+            Some((_, p)) => ties.push(rail_tie_rect(rail_segments, bus_w, tie_w, p, pad)),
+            None => unbridged += 1,
+        }
+    }
+    if unbridged > 0 {
+        eprintln!(
+            "⚠️  Stencil: {} small plate island(s) are enclosed by traces (not the \
+             bus rail) and left un-bridged — a tie there would dam the groove. They \
+             may detach when peeling; remove them by hand if so.",
+            unbridged
+        );
+    }
+    union_polys(ties)
+}
+
+/// A tie-bar rectangle that spans the bus-rail band at the centerline point nearest
+/// `target`, padded past both edges so it fuses the plate on either side of the rail.
+fn rail_tie_rect(
+    rail_segments: &[(Point2, Point2); 4],
+    bus_w: f64,
+    tie_w: f64,
+    target: Point2,
+    pad: f64,
+) -> Polygon {
+    // Nearest centerline point and whether that segment runs horizontally.
+    let mut best = (f64::INFINITY, target, true);
+    for (a, b) in rail_segments {
+        let q = nearest_on_segment(target, *a, *b);
+        let d = target.distance_to(q);
+        if d < best.0 {
+            best = (d, q, (a.y - b.y).abs() < (a.x - b.x).abs());
+        }
+    }
+    let (_, c, horizontal) = best;
+    let half = bus_w / 2.0 + pad;
+    if horizontal {
+        rect_poly(c.x - tie_w / 2.0, c.y - half, c.x + tie_w / 2.0, c.y + half)
+    } else {
+        rect_poly(c.x - half, c.y - tie_w / 2.0, c.x + half, c.y + tie_w / 2.0)
+    }
 }
 
 /// Re-orient an edge-manifold mesh so every triangle winds consistently and all

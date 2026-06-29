@@ -181,6 +181,8 @@ Print it in any filament — it's a reusable tool, not part of the board — and
 
 After plating you **grind the rail and stubs off** to restore isolation (see step 7). Because the bus bars sit proud on the flat substrate — while the real traces are recessed in their grooves — grinding the surface flush removes the bus without touching the traces.
 
+**Cathode contacts (tie-bars):** the rail fences off the plate inside it, so the stencil adds small **tie-bars** that bridge that inner plate to the outer frame — otherwise it prints as a loose piece that tears off when you peel the print. Each tie-bar is solid plate spanning the rail, so it **interrupts the painted rail** at that point: with N tie-bars the rail becomes N separate arcs, and you clip the plating cathode to **each arc**. The count is automatic (1 for small boards, 2 for larger) and any further loose islands are tied only where needed; set `bus_tie_count = 1` to force a single arc/clip, or higher for more mechanical strength. A board occasionally has a small plate island fully enclosed by traces — that can't be tied without damming a groove, so kicad2print prints a warning and leaves it; snip it out by hand if it detaches.
+
 Tune it in the preset/config via the `stencil_*` and `bus_*` keys (plate/slot/lip dimensions, bus width and inset); the defaults are a good starting point for a well-tuned printer. Best on rectangular outlines — the rail follows the board's bounding box.
 
 #### Manual — KiCad bridges (alternative)
