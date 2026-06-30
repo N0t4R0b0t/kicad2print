@@ -809,6 +809,19 @@ pub fn generate_stencil(
         }
     }
 
+    // The B.Cu stencil snaps onto the *bottom* face of the board, so its lip must
+    // wrap the opposite way from the F.Cu stencil — the two are mirror images
+    // through the board mid-plane. Reflect in Z (keeps the slots at the same XY so
+    // they still register with the bottom grooves); make_outward_consistent() then
+    // repairs the winding the reflection inverts.
+    if layer == CopperLayer::BCu {
+        for t in mesh.triangles.iter_mut() {
+            for v in t.vertices.iter_mut() {
+                v[2] = -v[2];
+            }
+        }
+    }
+
     // Force a single, consistently-outward orientation so the STL slices cleanly.
     make_outward_consistent(&mut mesh);
 
