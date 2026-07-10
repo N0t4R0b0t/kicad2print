@@ -49,6 +49,41 @@ impl std::str::FromStr for Mode {
     }
 }
 
+/// How the paint stencil registers onto the PCB.
+///
+/// - `"lip"` — an integral perimeter lip on the plate wraps the board edge.
+/// - `"ring"` — flat plates (printable contact-face-down for a smooth masking
+///   finish) plus a separate, reusable L-section clamp ring that snaps onto the
+///   PCB and folds a lip over the plate to wedge it against the board.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum StencilMount {
+    Lip,
+    #[default]
+    Ring,
+}
+
+impl std::fmt::Display for StencilMount {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            StencilMount::Lip => write!(f, "lip"),
+            StencilMount::Ring => write!(f, "ring"),
+        }
+    }
+}
+
+impl std::str::FromStr for StencilMount {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "lip" | "integral" => Ok(StencilMount::Lip),
+            "ring" | "clamp" => Ok(StencilMount::Ring),
+            other => Err(format!("Unknown stencil mount: '{}'. Use 'lip' or 'ring'", other)),
+        }
+    }
+}
+
 /// Specifies how via eyelets are represented in the 3D model.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -257,6 +292,16 @@ pub struct Config {
     #[serde(default = "default_generate_stencil")]
     pub generate_stencil: bool,
 
+    /// Whether the stencil also carries the temporary **plating bus** — a
+    /// perimeter rail plus one stub to each isolated trace (with tie-bars) that
+    /// shorts every trace to a single cathode contact for electroplating.
+    ///
+    /// Off by default: the plain stencil masks just the traces and via/pad holes.
+    /// Enable it (or pass `--plating-bus`) when you want kicad2print to build the
+    /// interconnection for you rather than adding it yourself in KiCad.
+    #[serde(default = "default_stencil_plating_bus")]
+    pub stencil_plating_bus: bool,
+
     /// Thickness of the printed stencil plate (mm). Also sets the deposited
     /// thickness of the temporary bus bars that get ground off after plating.
     #[serde(default = "default_stencil_thickness")]
@@ -304,6 +349,21 @@ pub struct Config {
     #[serde(default = "default_bus_tie_count")]
     pub bus_tie_count: u32,
 
+    /// How the stencil registers onto the PCB: `"lip"` (integral perimeter lip on
+    /// the plate) or `"ring"` (flat plates + a separate reusable L-section clamp
+    /// ring). `ring` lets you print the contact face flat on the bed for a smooth
+    /// masking finish. Default: `ring`.
+    #[serde(default)]
+    pub stencil_mount: StencilMount,
+
+    /// (ring mount) How far the clamp ring's top lip covers the plate edge (mm).
+    #[serde(default = "default_ring_lip_overlap")]
+    pub ring_lip_overlap_mm: f64,
+
+    /// (ring mount) Height of the clamp ring's top lip above the plate (mm).
+    #[serde(default = "default_ring_lip_height")]
+    pub ring_lip_height_mm: f64,
+
     /// Construction mode — selects assembly guide style and recommended geometry defaults.
     ///
     /// - `"copper-wire"`: lay physical wire into grooves; wide channels (1.2 mm)
@@ -337,6 +397,7 @@ fn default_output_dir() -> String { "./output".to_string() }
 fn default_generate_pad_holes() -> bool { true }
 fn default_generate_via_indents() -> bool { true }
 fn default_generate_stencil() -> bool { false }
+fn default_stencil_plating_bus() -> bool { false }
 fn default_stencil_thickness() -> f64 { 0.5 }
 fn default_stencil_slot_clearance() -> f64 { 0.1 }
 fn default_stencil_wall_height() -> f64 { 1.2 }
@@ -346,6 +407,8 @@ fn default_bus_width() -> f64 { 1.0 }
 fn default_bus_inset() -> f64 { 1.5 }
 fn default_bus_tie_width() -> f64 { 2.5 }
 fn default_bus_tie_count() -> u32 { 0 }
+fn default_ring_lip_overlap() -> f64 { 1.5 }
+fn default_ring_lip_height() -> f64 { 1.0 }
 
 impl Default for Config {
     fn default() -> Self {
@@ -363,6 +426,7 @@ impl Default for Config {
             generate_pad_holes: default_generate_pad_holes(),
             generate_via_indents: default_generate_via_indents(),
             generate_stencil: default_generate_stencil(),
+            stencil_plating_bus: default_stencil_plating_bus(),
             stencil_thickness_mm: default_stencil_thickness(),
             stencil_slot_clearance_mm: default_stencil_slot_clearance(),
             stencil_wall_height_mm: default_stencil_wall_height(),
@@ -372,6 +436,9 @@ impl Default for Config {
             bus_inset_mm: default_bus_inset(),
             bus_tie_width_mm: default_bus_tie_width(),
             bus_tie_count: default_bus_tie_count(),
+            stencil_mount: StencilMount::default(),
+            ring_lip_overlap_mm: default_ring_lip_overlap(),
+            ring_lip_height_mm: default_ring_lip_height(),
             mode: Mode::default(),
             assembly_steps: Vec::new(),
         }
@@ -449,6 +516,12 @@ impl Config {
         if overrides.generate_stencil.is_some() {
             self.generate_stencil = overrides.generate_stencil.unwrap();
         }
+        if overrides.stencil_plating_bus.is_some() {
+            self.stencil_plating_bus = overrides.stencil_plating_bus.unwrap();
+        }
+        if let Some(mount) = overrides.stencil_mount {
+            self.stencil_mount = mount;
+        }
         if let Some(mode) = overrides.mode {
             // Apply mode and its geometry defaults, but only for fields not already
             // explicitly set by the TOML config (i.e. still at their serde defaults).
@@ -508,6 +581,9 @@ impl Config {
         println!("Output directory:    {}", self.output_dir);
         println!("Generate pad holes:  {}", if self.generate_pad_holes { "yes" } else { "no" });
         println!("Generate via indents: {}", if self.generate_via_indents { "yes" } else { "no" });
+        if self.generate_stencil {
+            println!("Stencil mount:       {}", self.stencil_mount);
+        }
     }
 }
 
@@ -530,5 +606,7 @@ pub struct CliOverrides {
     pub generate_pad_holes: Option<bool>,
     pub generate_via_indents: Option<bool>,
     pub generate_stencil: Option<bool>,
+    pub stencil_plating_bus: Option<bool>,
+    pub stencil_mount: Option<StencilMount>,
     pub mode: Option<Mode>,
 }

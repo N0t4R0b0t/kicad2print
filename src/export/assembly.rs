@@ -250,6 +250,21 @@ Rinse and dry when done.",
 fn default_steps_electrolysis(pcb: &PcbData, config: &Config) -> Vec<AssemblyStep> {
     let mut steps = Vec::new();
     let stencil = config.generate_stencil;
+    let ring = config.stencil_mount == crate::config::StencilMount::Ring;
+    let bus = config.stencil_plating_bus;
+    let fills = if bus { "grooves + bus rail/stubs" } else { "grooves" };
+    // Seeding instruction for a stencil side, given the plate file name.
+    let seed_step = |plate: &str, side: &str| -> String {
+        if ring {
+            format!(
+                "Print {plate} contact-face DOWN (the smooth side masks the board). Lay it on the {side} grooves, snap the clamp ring (boardname_stencil_ring.stl) around the PCB to wedge the plate down, squeegee conductive seed paint across the slots ({fills}), then lift the ring and plate off. Let dry completely."
+            )
+        } else {
+            format!(
+                "Snap the {side} stencil ({plate}) onto the substrate, squeegee conductive seed paint across it so it fills the highlighted {fills}, then lift it off. Let dry completely."
+            )
+        }
+    };
     if !pcb.footprints.is_empty() {
         steps.push(AssemblyStep {
             name: "Place components".to_string(),
@@ -264,7 +279,7 @@ fn default_steps_electrolysis(pcb: &PcbData, config: &Config) -> Vec<AssemblySte
             components: vec![],
             wire_layer: Some("F.Cu".to_string()),
             instruction: if stencil {
-                "Snap the TOP stencil (boardname_stencil_top.stl) onto the substrate, squeegee conductive seed paint across it so it fills the highlighted grooves and the bus rail/stubs, then lift it off. Let dry completely.".to_string()
+                seed_step("boardname_stencil_top.stl", "TOP")
             } else {
                 "Apply conductive primer to all highlighted grooves on the TOP surface. Let dry completely.".to_string()
             },
@@ -276,7 +291,7 @@ fn default_steps_electrolysis(pcb: &PcbData, config: &Config) -> Vec<AssemblySte
             components: vec![],
             wire_layer: Some("B.Cu".to_string()),
             instruction: if stencil {
-                "Snap the BOTTOM stencil (boardname_stencil_bottom.stl) onto the substrate, squeegee conductive seed paint across it so it fills the highlighted grooves and the bus rail/stubs, then lift it off. Let dry completely.".to_string()
+                seed_step("boardname_stencil_bottom.stl", "BOTTOM")
             } else {
                 "Apply conductive primer to all highlighted grooves on the BOTTOM surface. Let dry completely.".to_string()
             },
@@ -290,7 +305,7 @@ fn default_steps_electrolysis(pcb: &PcbData, config: &Config) -> Vec<AssemblySte
             wire_layer: None,
             instruction: electroplate_instruction(&stats, config.channel_depth_mm),
         });
-        if stencil {
+        if stencil && bus {
             steps.push(AssemblyStep {
                 name: "Grind off the plating bus".to_string(),
                 components: vec![],

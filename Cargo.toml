@@ -1,6 +1,6 @@
 [package]
 name = "kicad2print"
-version = "1.0.0"
+version = "1.2.0"
 edition = "2021"
 description = "Convert KiCad PCB designs to 3D-printable substrate models; MCP server for Claude Desktop"
 repository = "https://github.com/N0t4R0b0t/kicad2print"

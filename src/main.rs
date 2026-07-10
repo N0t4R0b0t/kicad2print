@@ -52,7 +52,7 @@ mod render;
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use config::{CliOverrides, Config, EyeletStyle, Mode, OutputFormat};
+use config::{CliOverrides, Config, EyeletStyle, Mode, OutputFormat, StencilMount};
 use std::path::PathBuf;
 use std::process::Command;
 
@@ -161,10 +161,21 @@ struct Args {
     #[arg(long)]
     no_via_indents: bool,
 
-    /// Also generate a snap-on conductive-paint stencil with a temporary plating
-    /// bus (auto-enabled in electrolysis mode). Emits <stem>_stencil_top/bottom.stl
+    /// Also generate a snap-on conductive-paint stencil (auto-enabled in
+    /// electrolysis mode). Emits <stem>_stencil_top/bottom.stl (traces + holes).
     #[arg(long)]
     stencil: bool,
+
+    /// Add the temporary plating bus (perimeter rail + stubs + tie-bars) to the
+    /// stencil so every trace shorts to one cathode for electroplating. Off by
+    /// default — the plain stencil masks only the traces and holes.
+    #[arg(long)]
+    plating_bus: bool,
+
+    /// Stencil mount style: 'lip' (integral perimeter lip) or 'ring' (flat plates
+    /// + a separate clamp ring; print contact-face-down for a smooth finish)
+    #[arg(long, value_name = "STYLE")]
+    stencil_mount: Option<String>,
 }
 
 impl Args {
@@ -194,6 +205,13 @@ impl Args {
             .transpose()
             .map_err(|e| anyhow::anyhow!("Invalid mode: {}", e))?;
 
+        let stencil_mount = self
+            .stencil_mount
+            .as_ref()
+            .map(|s| s.parse::<StencilMount>())
+            .transpose()
+            .map_err(|e| anyhow::anyhow!("Invalid stencil-mount: {}", e))?;
+
         Ok(CliOverrides {
             channel_width_mm: self.channel_width,
             channel_depth_mm: self.channel_depth,
@@ -208,6 +226,8 @@ impl Args {
             generate_pad_holes: if self.no_pad_holes { Some(false) } else { None },
             generate_via_indents: if self.no_via_indents { Some(false) } else { None },
             generate_stencil: if self.stencil { Some(true) } else { None },
+            stencil_plating_bus: if self.plating_bus { Some(true) } else { None },
+            stencil_mount,
             mode,
         })
     }
@@ -422,6 +442,18 @@ fn cli_main() -> Result<()> {
                 written.push(path);
             }
         }
+
+        // Ring mount: also emit the single reusable L-section clamp ring.
+        if config.stencil_mount == StencilMount::Ring {
+            let ring = geometry::generate_clamp_ring(&geometry_pcb, &config)
+                .context("Failed to generate clamp ring geometry")?;
+            let path = out_dir.join(format!("{}_stencil_ring.stl", stem));
+            export::stl::write(&ring, &path).context("Failed to write clamp ring STL")?;
+            if args.verbose {
+                println!("   {} ({} triangles)", path.display(), ring.triangle_count());
+            }
+            written.push(path);
+        }
     }
 
     println!("\n✅ Done! Generated:");
@@ -429,8 +461,10 @@ fn cli_main() -> Result<()> {
         let name = f.file_name().and_then(|n| n.to_str()).unwrap_or("");
         let label = if name.ends_with("_guide.html") {
             "  📋 Build guide (assembly + continuity + 3D)"
+        } else if name.ends_with("_stencil_ring.stl") {
+            "  ⭕ Stencil clamp ring (reusable, snaps to PCB)"
         } else if name.contains("_stencil_") {
-            "  🩹 Paint stencil + plating bus (snap-on)"
+            "  🩹 Paint stencil (print contact-face down)"
         } else if f.extension().map(|e| e == "html").unwrap_or(false) {
             "  🌐 Preview (interactive)"
         } else {

@@ -126,19 +126,22 @@ output_dir = "./output"
 #
 # When enabled, kicad2print also emits a snap-on stencil for each copper side
 # that has traces (<board>_stencil_top.stl / _stencil_bottom.stl). The stencil
-# registers over the substrate via a perimeter snap-lip and has:
-#
-#   - Through-slots over every trace groove, so you can squeegee conductive
-#     paint only into the channels and then lift the stencil off (minimal
-#     cleanup), and
-#   - A temporary plating bus: a perimeter rail plus one stub to each
-#     electrically-isolated trace, so the whole side electroplates from a
-#     single cathode contact. The bus bars sit proud on the flat substrate —
-#     grind them off after plating to isolate the traces.
+# has through-slots over every trace groove (plus via/pad holes so it clears
+# inserted leads/eyelets), so you can squeegee conductive paint only into the
+# channels and then lift it off (minimal cleanup).
 #
 # Off by default; auto-enabled when --mode electrolysis is used. You can also
 # force it on with the --stencil CLI flag.
 generate_stencil = false
+
+# Optionally add a temporary plating bus to the stencil: a perimeter rail plus one
+# stub to each electrically-isolated trace (with tie-bars), so the whole side
+# electroplates from a single cathode contact. The bus bars sit proud on the flat
+# substrate — grind them off after plating to isolate the traces.
+#
+# Off by default (a plain stencil masks only the traces and holes). Turn it on
+# here or with the --plating-bus flag. The bus_* keys below only apply when true.
+stencil_plating_bus = false
 
 # Stencil plate thickness (also the deposited height of the grind-off bus bars).
 stencil_thickness_mm = 0.5
@@ -156,7 +159,7 @@ stencil_wall_thickness_mm = 1.5
 # Smaller = tighter snap; tune to your printer (typ. 0.1–0.2 mm).
 stencil_fit_clearance_mm = 0.15
 
-# Temporary plating bus geometry.
+# Temporary plating bus geometry (only used when stencil_plating_bus = true).
 bus_width_mm = 1.0   # width of the rail and the stubs
 bus_inset_mm = 1.5   # how far the rail sits inside the board edge
 
@@ -167,3 +170,14 @@ bus_inset_mm = 1.5   # how far the rail sits inside the board edge
 # where needed (and trace-enclosed islands are reported, not bridged).
 bus_tie_width_mm = 2.5   # width of each tie bridge
 bus_tie_count = 0        # 0 = auto (1 small board / 2 larger); set 1 for a single cathode clip
+
+# How the stencil registers onto the PCB:
+#   "ring" - flat plates + a separate, reusable L-section clamp ring. Print the
+#            plates contact-face DOWN for a glass-smooth masking face; the ring
+#            snaps around the PCB and a top lip wedges the plate against it.
+#            Emits an extra <board>_stencil_ring.stl (one ring, reused per side).
+#   "lip"  - integral perimeter lip on each plate (no separate ring); simpler to
+#            handle but the contact face must print up, so it isn't as smooth.
+stencil_mount = "ring"
+ring_lip_overlap_mm = 1.5   # how far the ring's top lip covers the plate
+ring_lip_height_mm = 1.0    # height of that lip above the plate

@@ -61,7 +61,7 @@ Steps 1–2 are software/printer; steps 3–7 are the wet workflow; step 8 is no
 >
 > If you forget a bridge on even one net, that entire net will not plate — you'll have copper everywhere except on the one trace you forgot, and you won't notice until you do the post-plating continuity check.
 >
-> **kicad2print can build this bus for you.** In `--mode electrolysis` it emits a snap-on **stencil** (`boardname_stencil_top.stl`/`_stencil_bottom.stl`) carrying a perimeter rail plus one stub to every electrically-isolated trace — a single cathode contact for the whole side, derived automatically from the geometry. After plating you grind the rail flush to restore isolation. See [the plating bus and sacrificial bridges](#the-plating-bus-and-sacrificial-bridges). You can still do it by hand in KiCad if you prefer (also documented there).
+> **kicad2print can build this bus for you** (optional). Enable `stencil_plating_bus` (or pass `--plating-bus`) and the snap-on **stencil** gains a perimeter rail plus one stub to every electrically-isolated trace — a single cathode contact for the whole side, derived automatically from the geometry. After plating you grind the rail flush to restore isolation. It's **off by default** (the plain stencil masks only traces + holes), since it doesn't suit every board. See [the plating bus and sacrificial bridges](#the-plating-bus-and-sacrificial-bridges). You can also do it by hand in KiCad (also documented there).
 
 ### What's happening physically
 
@@ -132,7 +132,7 @@ kicad2print my_board.kicad_pcb --config kicad2print.toml
 
 The generated `boardname_guide.html` includes a continuity-test tab that's especially valuable for plating: you'll use it at steps 5 and 7 to verify every net.
 
-Electrolysis mode also emits a **snap-on paint stencil** alongside the substrate — `boardname_stencil_top.stl` (and `_stencil_bottom.stl` for two-sided boards). This masks the board for seeding and carries the temporary plating bus; see [step 3](#the-plating-bus-and-sacrificial-bridges) for what it does and [step 4](#step-4--apply-seed-paint) for how to use it. Set `generate_stencil = false` (or omit the `--stencil` flag in other modes) to skip it.
+Electrolysis mode also emits a **snap-on paint stencil** alongside the substrate — `boardname_stencil_top.stl` (and `_stencil_bottom.stl` for two-sided boards), plus a reusable clamp ring `boardname_stencil_ring.stl` (default `ring` mount). This masks the board for seeding and carries the temporary plating bus; see [step 3](#the-plating-bus-and-sacrificial-bridges) for what it does and [step 4](#step-4--apply-seed-paint) for how to use it. Set `generate_stencil = false` (or omit the `--stencil` flag in other modes) to skip it.
 
 ---
 
@@ -174,16 +174,17 @@ As called out in the [design rule above](#-the-most-important-design-rule-every-
 - `boardname_stencil_top.stl`
 - `boardname_stencil_bottom.stl` (only if the board has back-copper traces)
 
-Print it in any filament — it's a reusable tool, not part of the board — and it does two jobs at once:
+Print it in any filament — it's a reusable tool, not part of the board.
 
-1. **Masks the board for seeding.** Through-slots sit exactly over every groove. Snap the stencil onto the printed substrate (a perimeter lip grips the board edge), squeegee seed paint across it, then lift it off — paint lands only in the channels. No spray-and-sand, almost no cleanup (see step 4).
-2. **Adds the temporary bus.** Extra slots form a perimeter rail just inside the board edge plus one short stub to **every electrically-isolated trace**. kicad2print finds those isolated traces geometrically, so you don't have to think about nets at all. After seeding, the rail and stubs become raised conductive bars that short every trace together, so the whole side plates from a single cathode clip on the rail.
+**Masks the board for seeding.** Through-slots sit exactly over every groove (plus via/pad holes, so the plate clears inserted leads/eyelets). Register the stencil over the substrate (see *Mounting* below), squeegee seed paint across it, then lift it off — paint lands only in the channels. No spray-and-sand, almost no cleanup (see step 4).
 
-After plating you **grind the rail and stubs off** to restore isolation (see step 7). Because the bus bars sit proud on the flat substrate — while the real traces are recessed in their grooves — grinding the surface flush removes the bus without touching the traces.
+**Optional — the temporary plating bus (`stencil_plating_bus`, off by default).** By default the stencil is just traces + holes. Turn the bus on (config or `--plating-bus`) and kicad2print adds extra slots: a perimeter rail just inside the board edge plus one short stub to **every electrically-isolated trace** (found geometrically, so you don't have to think about nets). After seeding, the rail and stubs become raised conductive bars that short every trace together, so the whole side plates from a single cathode clip on the rail. After plating you **grind the rail and stubs off** to restore isolation (step 7) — they sit proud of the recessed traces, so grinding flush removes the bus cleanly. This isn't right for every board; if you'd rather place the interconnect yourself, leave it off and add bridges in KiCad (see *Manual* below).
 
-**Cathode contacts (tie-bars):** the rail fences off the plate inside it, so the stencil adds small **tie-bars** that bridge that inner plate to the outer frame — otherwise it prints as a loose piece that tears off when you peel the print. Each tie-bar is solid plate spanning the rail, so it **interrupts the painted rail** at that point: with N tie-bars the rail becomes N separate arcs, and you clip the plating cathode to **each arc**. The count is automatic (1 for small boards, 2 for larger) and any further loose islands are tied only where needed; set `bus_tie_count = 1` to force a single arc/clip, or higher for more mechanical strength. A board occasionally has a small plate island fully enclosed by traces — that can't be tied without damming a groove, so kicad2print prints a warning and leaves it; snip it out by hand if it detaches.
+When the bus is on, **tie-bars** bridge the plate the rail fences in to the outer frame — otherwise it prints as a loose piece that tears off when you peel. Each tie-bar spans (and so **interrupts**) the painted rail: with N tie-bars the rail becomes N arcs, and you clip the cathode to **each arc**. The count is automatic (1 small / 2 larger); set `bus_tie_count = 1` for a single arc/clip. A small plate island fully enclosed by traces can't be tied without damming a groove, so kicad2print warns and leaves it; snip it out by hand if it detaches.
 
-Tune it in the preset/config via the `stencil_*` and `bus_*` keys (plate/slot/lip dimensions, bus width and inset); the defaults are a good starting point for a well-tuned printer. Best on rectangular outlines — the rail follows the board's bounding box.
+**Mounting — clamp ring (default) vs integral lip** (`stencil_mount`): with the default `ring` mount the plates are **flat** and you print them **contact-face down** on the bed, so the masking face comes out glass-smooth (cleaner seeding, easier release). A separate, reusable **L-section clamp ring** (`boardname_stencil_ring.stl`) snaps around the PCB and folds a lip over the plate to wedge it down — one ring serves both sides (move it across when you flip the board). Set `stencil_mount = "lip"` for the older one-piece design where a perimeter lip is built into each plate (no separate ring, but the contact face must print upward, so it's less smooth). Lip overhang/height are `ring_lip_overlap_mm` / `ring_lip_height_mm`.
+
+Tune the rest in the preset/config via the `stencil_*` and `bus_*` keys (plate/slot/lip dimensions, bus width and inset); the defaults are a good starting point for a well-tuned printer. Best on rectangular outlines — the rail follows the board's bounding box.
 
 #### Manual — KiCad bridges (alternative)
 
@@ -257,9 +258,9 @@ For a first attempt, **guitar shielding paint** is the sweet spot: brushable, st
 **Snap-on stencil (recommended — see [step 3](#the-plating-bus-and-sacrificial-bridges)):**
 
 1. Stir the paint thoroughly — conductive particles settle.
-2. Snap the printed stencil onto the substrate; the perimeter lip locates it over the grooves.
-3. Spread paint across the stencil with a squeegee or stiff card, working it into the slots (grooves + bus rail + stubs).
-4. Lift the stencil straight off before the paint skins over. Paint is now only in the channels and the bus — the flat surface stays clean.
+2. Register the plate over the grooves. With the **ring** mount: lay the flat plate smooth-face-down on the board, then snap the clamp ring around the PCB to wedge it down. With the **lip** mount: snap the one-piece stencil straight on (its lip locates it).
+3. Spread paint across the plate with a squeegee or stiff card, working it into the slots (grooves + bus rail + stubs).
+4. Lift the plate (and ring) straight off before the paint skins over. Paint is now only in the channels and the bus — the flat surface stays clean.
 5. Let it cure, then add a second pass if any groove looks thin. Touch up the trace-to-eyelet transitions by hand if the slot didn't fully reach the flange.
 
 This is the lowest-cleanup method and gives the most consistent trace width, since the slot — not your brush — defines the paint edge.
