@@ -151,21 +151,51 @@ impl Via {
     }
 }
 
-/// A component pad that has a through-hole.
+/// The land shape of a pad, as declared in the `.kicad_pcb` pad definition.
+/// Drives how the pad's copper land is rendered as an indent/slot — a round
+/// hole would be wrong for a rectangular SMD pad, for instance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PadShape {
+    Rect,
+    /// Rounded-rect / trapezoid / custom: approximated as a plain rect using
+    /// the pad's width/height bounding box.
+    RoundRect,
+    Circle,
+    /// Stadium (rect with semicircular caps) when width != height, else a circle.
+    Oval,
+}
+
+/// A component pad.
 ///
 /// Pads are the connection points for component leads (resistors, capacitors, etc.).
-/// This type only tracks through-hole pads; SMD (surface-mount) pads without holes
-/// are ignored since they don't require substrate modifications.
+/// Through-hole pads carry a real `drill` diameter; SMD pads have `drill == 0.0`
+/// and are only included here when they carry a net (see the parser), so they can
+/// still get a shaped land indent even though they need no substrate hole.
 #[derive(Debug, Clone)]
 pub struct Pad {
     /// Center point of the pad
     pub center: Point2,
-    /// Drill hole diameter in millimeters
+    /// Drill hole diameter in millimeters. 0.0 means no through-hole (SMD pad) —
+    /// callers must not synthesize a hole for these; only a real KiCad drill
+    /// value should ever produce a through-hole.
     pub drill: f64,
     /// Pad number string (e.g. "1", "2", "A1")
     pub number: String,
     /// Net name this pad is connected to, if any
     pub net_name: Option<String>,
+    /// Pad land width in millimeters (local X extent, before rotation)
+    pub width: f64,
+    /// Pad land height in millimeters (local Y extent, before rotation)
+    pub height: f64,
+    /// Land shape, used to draw an accurate indent (not just a round hole)
+    pub shape: PadShape,
+    /// Absolute rotation in degrees (footprint rotation + the pad's own local
+    /// rotation), for orienting non-circular land shapes correctly.
+    pub rotation_deg: f64,
+    /// True if this pad has copper on the front layer (F.Cu / "*.Cu")
+    pub on_fcu: bool,
+    /// True if this pad has copper on the back layer (B.Cu / "*.Cu")
+    pub on_bcu: bool,
 }
 
 impl Pad {
@@ -176,6 +206,12 @@ impl Pad {
             drill: self.drill * factor,
             number: self.number.clone(),
             net_name: self.net_name.clone(),
+            width: self.width * factor,
+            height: self.height * factor,
+            shape: self.shape,
+            rotation_deg: self.rotation_deg,
+            on_fcu: self.on_fcu,
+            on_bcu: self.on_bcu,
         }
     }
 }
@@ -394,7 +430,8 @@ impl PcbData {
         println!("Back copper traces:  {}", self.traces_bcu.len());
         println!("Arc traces:          {}", self.arc_traces.len());
         println!("Vias:                {}", self.vias.len());
-        println!("Pads with drills:    {}", self.pads.len());
+        println!("Pads with drills:    {}", self.pads.iter().filter(|p| p.drill > 0.0).count());
+        println!("SMD/netted pads:     {}", self.pads.iter().filter(|p| p.drill <= 0.0).count());
         println!("Total elements:      {}", self.element_count());
     }
 }

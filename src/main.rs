@@ -157,6 +157,11 @@ struct Args {
     #[arg(long)]
     no_pad_holes: bool,
 
+    /// Disable shaped pad land indents (rect/circle/oval, for electroplating a
+    /// proper solderable pad, not just the lead's round hole)
+    #[arg(long)]
+    no_pad_lands: bool,
+
     /// Disable via/eyelet indent guides
     #[arg(long)]
     no_via_indents: bool,
@@ -224,6 +229,7 @@ impl Args {
             output_format,
             output_dir: self.output_dir.clone(),
             generate_pad_holes: if self.no_pad_holes { Some(false) } else { None },
+            generate_pad_lands: if self.no_pad_lands { Some(false) } else { None },
             generate_via_indents: if self.no_via_indents { Some(false) } else { None },
             generate_stencil: if self.stencil { Some(true) } else { None },
             stencil_plating_bus: if self.plating_bus { Some(true) } else { None },

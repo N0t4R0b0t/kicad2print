@@ -279,6 +279,17 @@ pub struct Config {
     #[serde(default = "default_generate_via_indents")]
     pub generate_via_indents: bool,
 
+    /// Whether to carve a shallow, pad-shaped indent (rect/circle/oval, matching
+    /// the real KiCad pad land) at every pad, same depth as trace channels.
+    /// Merged into the trace channel network so electroplating fills a properly
+    /// shaped, solderable pad rather than just the lead's round drill hole.
+    /// A pad's actual through-hole (if any) is unaffected by this flag — it is
+    /// only ever generated when the pad has a real KiCad drill value.
+    ///
+    /// Default: true
+    #[serde(default = "default_generate_pad_lands")]
+    pub generate_pad_lands: bool,
+
     /// Whether to also generate a snap-on conductive-paint stencil plus a
     /// temporary plating bus (one stencil per copper side that has traces).
     ///
@@ -395,6 +406,7 @@ fn default_scale_factor() -> f64 { 0.0 }
 fn default_output_format() -> OutputFormat { OutputFormat::Stl }
 fn default_output_dir() -> String { "./output".to_string() }
 fn default_generate_pad_holes() -> bool { true }
+fn default_generate_pad_lands() -> bool { true }
 fn default_generate_via_indents() -> bool { true }
 fn default_generate_stencil() -> bool { false }
 fn default_stencil_plating_bus() -> bool { false }
@@ -424,6 +436,7 @@ impl Default for Config {
             output_format: default_output_format(),
             output_dir: default_output_dir(),
             generate_pad_holes: default_generate_pad_holes(),
+            generate_pad_lands: default_generate_pad_lands(),
             generate_via_indents: default_generate_via_indents(),
             generate_stencil: default_generate_stencil(),
             stencil_plating_bus: default_stencil_plating_bus(),
@@ -510,6 +523,9 @@ impl Config {
         if overrides.generate_pad_holes.is_some() {
             self.generate_pad_holes = overrides.generate_pad_holes.unwrap();
         }
+        if overrides.generate_pad_lands.is_some() {
+            self.generate_pad_lands = overrides.generate_pad_lands.unwrap();
+        }
         if overrides.generate_via_indents.is_some() {
             self.generate_via_indents = overrides.generate_via_indents.unwrap();
         }
@@ -580,6 +596,7 @@ impl Config {
         println!("Output format:       {}", self.output_format);
         println!("Output directory:    {}", self.output_dir);
         println!("Generate pad holes:  {}", if self.generate_pad_holes { "yes" } else { "no" });
+        println!("Generate pad lands:  {}", if self.generate_pad_lands { "yes" } else { "no" });
         println!("Generate via indents: {}", if self.generate_via_indents { "yes" } else { "no" });
         if self.generate_stencil {
             println!("Stencil mount:       {}", self.stencil_mount);
@@ -604,6 +621,7 @@ pub struct CliOverrides {
     pub output_format: Option<OutputFormat>,
     pub output_dir: Option<String>,
     pub generate_pad_holes: Option<bool>,
+    pub generate_pad_lands: Option<bool>,
     pub generate_via_indents: Option<bool>,
     pub generate_stencil: Option<bool>,
     pub stencil_plating_bus: Option<bool>,

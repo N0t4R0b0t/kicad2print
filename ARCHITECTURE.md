@@ -50,6 +50,12 @@ KiCad uses Y-down. kicad2print negates Y at parse time (`get_xy_point` in `kicad
 ### Scaling
 If any trace width is narrower than `channel_width_mm`, the entire board scales up uniformly: `scale = channel_width / min_trace_width`. This keeps component hole spacing correct so drilled holes still fit parts, just on a larger board.
 
+### Pad extraction
+`walk_kicad_tree` (`parser/kicad.rs`) puts *all* pads with a real net into `PcbData.pads` — through-hole and SMD alike (unnetted/no-connect SMD pads are excluded). Consumers that only want drilled pads (e.g. `union_pad_holes` in `geometry/mod.rs`) filter by `pad.drill > 0.0` themselves at the call site. Do not re-add a `drill > 0.0` filter at the parser level — that previously and silently dropped every SMD pad from the pad-land (shallow indent) feature board-wide.
+
+### `geo` boolean-op reliability
+The `geo` crate's boolean-op sweep algorithm (`union`/`intersection`/`difference`) is unreliable on real-world PCB geometry with touching/near-touching polygons (adjacent trace segments sharing an endpoint, pad lands overlapping trace stubs, Edge.Cuts cutouts overlapping pads) — confirmed to hang indefinitely or panic, non-deterministically, on identical input. Every boolean-op call in `geometry/mod.rs` therefore goes through `safe_union`/`safe_intersection`/`safe_difference`, which run the op on a watchdog thread (5s timeout) with `catch_unwind`, warn and degrade gracefully (drop/skip that contribution) rather than hanging or crashing the whole process. Any new boolean-op call added to `generate_model`/`generate_stencil` must use these wrappers, not a raw `geo` call.
+
 ### MCP server
 `mcp.rs` uses the `rmcp` crate (v1.5, `#[tool_router]` macro pattern). Each tool is an `async fn` on `KiCadServer`. Tools that invoke `kicad-cli` spawn it via `tokio::process::Command` and capture stdout/stderr. The server runs over stdio (stdin/stdout), which is the standard Claude Desktop transport.
 

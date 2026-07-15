@@ -24,7 +24,7 @@ use geo::{BooleanOps, Coord, LineString, MultiPolygon, Polygon};
 // No external clipper fallback available; use guarded geo unions.
 
 use crate::config::{Config, StencilMount};
-use crate::pcb::{BoardOutline, CopperLayer, CutoutShape, Pad, PcbData, Point2, Trace};
+use crate::pcb::{BoardOutline, CopperLayer, CutoutShape, Pad, PadShape, PcbData, Point2, Trace};
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -147,6 +147,22 @@ pub fn generate_model(pcb: &PcbData, config: &Config) -> Result<Mesh3D> {
     let fcu = union_traces(&pcb.traces_fcu, chan_w);
     let bcu = union_traces(&pcb.traces_bcu, chan_w);
 
+    // Pad lands: shallow, pad-shaped indents (same depth as trace channels) so
+    // electroplating fills a properly shaped, solderable pad — not just the
+    // lead's round drill hole. Merged into each layer's channel network so a
+    // trace flows continuously into its pad. THT pads still get a real
+    // through-hole for the lead (below) cut through the middle of this indent.
+    let (fcu, bcu) = if config.generate_pad_lands {
+        let pad_lands_fcu = union_pad_lands(&pcb.pads, 0.0, |p| p.on_fcu);
+        let pad_lands_bcu = union_pad_lands(&pcb.pads, 0.0, |p| p.on_bcu);
+        (
+            safe_union(fcu, &pad_lands_fcu, "F.Cu pad lands"),
+            safe_union(bcu, &pad_lands_bcu, "B.Cu pad lands"),
+        )
+    } else {
+        (fcu, bcu)
+    };
+
     // Pad holes: each pad uses its own drill size from KiCad.
     // hole_r serves as a minimum (in case a pad has a tiny or missing drill value).
     let holes = if config.generate_pad_holes {
@@ -158,7 +174,18 @@ pub fn generate_model(pcb: &PcbData, config: &Config) -> Result<Mesh3D> {
     // Via holes: always treat as through-holes (merged into pad holes polygon)
     let via_holes = if !pcb.vias.is_empty() {
         union_circles(
-            &pcb.vias.iter().map(|v| Pad { center: v.center, drill: config.eyelet_diameter_mm, number: String::new(), net_name: None }).collect::<Vec<_>>(),
+            &pcb.vias.iter().map(|v| Pad {
+                center: v.center,
+                drill: config.eyelet_diameter_mm,
+                number: String::new(),
+                net_name: None,
+                width: config.eyelet_diameter_mm,
+                height: config.eyelet_diameter_mm,
+                shape: PadShape::Circle,
+                rotation_deg: 0.0,
+                on_fcu: true,
+                on_bcu: true,
+            }).collect::<Vec<_>>(),
             config.eyelet_diameter_mm / 2.0,
             16,
         )
@@ -166,7 +193,7 @@ pub fn generate_model(pcb: &PcbData, config: &Config) -> Result<Mesh3D> {
         MultiPolygon::new(vec![])
     };
     let all_holes = if config.generate_pad_holes {
-        holes.union(&via_holes)
+        safe_union(holes, &via_holes, "pad holes + via holes")
     } else {
         via_holes
     };
@@ -178,23 +205,41 @@ pub fn generate_model(pcb: &PcbData, config: &Config) -> Result<Mesh3D> {
         MultiPolygon::new(vec![])
     };
     let all_holes = if !pcb.cutouts.is_empty() {
-        all_holes.union(&cutouts_mp)
+        safe_union(all_holes, &cutouts_mp, "holes + cutouts")
     } else {
         all_holes
     };
 
     // ── Generate solid substrate: full board outline minus all through-holes ─
-    let solid_substrate = board_mp.difference(&all_holes);
+    let solid_substrate = safe_difference(board_mp.clone(), &all_holes, "board outline - all holes");
+
+    // Clip the channel/pad-land networks against the board outline and all
+    // holes (drills + cutouts) exactly once, up front, and reuse this single
+    // clipped version everywhere below. Previously `top_face`/`bot_face` were
+    // cut using the *unclipped* fcu/bcu (still extending past cutout
+    // boundaries), while the channel-floor code separately computed its own
+    // clipped copy — two independently-clipped versions of the same feature
+    // meeting at nearly-but-not-exactly-coincident edges is exactly the kind
+    // of degenerate near-touching geometry that the underlying `geo` crate's
+    // boolean-op sweep algorithm can silently mis-triangulate (confirmed:
+    // reproducibly corrupted the region around a footprint that has a real
+    // Edge.Cuts cutout overlapping its own pads/trace stubs). A single
+    // consistently-clipped fcu/bcu avoids feeding that same boundary into the
+    // sweep algorithm twice from two different starting shapes.
+    let fcu = safe_intersection(fcu, &board_mp, "F.Cu network ∩ board outline");
+    let fcu = safe_difference(fcu, &all_holes, "F.Cu network - all holes");
+    let bcu = safe_intersection(bcu, &board_mp, "B.Cu network ∩ board outline");
+    let bcu = safe_difference(bcu, &all_holes, "B.Cu network - all holes");
 
     // ── Top face (z = thickness, normal +Z) ────────────────────────────────
-    let top_face = solid_substrate.difference(&fcu);
+    let top_face = safe_difference(solid_substrate.clone(), &fcu, "top face - F.Cu network");
     add_flat(&mut mesh, &top_face, &ctx, thickness, true);
 
     // ── Bottom face (z = 0, normal −Z) ─────────────────────────────────────
     let bot_face = if pcb.traces_bcu.is_empty() {
         solid_substrate.clone()
     } else {
-        solid_substrate.difference(&bcu)
+        safe_difference(solid_substrate.clone(), &bcu, "bottom face - B.Cu network")
     };
     add_flat(&mut mesh, &bot_face, &ctx, 0.0, false);
 
@@ -202,13 +247,11 @@ pub fn generate_model(pcb: &PcbData, config: &Config) -> Result<Mesh3D> {
     add_outline_walls(&mut mesh, outline, &ctx, 0.0, thickness);
 
     // ── F.Cu channel floors + inner walls ──────────────────────────────────
-    let fcu_clip = fcu.intersection(&board_mp).difference(&all_holes);
-    add_channel(&mut mesh, &fcu_clip, &ctx, thickness - chan_depth, thickness, true);
+    add_channel(&mut mesh, &fcu, &ctx, thickness - chan_depth, thickness, true);
 
     // ── B.Cu channel floors + inner walls ──────────────────────────────────
     if !pcb.traces_bcu.is_empty() {
-        let bcu_clip = bcu.intersection(&board_mp).difference(&all_holes);
-        add_channel(&mut mesh, &bcu_clip, &ctx, chan_depth, 0.0, false);
+        add_channel(&mut mesh, &bcu, &ctx, chan_depth, 0.0, false);
     }
 
     // ── Through-hole cylinder walls (pads + vias) ──────────────────────────
@@ -334,20 +377,92 @@ fn union_polys(polys: Vec<Polygon>) -> MultiPolygon {
         return MultiPolygon::new(vec![]);
     }
     // Perform unions incrementally, guarding each union call so a single
-    // problematic polygon won't crash the entire process.
+    // problematic polygon won't crash the entire process. The geo crate's
+    // boolean-op sweep algorithm has been observed to both panic AND hang
+    // indefinitely on pathological/degenerate input (e.g. capsule polygons
+    // that touch at an exact shared vertex, as adjacent PCB trace segments
+    // do) — catch_unwind alone can't stop a hang, so each union also runs
+    // under a watchdog timeout on a background thread.
     let mut result = MultiPolygon::new(vec![valid[0].clone()]);
     for (i, poly) in valid.iter().enumerate().skip(1) {
-        eprintln!("geometry: union iteration {} (poly vertices={})", i, poly.exterior().coords().count());
         let rhs = MultiPolygon::new(vec![poly.clone()]);
-        let union_res = std::panic::catch_unwind(|| result.union(&rhs));
-        match union_res {
-            Ok(mp) => result = mp,
-            Err(_) => {
-                eprintln!("⚠️  geometry: skipping polygon at index {} that caused boolean-op panic", i);
+        match geo_op_with_timeout(result.clone(), rhs, GEO_OP_TIMEOUT, geo_union) {
+            Some(mp) => result = mp,
+            None => {
+                eprintln!("⚠️  geometry: skipping polygon at index {} that caused a boolean-op panic or timeout", i);
             }
         }
     }
     result
+}
+
+/// Runs a `geo` boolean op (union/intersection/difference) on a background
+/// thread and gives up after `timeout`, returning `None` on panic or timeout
+/// instead of hanging or crashing the whole process. The abandoned thread (if
+/// any) is left to run and is killed with the process on exit — this is a
+/// short-lived CLI tool, so leaking one stuck thread per failed op is an
+/// acceptable trade for never hanging or aborting.
+fn geo_op_with_timeout(
+    lhs: MultiPolygon,
+    rhs: MultiPolygon,
+    timeout: std::time::Duration,
+    op: fn(&MultiPolygon, &MultiPolygon) -> MultiPolygon,
+) -> Option<MultiPolygon> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| op(&lhs, &rhs)));
+        let _ = tx.send(result);
+    });
+    match rx.recv_timeout(timeout) {
+        Ok(Ok(mp)) => Some(mp),
+        Ok(Err(_)) | Err(_) => None,
+    }
+}
+
+fn geo_union(a: &MultiPolygon, b: &MultiPolygon) -> MultiPolygon { a.union(b) }
+fn geo_intersection(a: &MultiPolygon, b: &MultiPolygon) -> MultiPolygon { a.intersection(b) }
+fn geo_difference(a: &MultiPolygon, b: &MultiPolygon) -> MultiPolygon { a.difference(b) }
+
+const GEO_OP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Safe union: on panic/timeout, warns and returns `lhs` unchanged (drops the
+/// rhs contribution) rather than crashing or hanging the whole conversion.
+fn safe_union(lhs: MultiPolygon, rhs: &MultiPolygon, what: &str) -> MultiPolygon {
+    match geo_op_with_timeout(lhs.clone(), rhs.clone(), GEO_OP_TIMEOUT, geo_union) {
+        Some(mp) => mp,
+        None => {
+            eprintln!("⚠️  geometry: union failed ({what}) — keeping prior geometry, dropping this contribution");
+            lhs
+        }
+    }
+}
+
+/// Safe intersection: on panic/timeout, warns and returns `lhs` unchanged
+/// (skips clipping) rather than crashing or hanging the whole conversion.
+fn safe_intersection(lhs: MultiPolygon, rhs: &MultiPolygon, what: &str) -> MultiPolygon {
+    match geo_op_with_timeout(lhs.clone(), rhs.clone(), GEO_OP_TIMEOUT, geo_intersection) {
+        Some(mp) => mp,
+        None => {
+            eprintln!("⚠️  geometry: intersection failed ({what}) — keeping prior geometry, skipping this clip");
+            lhs
+        }
+    }
+}
+
+/// Safe difference: on panic/timeout, warns and returns `lhs` unchanged
+/// (skips subtracting rhs) rather than crashing or hanging the whole
+/// conversion. Note: unlike a failed union/intersection, a failed difference
+/// leaves `rhs`'s area un-subtracted from `lhs` — for a hole cut this means
+/// the hole may be missing in the small, rare case this triggers, which is a
+/// far better failure mode than an aborted process or a corrupted mesh.
+fn safe_difference(lhs: MultiPolygon, rhs: &MultiPolygon, what: &str) -> MultiPolygon {
+    match geo_op_with_timeout(lhs.clone(), rhs.clone(), GEO_OP_TIMEOUT, geo_difference) {
+        Some(mp) => mp,
+        None => {
+            eprintln!("⚠️  geometry: difference failed ({what}) — keeping prior geometry, skipping this cut");
+            lhs
+        }
+    }
 }
 
 fn union_traces(traces: &[Trace], channel_width: f64) -> MultiPolygon {
@@ -365,9 +480,14 @@ fn union_circles(pads: &[Pad], radius: f64, sides: usize) -> MultiPolygon {
 
 /// Union of pad hole circles, using each pad's own drill diameter (from KiCad).
 /// `min_radius` is a floor in case a pad has a missing or unrealistically small drill.
+/// `min_radius` is a floor applied only to pads that already have a real KiCad
+/// drill (guards against a tiny/degenerate drill value) — a pad with no drill
+/// at all (`drill == 0.0`, e.g. an SMD pad) is skipped entirely and never gets
+/// a fabricated hole; it may still get a shaped land indent (`pad_land_poly`).
 fn union_pad_holes(pads: &[Pad], min_radius: f64, sides: usize) -> MultiPolygon {
     union_polys(
         pads.iter()
+            .filter(|p| p.drill > 0.0)
             .map(|p| {
                 let r = (p.drill / 2.0).max(min_radius);
                 circle_poly(&p.center, r, sides)
@@ -404,6 +524,96 @@ fn rect_cutout_poly(cx: f64, cy: f64, hw: f64, hh: f64, rot_deg: f64) -> Polygon
     Polygon::new(LineString::new(coords), vec![])
 }
 
+/// Builds a stadium (rect with semicircular caps) for a KiCad "oval" pad of
+/// local size w×h, rotated by `rot_deg` and centered at (cx, cy). Degenerates
+/// to a plain circle when w == h. `cap_sides` is the number of segments per
+/// semicircular cap.
+fn oval_poly(cx: f64, cy: f64, w: f64, h: f64, rot_deg: f64, cap_sides: usize) -> Polygon {
+    use std::f64::consts::PI;
+    let rot = rot_deg.to_radians();
+    let to_global = |lx: f64, ly: f64| Coord {
+        x: cx + lx * rot.cos() - ly * rot.sin(),
+        y: cy + lx * rot.sin() + ly * rot.cos(),
+    };
+
+    if (w - h).abs() < 1e-9 {
+        // Square aspect ratio — a plain circle.
+        let r = w / 2.0;
+        let coords: Vec<Coord> = (0..=cap_sides * 2)
+            .map(|i| {
+                let a = 2.0 * PI * i as f64 / (cap_sides * 2) as f64;
+                to_global(r * a.cos(), r * a.sin())
+            })
+            .collect();
+        return Polygon::new(LineString::new(coords), vec![]);
+    }
+
+    // Local-frame stadium: long axis picked by whichever of w/h is larger.
+    let r = w.min(h) / 2.0;
+    let mut coords: Vec<Coord> = Vec::with_capacity(cap_sides * 2 + 2);
+    if w >= h {
+        let half_straight = (w - h) / 2.0;
+        // Cap centered at +half_straight, sweeping the right semicircle (-90°..+90°)
+        for i in 0..=cap_sides {
+            let a = -PI / 2.0 + PI * i as f64 / cap_sides as f64;
+            coords.push(to_global(half_straight + r * a.cos(), r * a.sin()));
+        }
+        // Cap centered at -half_straight, sweeping the left semicircle (90°..270°)
+        for i in 0..=cap_sides {
+            let a = PI / 2.0 + PI * i as f64 / cap_sides as f64;
+            coords.push(to_global(-half_straight + r * a.cos(), r * a.sin()));
+        }
+    } else {
+        let half_straight = (h - w) / 2.0;
+        // Cap centered at +half_straight (top), sweeping (0°..180°)
+        for i in 0..=cap_sides {
+            let a = PI * i as f64 / cap_sides as f64;
+            coords.push(to_global(r * a.cos(), half_straight + r * a.sin()));
+        }
+        // Cap centered at -half_straight (bottom), sweeping (180°..360°)
+        for i in 0..=cap_sides {
+            let a = PI + PI * i as f64 / cap_sides as f64;
+            coords.push(to_global(r * a.cos(), -half_straight + r * a.sin()));
+        }
+    }
+    coords.push(coords[0]);
+    Polygon::new(LineString::new(coords), vec![])
+}
+
+/// Builds the copper land polygon for a pad, in its real shape/size/orientation
+/// (rect, rounded-rect approximated as rect, circle, or oval/stadium) — used to
+/// carve an accurately-shaped indent/slot rather than a round hole. Returns
+/// `None` for a pad with no usable size (shouldn't normally happen).
+/// `margin_mm` inflates width/height symmetrically (e.g. to widen a stencil
+/// opening past the substrate's exact pad size for paint/alignment tolerance,
+/// matching how trace slots get `stencil_slot_clearance_mm` — pass 0.0 for an
+/// exact-size land).
+fn pad_land_poly(pad: &Pad, margin_mm: f64) -> Option<Polygon> {
+    if pad.width <= 0.0 || pad.height <= 0.0 {
+        return None;
+    }
+    let w = pad.width + margin_mm;
+    let h = pad.height + margin_mm;
+    Some(match pad.shape {
+        PadShape::Rect | PadShape::RoundRect => {
+            rect_cutout_poly(pad.center.x, pad.center.y, w / 2.0, h / 2.0, pad.rotation_deg)
+        }
+        PadShape::Circle => circle_poly(&pad.center, w.max(h) / 2.0, 24),
+        PadShape::Oval => oval_poly(pad.center.x, pad.center.y, w, h, pad.rotation_deg, 12),
+    })
+}
+
+/// Union of pad land shapes (see `pad_land_poly`) for pads matching `filter`
+/// (typically an on_fcu/on_bcu check for the layer being built).
+fn union_pad_lands(pads: &[Pad], margin_mm: f64, filter: impl Fn(&Pad) -> bool) -> MultiPolygon {
+    union_polys(
+        pads.iter()
+            .filter(|p| filter(p))
+            .filter_map(|p| pad_land_poly(p, margin_mm))
+            .collect(),
+    )
+}
+
 // ---------------------------------------------------------------------------
 // Mesh face generators
 // ---------------------------------------------------------------------------
@@ -428,15 +638,25 @@ fn add_flat(mesh: &mut Mesh3D, mp: &MultiPolygon, ctx: &Ctx, z: f32, normal_up: 
 
 /// Triangulate a polygon (with possible holes) using the earcut algorithm.
 /// Returns a list of triangles as [Coord; 3] arrays.
+///
+/// `earcut` assumes a simple (non-self-intersecting), duplicate-free ring.
+/// Rings coming out of several chained `geo` boolean ops can carry
+/// sub-micron floating-point noise — near-duplicate or near-collinear
+/// vertices that are mathematically harmless but make earcut's ear-clipping
+/// produce scattered, fragmented garbage instead of the intended shape
+/// (confirmed: a real pad land recessed floor came out as disconnected
+/// slivers instead of a clean rectangle). Snapping to a fixed grid right
+/// before triangulation — well below any manufacturing tolerance — resolves
+/// this without needing to fix the noise at its various upstream sources.
 fn triangulate_polygon(poly: &Polygon) -> Vec<[Coord; 3]> {
     let mut verts: Vec<f64> = Vec::new();
     let mut hole_indices: Vec<usize> = Vec::new();
 
-    push_ring(poly.exterior(), &mut verts);
+    push_ring_snapped(poly.exterior(), &mut verts);
 
     for interior in poly.interiors() {
         hole_indices.push(verts.len() / 2);
-        push_ring(interior, &mut verts);
+        push_ring_snapped(interior, &mut verts);
     }
 
     let indices = earcutr::earcut(&verts, &hole_indices, 2).unwrap_or_default();
@@ -447,6 +667,46 @@ fn triangulate_polygon(poly: &Polygon) -> Vec<[Coord; 3]> {
         .filter(|c| c.len() == 3)
         .map(|c| [coord_at(c[0]), coord_at(c[1]), coord_at(c[2])])
         .collect()
+}
+
+/// 1/10000 mm = 0.1 micron — far finer than any FDM/resin printer can
+/// resolve, but coarse enough to collapse the floating-point noise that
+/// chained boolean ops leave behind onto exactly-coincident coordinates.
+fn snap_coord(v: f64) -> f64 {
+    (v * 10_000.0).round() / 10_000.0
+}
+
+/// Like `push_ring`, but snaps coordinates to `snap_coord` and drops
+/// consecutive duplicate/near-zero-length edges the snap can introduce —
+/// earcut degrades badly on both.
+fn push_ring_snapped(ring: &geo::LineString, verts: &mut Vec<f64>) {
+    let coords: Vec<_> = ring.coords().collect();
+    let n = if coords.len() > 1 && coords.first() == coords.last() {
+        coords.len() - 1
+    } else {
+        coords.len()
+    };
+    let ring_start = verts.len();
+    let mut last: Option<(f64, f64)> = None;
+    for c in &coords[..n] {
+        let (x, y) = (snap_coord(c.x), snap_coord(c.y));
+        if last == Some((x, y)) {
+            continue;
+        }
+        verts.push(x);
+        verts.push(y);
+        last = Some((x, y));
+    }
+    // Drop a trailing point that snapped onto *this ring's own* first point
+    // (not any earlier ring already in `verts` — this function is called once
+    // per ring, exterior then each hole, all sharing one accumulator).
+    if verts.len() >= ring_start + 4 {
+        let (fx, fy) = (verts[ring_start], verts[ring_start + 1]);
+        let (lx, ly) = (verts[verts.len() - 2], verts[verts.len() - 1]);
+        if (fx, fy) == (lx, ly) {
+            verts.truncate(verts.len() - 2);
+        }
+    }
 }
 
 /// Vertical quads along the board outline perimeter.
@@ -560,23 +820,6 @@ fn add_ring_walls<'a>(
     }
 }
 
-/// Shallow indent dimples at via locations (guide marks for eyelets).
-/// All vias use eyelet_diameter_mm for consistent sizing.
-/// Generate via dimple geometry from the via_indents polygon.
-/// The face polygon already has holes with these exact ring vertices.
-fn push_ring(ring: &geo::LineString, verts: &mut Vec<f64>) {
-    let coords: Vec<_> = ring.coords().collect();
-    let n = if coords.len() > 1 && coords.first() == coords.last() {
-        coords.len() - 1
-    } else {
-        coords.len()
-    };
-    for c in &coords[..n] {
-        verts.push(c.x);
-        verts.push(c.y);
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Snap-on conductive-paint stencil + temporary plating bus
 // ---------------------------------------------------------------------------
@@ -631,6 +874,22 @@ pub fn generate_stencil(
     // ── Trace slots: each unioned polygon is one isolated copper island ─────
     let trace_slots = union_traces(traces, slot_w);
 
+    // ── Pad lands: pad-shaped (not round) through-slots so paint/plating fills
+    // the substrate's matching pad-shaped indent, not just a round lead hole.
+    // Widened by the same slot clearance as trace channels for paint/alignment
+    // tolerance. Merged into trace_slots so a pad's slot joins its trace's.
+    let trace_slots = if config.generate_pad_lands {
+        let land_margin = 2.0 * config.stencil_slot_clearance_mm;
+        let on_layer = |p: &Pad| match layer {
+            CopperLayer::FCu => p.on_fcu,
+            CopperLayer::BCu => p.on_bcu,
+        };
+        let pad_lands = union_pad_lands(&pcb.pads, land_margin, on_layer);
+        safe_union(trace_slots, &pad_lands, "stencil trace slots + pad lands")
+    } else {
+        trace_slots
+    };
+
     // ── Pad + via holes so the plate clears inserted leads/eyelets and lets
     // paint reach the eyelet flanges (mirrors the substrate's through-holes).
     let pad_holes = if config.generate_pad_holes {
@@ -649,13 +908,19 @@ pub fn generate_stencil(
                     drill: config.eyelet_diameter_mm,
                     number: String::new(),
                     net_name: None,
+                    width: config.eyelet_diameter_mm,
+                    height: config.eyelet_diameter_mm,
+                    shape: PadShape::Circle,
+                    rotation_deg: 0.0,
+                    on_fcu: true,
+                    on_bcu: true,
                 })
                 .collect::<Vec<_>>(),
             config.eyelet_diameter_mm / 2.0,
             16,
         )
     };
-    let hole_slots = pad_holes.union(&via_holes);
+    let hole_slots = safe_union(pad_holes, &via_holes, "stencil pad holes + via holes");
 
     // Rail centerline rectangle — used to route stubs and place tie-bars. On a
     // strongly non-rectangular outline the centerline isn't clipped to the board,
@@ -684,10 +949,12 @@ pub fn generate_stencil(
         let rail_mp = if rx1 - rx0 > 2.5 * bus_w && ry1 - ry0 > 2.5 * bus_w {
             let outer = MultiPolygon::new(vec![rect_poly(rx0, ry0, rx1, ry1)]);
             let inner = MultiPolygon::new(vec![rect_poly(rx0 + bus_w, ry0 + bus_w, rx1 - bus_w, ry1 - bus_w)]);
-            outer.difference(&inner).intersection(&board_mp)
+            let ring = safe_difference(outer, &inner, "stencil bus rail ring");
+            safe_intersection(ring, &board_mp, "stencil bus rail ring ∩ board outline")
         } else {
             // Board too small for a ring — a single bus bar along one edge.
-            MultiPolygon::new(vec![rect_poly(rx0, ry0, rx1, ry0 + bus_w)]).intersection(&board_mp)
+            let bar = MultiPolygon::new(vec![rect_poly(rx0, ry0, rx1, ry0 + bus_w)]);
+            safe_intersection(bar, &board_mp, "stencil bus bar ∩ board outline")
         };
 
         // Mid-edge tie-bars hold the plate the rail fences in. Each interrupts the
@@ -738,13 +1005,14 @@ pub fn generate_stencil(
                 }
             }
         }
-        (rail_mp.union(&union_polys(stub_polys)), tie_mp)
+        (safe_union(rail_mp, &union_polys(stub_polys), "stencil bus rail + stubs"), tie_mp)
     } else {
         (MultiPolygon::new(vec![]), MultiPolygon::new(vec![]))
     };
 
     // All through-slots = traces ∪ holes ∪ (bus, if enabled).
-    let slots = trace_slots.union(&hole_slots).union(&bus_slots);
+    let slots = safe_union(trace_slots, &hole_slots, "stencil slots + hole slots");
+    let slots = safe_union(slots, &bus_slots, "stencil slots + bus slots");
 
     // ── Plate footprint + slot region (depend on the mount style) ───────────
     let clr = config.stencil_fit_clearance_mm;
@@ -769,12 +1037,12 @@ pub fn generate_stencil(
     // Clip slots to the plate's slot region. With the bus on, carve the tie-bars
     // and bridge any remaining loose plate bodies across the rail so nothing
     // prints detached; a plain paint stencil (traces + holes) needs neither.
-    let slots = slots.intersection(&clip_mp);
+    let slots = safe_intersection(slots, &clip_mp, "stencil slots ∩ clip region");
     let slots = if bus {
-        let slots = slots.difference(&tie_mp);
-        let top_face = plate_mp.difference(&slots);
+        let slots = safe_difference(slots, &tie_mp, "stencil slots - tie bars");
+        let top_face = safe_difference(plate_mp.clone(), &slots, "stencil top face - slots (loose-body check)");
         let extra_ties = bridge_loose_bodies(&top_face, &rail_segments, bus_w, tie_w, tie_pad);
-        slots.difference(&extra_ties)
+        safe_difference(slots, &extra_ties, "stencil slots - extra ties")
     } else {
         slots
     };
@@ -792,9 +1060,12 @@ pub fn generate_stencil(
         //      −wh  ┤  └──────────┘       └─────────┘   ← lip bottom rim
         StencilMount::Lip => {
             let wh = config.stencil_wall_height_mm as f32;
-            add_flat(&mut mesh, &plate_mp.difference(&slots), &ctx, plate_t, true); // top
-            add_flat(&mut mesh, &clip_mp.difference(&slots), &ctx, 0.0, false); // cavity underside
-            add_flat(&mut mesh, &plate_mp.difference(&clip_mp), &ctx, -wh, false); // lip bottom rim
+            let top = safe_difference(plate_mp.clone(), &slots, "stencil lip top face - slots");
+            let underside = safe_difference(clip_mp.clone(), &slots, "stencil lip cavity underside - slots");
+            let rim = safe_difference(plate_mp.clone(), &clip_mp, "stencil lip bottom rim - clip region");
+            add_flat(&mut mesh, &top, &ctx, plate_t, true); // top
+            add_flat(&mut mesh, &underside, &ctx, 0.0, false); // cavity underside
+            add_flat(&mut mesh, &rim, &ctx, -wh, false); // lip bottom rim
             add_ring_walls(&mut mesh, plate_outer.exterior().coords(), -wh, plate_t, false, &ctx);
             add_ring_walls(&mut mesh, clip_inner.exterior().coords(), -wh, 0.0, true, &ctx);
             add_slot_walls(&mut mesh, &slots, 0.0, plate_t, &ctx);
@@ -812,7 +1083,7 @@ pub fn generate_stencil(
         // registers it. The plate is Z-symmetric, so the B.Cu plate needs no
         // mirror — only the slot XY matters.
         StencilMount::Ring => {
-            let faces = plate_mp.difference(&slots);
+            let faces = safe_difference(plate_mp.clone(), &slots, "stencil ring plate face - slots");
             add_flat(&mut mesh, &faces, &ctx, plate_t, true); // top
             add_flat(&mut mesh, &faces, &ctx, 0.0, false); // contact face
             add_ring_walls(&mut mesh, plate_outer.exterior().coords(), 0.0, plate_t, false, &ctx);

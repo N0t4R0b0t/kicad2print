@@ -231,7 +231,9 @@ Claude: [runs kicad2print conversion, returns STL + preview]
 | `list_nets` | All nets with connected pads — **call before any edit** to get correct net names |
 | `get_net_for_pad` | Net name and absolute position of one pad |
 | `query_pads_in_region` | All pads in a bounding box — inspect an area before routing |
-| `check_trace_clearance` | Collision check for a proposed trace — run before `add_trace` |
+| `query_traces_in_region` | All trace segments in a bounding box — pairs with `query_pads_in_region` |
+| `check_trace_clearance` | Collision check vs. pads *and* existing traces — run before `add_trace`, or pass `add_trace(check: true)` |
+| `delete_trace` | Remove trace segments by net/layer/uuid/region — the fix for bad routing, with `dry_run` support |
 | `verify_connectivity` | Confirm two pads are physically wired by existing traces/vias |
 | `add_power_symbol` | Place a power net symbol with correct `lib_symbols` definition |
 | `render_pcb` | Render the board (top / bottom / side views) |

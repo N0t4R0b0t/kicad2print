@@ -9,7 +9,8 @@
 //!
 //! Key design decisions:
 //! - Only traces on F.Cu and B.Cu copper layers are extracted (internal copper ignored)
-//! - Only through-hole pads are extracted (SMD pads without drills are skipped)
+//! - Through-hole and netted SMD pads are extracted (unnetted/no-connect SMD pads are
+//!   skipped); consumers that only want drilled pads filter by `pad.drill > 0.0` themselves
 //! - Y coordinates are negated to convert from KiCad's Y-down convention to standard Y-up
 //! - Board outline from Edge.Cuts layer segments are sorted and chained into a closed polygon
 
@@ -104,10 +105,13 @@ pub fn walk_kicad_tree(nodes: &[SexpNode]) -> Result<PcbData> {
                         if let Ok(fp) = parse_footprint(node) {
                             // Extract Edge.Cuts cutouts from within this footprint
                             collect_footprint_cutouts(node, &mut pcb.cutouts);
-                            // Only through-hole pads go into global geometry list (used for drill holes)
-                            for pad in fp.pads.iter().filter(|p| p.drill > 0.0) {
-                                pcb.pads.push(pad.clone());
-                            }
+                            // All pads go into the global geometry list: through-hole pads
+                            // for drill holes (union_pad_holes filters by drill > 0.0 itself),
+                            // and SMD pads (drill == 0, already filtered to netted-only by
+                            // parse_footprint) for shallow pad-land indents. Previously this
+                            // filtered to `drill > 0.0` only, which silently dropped every SMD
+                            // pad on the board before union_pad_lands ever saw them.
+                            pcb.pads.extend(fp.pads.iter().cloned());
                             pcb.footprints.push(fp);
                         }
                     }
@@ -432,6 +436,39 @@ fn parse_footprint(node: &SexpNode) -> Result<Footprint> {
                             .unwrap_or("")
                             .to_string();
 
+                        // Land shape is the fourth atom: (pad "1" thru_hole rect ...)
+                        let pad_shape = match pad_list.get(3).and_then(|n| n.as_atom()) {
+                            Some("rect") => PadShape::Rect,
+                            Some("roundrect") | Some("trapezoid") | Some("custom") => PadShape::RoundRect,
+                            Some("oval") => PadShape::Oval,
+                            _ => PadShape::Circle,
+                        };
+
+                        // Land size: (size W H) — H defaults to W for a square/circular pad.
+                        let (pad_w, pad_h) = item.get_child("size")
+                            .map(|n| {
+                                let w = n.nth(1).and_then(|x| x.as_atom()).and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0);
+                                let h = n.nth(2).and_then(|x| x.as_atom()).and_then(|s| s.parse::<f64>().ok()).unwrap_or(w);
+                                (w, h)
+                            })
+                            .unwrap_or((0.0, 0.0));
+
+                        // Which copper layers this pad's land actually sits on.
+                        // THT pads commonly use a "*.Cu" wildcard covering both sides.
+                        let (mut on_fcu, mut on_bcu) = (false, false);
+                        if let Some(layers_node) = item.get_child("layers") {
+                            if let Some(layer_list) = layers_node.as_list() {
+                                for l in layer_list.iter().skip(1).filter_map(|n| n.as_atom()) {
+                                    match l {
+                                        "*.Cu" => { on_fcu = true; on_bcu = true; }
+                                        "F.Cu" => on_fcu = true,
+                                        "B.Cu" => on_bcu = true,
+                                        _ => {}
+                                    }
+                                }
+                            }
+                        }
+
                         // Net name from (net "NAME") or legacy (net INDEX "NAME")
                         let net_name = item.get_child("net").and_then(|n| {
                             // Try index 1 first (KiCad 7+: (net "NAME"))
@@ -467,6 +504,14 @@ fn parse_footprint(node: &SexpNode) -> Result<Footprint> {
                                 -(fp_y + rot_y),
                             );
 
+                            // Pad's own local rotation (optional 3rd value), composed with the
+                            // footprint's rotation to get the land shape's absolute orientation.
+                            let pad_local_rot_deg = at_node.nth(3)
+                                .and_then(|n| n.as_atom())
+                                .and_then(|s| s.parse::<f64>().ok())
+                                .unwrap_or(0.0);
+                            let absolute_rot_deg = fp_rot_deg + pad_local_rot_deg;
+
                             let drill = item.get_child("drill")
                                 .and_then(|n| n.nth(1))
                                 .and_then(|n| n.as_atom())
@@ -483,6 +528,12 @@ fn parse_footprint(node: &SexpNode) -> Result<Footprint> {
                                     drill,
                                     number: pad_number,
                                     net_name,
+                                    width: pad_w,
+                                    height: pad_h,
+                                    shape: pad_shape,
+                                    rotation_deg: absolute_rot_deg,
+                                    on_fcu,
+                                    on_bcu,
                                 });
                             }
                         }
