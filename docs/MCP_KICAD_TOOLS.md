@@ -53,8 +53,9 @@ They are least useful — and most dangerous — for large routing sessions, net
 | `render_schematic` | Render a `.kicad_sch` schematic as a PNG |
 | `list_nets` | **All nets with their connected pads.** Call this first, before any edit, to discover correct net names. Never guess. |
 | `get_net_for_pad` | Net name, absolute position, and size of one pad by reference + number |
-| `query_pads_in_region` | All pads whose centre falls inside a bounding box — use before routing |
-| `check_trace_clearance` | Collision and clearance check for a proposed segment — call before `add_trace` |
+| `query_pads_in_region` | All pads whose centre falls inside a bounding box — use before routing. Optional `layer` filter is real (matches per-pad copper layers, THT pads match any layer). |
+| `query_traces_in_region` | All copper trace segments whose bounding box overlaps a region — pairs with `query_pads_in_region` for pre-routing reconnaissance. Uses bounding-box overlap (conservative: a shallow diagonal segment can rarely be reported when only its bbox, not the segment itself, clips the region). |
+| `check_trace_clearance` | Collision and clearance check for a proposed segment — call before `add_trace`. Checks the segment against **both** existing pads and existing traces (different-layer and same-net traces are exempted; pass `net` so same-net T-junctions aren't false-flagged). |
 | `verify_connectivity` | BFS through traces and vias to confirm two pads are physically wired |
 | `export_layer_svg` | Export copper layers as SVG + PNG image |
 | `export_netlist` | Full component and net connectivity from a schematic |
@@ -80,7 +81,7 @@ Each edit tool that modifies a `.kicad_pcb` file renders the board afterward. Sc
 | Tool | What it does | Risk |
 |---|---|---|
 | `add_power_symbol` | Adds a power net symbol — embeds `lib_symbols` definition and places instance atomically | Low — but verify the net name with `list_nets` first |
-| `add_trace` | Add a copper segment. Net is a string name, not a number. | **Run `check_trace_clearance` first.** A trace through a pad passes DRC until fill_zones runs |
+| `add_trace` | Add a copper segment. Net is a string name, not a number. Optional `check: true` runs the same collision check as `check_trace_clearance` before writing and refuses on any COLLISION (add `force: true` to write anyway); default is `check: false`, matching prior always-write behavior. | **Pass `check: true`** for routing sessions. A trace through a pad passes DRC until fill_zones runs |
 | `add_wire` | Add a schematic wire | Low — schematic preview shown |
 | `add_label` | Add a net label to a schematic | Low |
 | `add_component` | Place a footprint in the PCB | Medium — verify position and rotation |
@@ -88,8 +89,9 @@ Each edit tool that modifies a `.kicad_pcb` file renders the board afterward. Sc
 | `move_component` | Move a footprint to new coordinates | Medium — check for overlaps |
 | `move_label` | Move a schematic label | Low |
 | `move_symbol` | Move a schematic symbol | Low |
-| `replace_footprint` | Swap a footprint in the PCB | Medium — pad count and numbering must match |
+| `replace_footprint` | Swap a footprint in the PCB. Nets are carried over automatically by matching pad number between old and new footprints; the response reports the carryover count and flags any pad number with no old-side match | Medium — carryover assumes old/new pad numbering share intent, same ambiguity as KiCad's own "Change footprint"; verify with `list_nets` after a swap between dissimilar footprints |
 | `replace_symbol` | Swap a schematic symbol | Medium |
+| `delete_trace` | Remove trace segments by `net`, `layer`, `uuid`, or a region (all combine as AND). Supports `dry_run: true` to preview what would be removed without writing. Refuses to run with no filter given. | **High** — irreversible without git, same tier as `delete_component` |
 | `patch_kicad_file` | Exact string replacement in any KiCad file | **High** — operates on raw text; a wrong match corrupts the file |
 | `write_kicad_file` | Write an entire file back to disk | **High** — overwrites without diff preview |
 | `set_board_outline` | Resize the board boundary | Medium |
@@ -116,11 +118,13 @@ git add -A && git commit -m "checkpoint before AI edits"
 Then follow this order:
 
 1. **`list_nets`** — discover exact net names before touching anything
-2. **`query_pads_in_region`** — inspect the area you intend to route
-3. **`check_trace_clearance`** — verify proposed segment is clear
+2. **`query_pads_in_region`** and **`query_traces_in_region`** — inspect the area you intend to route, both pads and existing copper
+3. **`check_trace_clearance`** (pass the trace's `net`, so same-net T-junctions aren't false-flagged) — verify proposed segment is clear of both pads and existing traces, or equivalently call `add_trace` with `check: true`
 4. **`add_trace`** (or other edit) — make the change
 5. **`verify_connectivity`** — confirm the pads are now wired
 6. **`run_drc`** — full design rules pass with board render
+
+If routing goes wrong, use **`delete_trace`** (filtered by `net`, `layer`, `uuid`, or region, with `dry_run: true` to preview first) to remove the bad segments — don't fall back to an ad-hoc script over the raw file.
 
 Open KiCad to visually confirm any change that you can't fully describe from the tool output alone. The MCP tools can tell you coordinates and net names; only KiCad shows you the routing in context.
 
@@ -128,7 +132,9 @@ Open KiCad to visually confirm any change that you can't fully describe from the
 
 ## Known limitations
 
-**`verify_connectivity` false negatives:** connectivity is checked by matching trace endpoints to pad centres using millimetre coordinates rounded to the nearest micron. If a pad position computed from a rotated footprint differs from the trace endpoint by more than 1 µm due to floating-point arithmetic, the BFS will report DISCONNECTED even when the board is correctly routed. Treat DISCONNECTED as "worth checking in KiCad", not as a confirmed fault.
+**`verify_connectivity` false negatives:** connectivity is checked by matching trace endpoints to pad centres using millimetre coordinates bucketed to a 5 micron grid. If a pad position computed from a rotated footprint differs from the trace endpoint by more than 5 µm — well beyond ordinary floating-point drift, but possible in unusual cases — the BFS will report DISCONNECTED even when the board is correctly routed. Treat DISCONNECTED as "worth checking in KiCad", not as a confirmed fault.
+
+**`run_drc` shorting_items / solder_mask_bridge positions can be misleading after a footprint pad edit:** `run_drc` shells out to `kicad-cli pcb drc` fresh on every call with no caching — the position mismatch is an upstream `kicad-cli`/pcbnew JSON-reporting characteristic, not a kicad2print bug. After repositioning or swapping pads (e.g. via `patch_kicad_file` or `replace_footprint`), a reported violation can name a real pad at a position that pad's current geometry could never produce. If a DRC-reported position looks physically impossible, cross-check with `verify_connectivity` — it inspects the file directly and is the more reliable source in that situation.
 
 **`check_trace_clearance` layer approximation:** the tool reports all pads near a segment regardless of layer. Through-hole pads affect all layers and are always flagged. SMD pads on the opposite layer are also flagged (conservatively). Use the result as a list of pads to inspect, not as a binary pass/fail.
 

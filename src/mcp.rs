@@ -496,6 +496,15 @@ pub struct AddTraceParams {
     /// Net name string (e.g. "GND", "VBUS"). Omit or leave empty for unconnected.
     #[schemars(default)]
     pub net: Option<String>,
+    /// If true, run the same collision check as check_trace_clearance before writing.
+    /// Any COLLISION aborts the write (no file change) and returns the report instead.
+    /// Warnings never block. Default false (preserves prior always-write behavior).
+    #[schemars(default)]
+    pub check: Option<bool>,
+    /// If true, write the trace even if the check reports collisions. Has no effect
+    /// unless check is also true. Default false.
+    #[schemars(default)]
+    pub force: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
@@ -514,6 +523,38 @@ pub struct DeleteGraphicParams {
     /// Also delete footprint blocks matching text_contains in their reference or value
     #[schemars(default)]
     pub include_footprints: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct DeleteTraceParams {
+    /// Absolute path to the .kicad_pcb file
+    pub path: String,
+    /// Delete segments belonging to this net name (exact match)
+    #[schemars(default)]
+    pub net: Option<String>,
+    /// Delete segments on this copper layer (e.g. "F.Cu") — combined with other filters as AND
+    #[schemars(default)]
+    pub layer: Option<String>,
+    /// Delete the single segment with this exact tstamp/uuid (substring match)
+    #[schemars(default)]
+    pub uuid: Option<String>,
+    /// Region left X boundary in mm — all four of x1/y1/x2/y2 must be given together
+    #[schemars(default)]
+    pub x1: Option<f64>,
+    /// Region top Y boundary in mm
+    #[schemars(default)]
+    pub y1: Option<f64>,
+    /// Region right X boundary in mm
+    #[schemars(default)]
+    pub x2: Option<f64>,
+    /// Region bottom Y boundary in mm
+    #[schemars(default)]
+    pub y2: Option<f64>,
+    /// If true, report what WOULD be removed without writing anything. Recommended
+    /// before a net/layer/region filter that could match more than expected —
+    /// pairs with query_traces_in_region for discovery.
+    #[schemars(default)]
+    pub dry_run: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
@@ -611,6 +652,26 @@ pub struct QueryPadsInRegionParams {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct QueryTracesInRegionParams {
+    /// Absolute path to the .kicad_pcb file
+    pub path: String,
+    /// Left X boundary in mm
+    pub x1: f64,
+    /// Top Y boundary in mm
+    pub y1: f64,
+    /// Right X boundary in mm
+    pub x2: f64,
+    /// Bottom Y boundary in mm
+    pub y2: f64,
+    /// Filter to traces on this copper layer (e.g. "F.Cu", "B.Cu") — omit for all layers
+    #[schemars(default)]
+    pub layer: Option<String>,
+    /// Filter to traces on this net — omit for all nets
+    #[schemars(default)]
+    pub net: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct CheckTraceClearanceParams {
     /// Absolute path to the .kicad_pcb file
     pub path: String,
@@ -630,6 +691,14 @@ pub struct CheckTraceClearanceParams {
     /// Minimum required clearance from pad edges in mm (default: 0.1)
     #[schemars(default)]
     pub clearance: Option<f64>,
+    /// Net name the proposed trace belongs to (e.g. "GND"). Segments already on
+    /// this same net are allowed to touch/overlap (T-junctions, continuations)
+    /// and are excluded from trace-vs-trace collision checks. Omit if the trace
+    /// is unrouted/has no net yet — in that case it is still checked against
+    /// other unrouted segments, since two unrouted traces touching is a real
+    /// collision, not a legitimate junction.
+    #[schemars(default)]
+    pub net: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
@@ -1195,6 +1264,68 @@ fn remove_matching_graphics(
     (result, count)
 }
 
+/// Find `(segment ...)` blocks matching the given filters (all provided filters
+/// combine as AND). Returns each match's byte range plus a short human-readable
+/// description (net/layer/endpoints), so a caller can preview matches (dry_run)
+/// without necessarily removing them.
+fn find_matching_traces(
+    content: &str,
+    net: Option<&str>,
+    layer: Option<&str>,
+    uuid: Option<&str>,
+    region: Option<(f64, f64, f64, f64)>,
+) -> Vec<(std::ops::Range<usize>, String)> {
+    let mut matches = Vec::new();
+    for_each_top_level(content, "(segment", |start, end| {
+        let block = &content[start..end];
+        let seg_net = parse_quoted_field(block, "(net \"").unwrap_or_default();
+        let seg_layer = parse_quoted_field(block, "(layer \"");
+
+        let net_match = net.map(|n| seg_net == n).unwrap_or(true);
+        let layer_match = layer.map(|l| seg_layer.as_deref() == Some(l)).unwrap_or(true);
+        let uuid_match = uuid.map(|u| block.contains(u)).unwrap_or(true);
+        let region_match = region.map(|(xmin, ymin, xmax, ymax)| {
+            if let (Some((x1, y1)), Some((x2, y2))) = (parse_xy_field(block, "(start "), parse_xy_field(block, "(end ")) {
+                let (sxmin, sxmax) = (x1.min(x2), x1.max(x2));
+                let (symin, symax) = (y1.min(y2), y1.max(y2));
+                sxmin <= xmax && sxmax >= xmin && symin <= ymax && symax >= ymin
+            } else {
+                false
+            }
+        }).unwrap_or(true);
+
+        if net_match && layer_match && uuid_match && region_match {
+            let (x1, y1) = parse_xy_field(block, "(start ").unwrap_or((0.0, 0.0));
+            let (x2, y2) = parse_xy_field(block, "(end ").unwrap_or((0.0, 0.0));
+            let net_display = if seg_net.is_empty() { "<unrouted>" } else { &seg_net };
+            let desc = format!(
+                "net={net_display} layer={}  ({x1:.3},{y1:.3})→({x2:.3},{y2:.3})",
+                seg_layer.as_deref().unwrap_or("?"),
+            );
+            matches.push((start..end, desc));
+        }
+    });
+    matches
+}
+
+/// Remove the given byte ranges from `content` (descending order to keep earlier
+/// ranges valid), trimming one adjacent newline per range — same splice logic
+/// as `remove_matching_graphics`.
+fn splice_out_ranges(content: &str, mut ranges: Vec<std::ops::Range<usize>>) -> String {
+    ranges.sort_by(|a, b| b.start.cmp(&a.start));
+    let mut result = content.to_string();
+    for range in ranges {
+        let end = if result.as_bytes().get(range.end) == Some(&b'\n') { range.end + 1 } else { range.end };
+        let start = if range.start > 0 && result.as_bytes().get(range.start - 1) == Some(&b'\n') {
+            range.start - 1
+        } else {
+            range.start
+        };
+        result.drain(start..end.min(result.len()));
+    }
+    result
+}
+
 /// Extract absolute pad positions from a footprint block, accounting for footprint rotation.
 /// Returns `(pad_number, global_x, global_y, layer)` for each pad in a footprint block.
 fn extract_pad_positions(block: &str) -> Vec<(String, f64, f64, String)> {
@@ -1267,11 +1398,9 @@ fn remove_dangling_wires(content: &str) -> (String, usize) {
     let pt_k = |x: f64, y: f64| (coord_k(x), coord_k(y));
 
     let mut wires: Vec<Wire> = Vec::new();
-    let needle = "\n  (wire ";
-    let mut pos = 0;
-    while let Some(rel) = content[pos..].find(needle) {
-        let start = pos + rel + 1;
-        let end = pcb_edit::block_end(content, start);
+    // for_each_top_level matches both single-line and multi-line `(wire ...)` forms
+    // and both 2-space/tab indentation (see find_symbol_blocks for the same fix).
+    for_each_top_level(content, "(wire", |start, end| {
         let block = &content[start..end];
 
         // Parse (pts (xy X1 Y1) (xy X2 Y2))
@@ -1285,31 +1414,16 @@ fn remove_dangling_wires(content: &str) -> (String, usize) {
         if let (Some(p1), Some(p2)) = (pts.next().and_then(parse_pt), pts.next().and_then(parse_pt)) {
             wires.push(Wire { range: start..end, x1: p1.0, y1: p1.1, x2: p2.0, y2: p2.1 });
         }
-        pos = end;
-    }
+    });
 
     // Build set of all "anchored" points: pin positions, label positions, junctions, no_connects
     let mut anchors: std::collections::HashSet<(i64, i64)> = std::collections::HashSet::new();
 
     // Pin positions from all symbol instances
-    let sym_needle = "\n  (symbol (lib_id ";
-    let mut pos = 0;
-    while let Some(rel) = content[pos..].find(sym_needle) {
-        let start = pos + rel + 1;
-        let end = pcb_edit::block_end(content, start);
-        let block = &content[start..end];
-        // Extract reference and compute pin positions
-        let ref_marker = "(property \"Reference\" \"";
-        if let Some(rp) = block.find(ref_marker) {
-            let after = &block[rp + ref_marker.len()..];
-            if let Some(re) = after.find('"') {
-                let reference = &after[..re];
-                for (_, _, px, py) in compute_pin_positions(content, reference) {
-                    anchors.insert(pt_k(px, py));
-                }
-            }
+    for reference in find_symbol_blocks(content).keys() {
+        for (_, _, px, py) in compute_pin_positions(content, reference) {
+            anchors.insert(pt_k(px, py));
         }
-        pos = end;
     }
 
     // Labels: (label "X" (at X Y ...) and (global_label "X" ... (at X Y ...)
@@ -1367,29 +1481,18 @@ fn remove_dangling_wires(content: &str) -> (String, usize) {
 /// Find a symbol instance block in a schematic by reference designator.
 /// Returns the byte range of the block (not including the leading newline).
 fn find_sch_symbol_by_ref(content: &str, reference: &str) -> Option<std::ops::Range<usize>> {
-    let needle = "\n  (symbol (lib_id ";
-    let mut pos = 0;
-    while let Some(rel) = content[pos..].find(needle) {
-        let start = pos + rel + 1;
-        let end = pcb_edit::block_end(content, start);
-        let block = &content[start..end];
-        // Check for (property "Reference" "REF" ...) inside
-        let ref_marker = format!("\"Reference\" \"{}\"", reference);
-        if block.contains(&ref_marker) {
-            return Some(start..end);
-        }
-        pos = end;
-    }
-    None
+    find_symbol_blocks(content).remove(reference)
 }
 
 /// Replace the (at X Y ROT) in a schematic symbol instance block.
 fn sch_replace_at(block: &str, new_x: f64, new_y: f64, rotation: Option<f64>) -> String {
-    // The at is on the opening line: (symbol (lib_id "...") (at X Y ROT) ...
-    let at_needle = ") (at ";
-    if let Some(at_pos) = block.find(at_needle) {
-        let at_start = at_pos + at_needle.len() - 1; // points at '('
-        let at_content_start = at_pos + at_needle.len();
+    // The instance's own placement is always the first top-level "(at " in the
+    // block — it comes right after (lib_id ...), before any property's own nested
+    // (at ...). Works for both the single-line and multi-line symbol forms (the
+    // instance's `(at ...)` doesn't have to share a line with `(lib_id ...)`).
+    let at_needle = "(at ";
+    if let Some(at_start) = block.find(at_needle) {
+        let at_content_start = at_start + at_needle.len();
         // Find the closing ) of the (at ...) node
         let mut depth = 1i32;
         let mut end_rel = 0;
@@ -1442,12 +1545,12 @@ fn compute_pin_positions_inner(content: &str, reference: &str) -> Option<Vec<(St
         after[..after.find('"')?].to_string()
     };
 
-    // Extract placement (at X Y ROT)
+    // Extract placement (at X Y ROT) — the instance's own placement, always the
+    // first top-level "(at " in the block (see sch_replace_at); not necessarily on
+    // the same physical line as `(symbol`/`(lib_id ...)` in the multi-line form.
     let (inst_x, inst_y, inst_rot): (f64, f64, f64) = {
-        let first_line_end = instance_block.find('\n').unwrap_or(instance_block.len());
-        let first_line = &instance_block[..first_line_end];
-        if let Some(at_pos) = first_line.find("(at ") {
-            let after = &first_line[at_pos + 4..];
+        if let Some(at_pos) = instance_block.find("(at ") {
+            let after = &instance_block[at_pos + 4..];
             let parts: Vec<&str> = after.split_whitespace().collect();
             let x: f64 = parts.first().and_then(|s| s.parse().ok()).unwrap_or(0.0);
             let y: f64 = parts.get(1).and_then(|s| s.trim_end_matches(')').parse().ok()).unwrap_or(0.0);
@@ -1527,8 +1630,15 @@ fn extract_quoted_after_kw(block: &str, keyword: &str) -> String {
     String::new()
 }
 
+/// Rounds a coordinate to a 5-micron bucket for exact-hash spatial matching
+/// (verify_connectivity's BFS, cleanup_traces' pad-proximity check). 5 microns
+/// is a 20x safety margin below any realistic KiCad clearance (>=0.1mm/100um),
+/// so genuinely distinct copper can never collapse into the same bucket, while
+/// comfortably absorbing the sub-micron float drift between independently
+/// computed rotated-footprint pad centers and trace endpoints that used to
+/// cause false DISCONNECTED reports at the previous 0.1-micron precision.
 fn coord_key(v: f64) -> i64 {
-    (v * 10_000.0).round() as i64
+    (v * 200.0).round() as i64
 }
 
 fn point_key(x: f64, y: f64) -> (i64, i64) {
@@ -1652,8 +1762,12 @@ fn remove_orphaned_segments(
         .collect();
 
     fn is_near_pad(pk: (i64, i64), pad_keys: &HashSet<(i64, i64)>) -> bool {
-        // Tolerance: 0.01mm = 100 units (since 1 unit = 0.0001mm)
-        let tol = 100i64;
+        // Tolerance: 0.01mm = 2 units (coord_key is now 200 units/mm, not 10,000 —
+        // this MUST move in lockstep with coord_key's scale factor, or this
+        // "100 units" would silently become 0.5mm instead of the intended
+        // 0.01mm, a 50x loosening that could make cleanup_traces treat
+        // genuinely separate pads as touching).
+        let tol = 2i64;
         for &(px, py) in pad_keys {
             if (pk.0 - px).abs() <= tol && (pk.1 - py).abs() <= tol {
                 return true;
@@ -2452,6 +2566,11 @@ keep_pos = {keep_pos}
 pos = old.GetPosition() if keep_pos else pcbnew.VECTOR2I(0, 0)
 rot = old.GetOrientation() if keep_pos else pcbnew.EDA_ANGLE(0, pcbnew.DEGREES_T)
 val = old.GetValue()
+# Capture old pad nets by pad number before the old footprint is removed, so the
+# new footprint (freshly loaded from the library, which carries no net data at
+# all) can have matching-numbered pads reconnected automatically — mirrors what
+# KiCad's own "Change footprint" GUI action does.
+old_nets = {{p.GetNumber(): p.GetNetname() for p in old.Pads() if p.GetNetname()}}
 new_fp = pcbnew.FootprintLoad({lib:?}, {fp:?})
 if new_fp is None:
     print(json.dumps({{"error": "footprint not found in library"}})); sys.exit(1)
@@ -2461,12 +2580,25 @@ new_fp.SetPosition(pos)
 new_fp.SetOrientation(rot)
 b.Remove(old)
 b.Add(new_fp)
+carried = []
+uncarried_old = []
+for pad in new_fp.Pads():
+    net_name = old_nets.get(pad.GetNumber())
+    if net_name:
+        net_info = b.FindNet(net_name)
+        if net_info is not None:
+            pad.SetNet(net_info)
+            carried.append(pad.GetNumber())
+for num, net_name in old_nets.items():
+    if num not in carried:
+        uncarried_old.append({{"number": num, "net": net_name}})
 b.Save({pcb:?})
 pads = [{{"number": p.GetNumber(),
           "x": round(pcbnew.ToMM(p.GetPosition().x), 6),
           "y": round(pcbnew.ToMM(p.GetPosition().y), 6),
-          "layer": p.GetLayerName()}} for p in new_fp.Pads()]
-print(json.dumps({{"ok": True, "pads": pads}}))
+          "layer": p.GetLayerName(),
+          "net": p.GetNetname()}} for p in new_fp.Pads()]
+print(json.dumps({{"ok": True, "pads": pads, "old_pad_count": len(old_nets), "carried_count": len(carried), "uncarried_old": uncarried_old}}))
 "#,
             pcb = p.path,
             reference = p.reference,
@@ -2498,7 +2630,7 @@ print(json.dumps({{"ok": True, "pads": pads}}))
             ))]));
         }
 
-        // Format pad position table for the response
+        // Format pad position + net table for the response
         let pad_table = if let Some(pads) = py_json.get("pads").and_then(|p| p.as_array()) {
             let mut lines = vec!["Pad positions:".to_string()];
             for pad in pads {
@@ -2506,16 +2638,46 @@ print(json.dumps({{"ok": True, "pads": pads}}))
                 let px  = pad["x"].as_f64().unwrap_or(0.0);
                 let py  = pad["y"].as_f64().unwrap_or(0.0);
                 let lay = pad["layer"].as_str().unwrap_or("?");
-                lines.push(format!("  pad {num}: ({px:.4}, {py:.4}) {lay}"));
+                let net = pad["net"].as_str().unwrap_or("");
+                if net.is_empty() {
+                    lines.push(format!("  pad {num}: ({px:.4}, {py:.4}) {lay}  [no net]"));
+                } else {
+                    lines.push(format!("  pad {num}: ({px:.4}, {py:.4}) {lay}  net={net}"));
+                }
             }
             lines.join("\n")
         } else {
             String::new()
         };
 
+        // Net carryover summary — the old footprint's pads are matched to the new
+        // footprint's pads by pad NUMBER; anything left unmatched needs manual
+        // net reassignment (e.g. old/new footprints have different pad counts).
+        let old_pad_count = py_json.get("old_pad_count").and_then(|v| v.as_u64()).unwrap_or(0);
+        let carried_count = py_json.get("carried_count").and_then(|v| v.as_u64()).unwrap_or(0);
+        let net_summary = if old_pad_count == 0 {
+            "No netted pads on the old footprint — nothing to carry over.".to_string()
+        } else {
+            let mut s = format!("Carried over nets for {carried_count}/{old_pad_count} old netted pad(s).");
+            if let Some(uncarried) = py_json.get("uncarried_old").and_then(|v| v.as_array()) {
+                if !uncarried.is_empty() {
+                    let list: Vec<String> = uncarried.iter().map(|u| {
+                        let num = u["number"].as_str().unwrap_or("?");
+                        let net = u["net"].as_str().unwrap_or("?");
+                        format!("pad {num} (was {net})")
+                    }).collect();
+                    s.push_str(&format!(
+                        "\n⚠️  No matching pad number on the new footprint for: {} — reassign manually.",
+                        list.join(", ")
+                    ));
+                }
+            }
+            s
+        };
+
         let summary = format!(
-            "Replaced {} footprint: {} → {}:{}\nPosition kept: ({}, {}, rot={}°)\n{}",
-            p.reference, old_fp_name, p.library, p.footprint, x, y, rot, pad_table
+            "Replaced {} footprint: {} → {}:{}\nPosition kept: ({}, {}, rot={}°)\n{}\n\n{}",
+            p.reference, old_fp_name, p.library, p.footprint, x, y, rot, pad_table, net_summary
         );
 
         let mut contents = vec![Content::text(summary)];
@@ -2825,15 +2987,23 @@ print(json.dumps({{"ok": True, "pads": pads}}))
             ))]));
         }
 
-        // Build diff context: find first occurrence position in new content and show ±3 lines around it
+        // Build diff context: use the ACTUAL match byte-offset (known from the
+        // `count`/uniqueness check above via old_string) rather than re-searching
+        // the whole file for new_string's first line — that re-search could latch
+        // onto an earlier, unrelated occurrence of similar/generic boilerplate
+        // elsewhere in a large file, showing the wrong location entirely even
+        // though the edit itself (via replacen/replace, above) landed correctly.
+        // The region before the first match is byte-identical between `content`
+        // and `new_content` (nothing before it moves), so counting newlines in
+        // the ORIGINAL content up to that offset gives the correct line number
+        // in `new_content` too. For replace_all, this anchors on the first of
+        // potentially several replacements — sufficient to restore trust in the
+        // preview without listing every location.
         let replacements = if replace_all { count } else { 1 };
-        let needle = &p.new_string;
         let diff_ctx: String = {
+            let match_offset = content.find(&p.old_string).unwrap_or(0);
+            let hit_line = content[..match_offset].matches('\n').count();
             let new_lines: Vec<&str> = new_content.lines().collect();
-            // Find lines that contain (part of) the new string's first line
-            let first_new_line = needle.lines().next().unwrap_or("");
-            let hit_line = new_lines.iter().position(|l| l.contains(first_new_line))
-                .unwrap_or(0);
             let win_start = hit_line.saturating_sub(3);
             let win_end   = (hit_line + 4).min(new_lines.len());
             new_lines[win_start..win_end].iter().enumerate()
@@ -3780,8 +3950,11 @@ print(json.dumps({{"changed": changed}}))
         let new_footprint = p.new_footprint.as_deref().unwrap_or(&old_footprint);
 
         // --- Find lib_symbols section ---
-        let lib_sym_start = match content.find("\n  (lib_symbols\n") {
-            Some(s) => s + 1, // point at '('
+        // Plain substring search (not needing 2-space/tab indent matching): there's
+        // only ever one top-level `(lib_symbols` section per schematic, so this is
+        // unambiguous regardless of file indentation style.
+        let lib_sym_start = match content.find("(lib_symbols") {
+            Some(s) => s,
             None => return Ok(CallToolResult::error(vec![Content::text(
                 "No lib_symbols section found in schematic.".to_string()
             )])),
@@ -4133,7 +4306,7 @@ print(json.dumps({{"changed": changed}}))
     }
 
     /// Add a copper trace segment to a PCB file.
-    #[tool(description = "Add a copper trace segment to a .kicad_pcb file between two points on a given layer. Returns a render.")]
+    #[tool(description = "Add a copper trace segment to a .kicad_pcb file between two points on a given layer. Pass check=true to run the same collision check as check_trace_clearance before writing (recommended for routing sessions) — any COLLISION aborts the write unless force=true is also set. Returns a render.")]
     async fn add_trace(
         &self,
         params: Parameters<AddTraceParams>,
@@ -4149,6 +4322,26 @@ print(json.dumps({{"changed": changed}}))
 
         let width = p.width.unwrap_or(0.25);
         let net = p.net.as_deref().unwrap_or("").to_string();
+
+        if p.check.unwrap_or(false) {
+            let (collisions, warnings) = compute_clearance(
+                &content, p.x1, p.y1, p.x2, p.y2, &p.layer, width, 0.1, &net,
+            );
+            if !collisions.is_empty() && !p.force.unwrap_or(false) {
+                let mut output = format!(
+                    "Refused to add trace: {} COLLISION(S) found. Pass force=true to write anyway.\n\n",
+                    collisions.len()
+                );
+                output.push_str(&format!("COLLISIONS ({}):\n", collisions.len()));
+                for c in &collisions { output.push_str(c); output.push('\n'); }
+                if !warnings.is_empty() {
+                    output.push_str(&format!("\nCLEARANCE WARNINGS ({}):\n", warnings.len()));
+                    for w in &warnings { output.push_str(w); output.push('\n'); }
+                }
+                return Ok(CallToolResult::error(vec![Content::text(output)]));
+            }
+        }
+
         let ts = pcb_edit::new_tstamp();
 
         let segment = format!(
@@ -4205,6 +4398,68 @@ print(json.dumps({{"changed": changed}}))
         }
 
         let mut contents = vec![Content::text(format!("Removed {removed} graphic element(s)."))];
+        contents.extend(self.render_board(&p.path).await);
+        Ok(CallToolResult::success(contents))
+    }
+
+    /// Delete copper trace segments from a PCB, filtered by net, layer, uuid, and/or region.
+    /// Replaces the ad-hoc script previously needed to undo a bad routing pass.
+    #[tool(description = "Delete copper trace segments from a .kicad_pcb, filtered by net name, layer, uuid, and/or a bounding region (all provided filters combine as AND). Use dry_run=true first to preview matches before writing — especially for a net/layer/region filter that could match more than expected. Use this instead of a throwaway script when traces were routed incorrectly. Returns count removed (or previewed) and an updated render.")]
+    async fn delete_trace(
+        &self,
+        params: Parameters<DeleteTraceParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let p = params.0;
+        let path = PathBuf::from(&p.path);
+        let _guard = self.lock_file(&path).await;
+
+        let content = match fs::read_to_string(&path).await {
+            Ok(c) => c,
+            Err(e) => return Ok(CallToolResult::error(vec![Content::text(format!("Failed to read: {e}"))])),
+        };
+
+        let has_region = p.x1.is_some() && p.y1.is_some() && p.x2.is_some() && p.y2.is_some();
+        if p.net.is_none() && p.layer.is_none() && p.uuid.is_none() && !has_region {
+            return Ok(CallToolResult::error(vec![Content::text(
+                "Provide at least one filter: net, layer, uuid, or all four of x1/y1/x2/y2".to_string()
+            )]));
+        }
+
+        let region = if has_region {
+            let (x1, y1, x2, y2) = (p.x1.unwrap(), p.y1.unwrap(), p.x2.unwrap(), p.y2.unwrap());
+            Some((x1.min(x2), y1.min(y2), x1.max(x2), y1.max(y2)))
+        } else {
+            None
+        };
+
+        let matches = find_matching_traces(&content, p.net.as_deref(), p.layer.as_deref(), p.uuid.as_deref(), region);
+
+        if matches.is_empty() {
+            return Ok(CallToolResult::success(vec![Content::text(
+                "No matching traces found; nothing removed.".to_string()
+            )]));
+        }
+
+        if p.dry_run.unwrap_or(false) {
+            let listing = matches.iter()
+                .map(|(_, desc)| format!("  {desc}"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            return Ok(CallToolResult::success(vec![Content::text(format!(
+                "DRY RUN — would remove {} trace segment(s), nothing written:\n{}",
+                matches.len(), listing
+            ))]));
+        }
+
+        let removed = matches.len();
+        let ranges: Vec<std::ops::Range<usize>> = matches.into_iter().map(|(r, _)| r).collect();
+        let new_content = splice_out_ranges(&content, ranges);
+
+        if let Err(e) = fs::write(&path, &new_content).await {
+            return Ok(CallToolResult::error(vec![Content::text(format!("Failed to write: {e}"))]));
+        }
+
+        let mut contents = vec![Content::text(format!("Removed {removed} trace segment(s)."))];
         contents.extend(self.render_board(&p.path).await);
         Ok(CallToolResult::success(contents))
     }
@@ -4819,11 +5074,8 @@ print('ok')
         let matching: Vec<&PcbPad> = all_pads.iter()
             .filter(|pad| pad.x >= x_min && pad.x <= x_max && pad.y >= y_min && pad.y <= y_max)
             .filter(|pad| {
-                p.layer.as_ref().map_or(true, |l| pad.is_thru_hole || {
-                    // SMD pads: check their specific layer. We derive it from pad type heuristic.
-                    // Since we don't store layer directly, THT pads always match.
-                    // This is a best-effort filter; full accuracy needs layer stored per pad.
-                    pad.is_thru_hole || l.is_empty()
+                p.layer.as_ref().map_or(true, |l| {
+                    pad.layers.iter().any(|pl| pl == l || pl == "*.Cu")
                 })
             })
             .collect();
@@ -4850,8 +5102,54 @@ print('ok')
         Ok(CallToolResult::success(vec![Content::text(output)]))
     }
 
-    /// Check if a proposed trace segment collides with or violates clearance from any pad.
-    #[tool(description = "Before adding a trace, check if it would collide with or come too close to any pad in a .kicad_pcb. Returns collisions (trace overlaps pad) and warnings (trace closer than clearance). Run this before add_trace to catch routing errors without a DRC cycle.")]
+    /// Query all trace segments whose bounding box overlaps a rectangular region.
+    #[tool(description = "Return all copper trace segments whose bounding box overlaps a rectangular region of a .kicad_pcb. Use before routing to discover what traces already occupy a proposed path — pairs with query_pads_in_region. Returns net, layer, endpoints, and width. Uses bounding-box overlap, which is conservative: a segment may occasionally be reported when only its bounding box (not the segment itself) clips the region.")]
+    async fn query_traces_in_region(
+        &self,
+        params: Parameters<QueryTracesInRegionParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let p = params.0;
+        let content = match fs::read_to_string(&p.path).await {
+            Ok(c) => c,
+            Err(e) => return Ok(CallToolResult::error(vec![Content::text(format!("Failed to read: {e}"))])),
+        };
+
+        let all_segments = parse_pcb_segments(&content);
+        let x_min = p.x1.min(p.x2);
+        let x_max = p.x1.max(p.x2);
+        let y_min = p.y1.min(p.y2);
+        let y_max = p.y1.max(p.y2);
+
+        let matching: Vec<&PcbSegment> = all_segments.iter()
+            .filter(|s| segment_bbox_overlaps_region(s, x_min, y_min, x_max, y_max))
+            .filter(|s| p.layer.as_deref().map_or(true, |l| s.layer == l))
+            .filter(|s| p.net.as_deref().map_or(true, |n| s.net == n))
+            .collect();
+
+        if matching.is_empty() {
+            return Ok(CallToolResult::success(vec![Content::text(format!(
+                "No traces in region ({}, {}) → ({}, {})", p.x1, p.y1, p.x2, p.y2
+            ))]));
+        }
+
+        let mut output = format!("Traces in region ({}, {}) → ({}, {}):\n\n", p.x1, p.y1, p.x2, p.y2);
+        output.push_str(&format!("{:<30} {:<6} {:>8} {:>8}    {:>8} {:>8}  {:>6}\n",
+            "Net", "Layer", "X1", "Y1", "X2", "Y2", "W(mm)"));
+        output.push_str(&"-".repeat(90));
+        output.push('\n');
+        for seg in &matching {
+            let net = if seg.net.is_empty() { "<unrouted>" } else { &seg.net };
+            output.push_str(&format!("{:<30} {:<6} {:>8.3} {:>8.3}    {:>8.3} {:>8.3}  {:>6.3}\n",
+                net, seg.layer, seg.x1, seg.y1, seg.x2, seg.y2, seg.width));
+        }
+        output.push_str(&format!("\nTotal: {} traces\n", matching.len()));
+
+        Ok(CallToolResult::success(vec![Content::text(output)]))
+    }
+
+    /// Check if a proposed trace segment collides with or violates clearance from any
+    /// pad OR any existing same-layer trace on a different net.
+    #[tool(description = "Before adding a trace, check if it would collide with or come too close to any pad OR any existing same-layer trace of a different net in a .kicad_pcb. Pass net to exempt same-net T-junctions. Returns collisions (physical overlap) and warnings (closer than clearance). Run this before add_trace to catch routing errors without a DRC cycle.")]
     async fn check_trace_clearance(
         &self,
         params: Parameters<CheckTraceClearanceParams>,
@@ -4864,31 +5162,11 @@ print('ok')
 
         let width = p.width.unwrap_or(0.25);
         let clearance = p.clearance.unwrap_or(0.1);
-        let half_trace = width / 2.0;
-        let all_pads = parse_pcb_pads(&content);
+        let net = p.net.as_deref().unwrap_or("");
 
-        let mut collisions: Vec<String> = Vec::new();
-        let mut warnings: Vec<String> = Vec::new();
-
-        for pad in &all_pads {
-            // THT pads affect all layers; SMD pads we check regardless (conservative)
-            let dist = point_to_segment_dist(pad.x, pad.y, p.x1, p.y1, p.x2, p.y2);
-            let half_pad = (pad.width.max(pad.height)) / 2.0;
-            let collision_dist = half_trace + half_pad;
-            let warn_dist = collision_dist + clearance;
-
-            if dist < collision_dist {
-                collisions.push(format!(
-                    "  COLLISION  {:<10} pad {:>4}  net={:<30}  pos=({:.3},{:.3})  size={:.3}×{:.3}  dist={:.3}mm",
-                    pad.reference, pad.pad_num, pad.net, pad.x, pad.y, pad.width, pad.height, dist
-                ));
-            } else if dist < warn_dist {
-                warnings.push(format!(
-                    "  CLOSE      {:<10} pad {:>4}  net={:<30}  pos=({:.3},{:.3})  size={:.3}×{:.3}  dist={:.3}mm  (min={:.3}mm)",
-                    pad.reference, pad.pad_num, pad.net, pad.x, pad.y, pad.width, pad.height, dist, warn_dist
-                ));
-            }
-        }
+        let (collisions, warnings) = compute_clearance(
+            &content, p.x1, p.y1, p.x2, p.y2, &p.layer, width, clearance, net,
+        );
 
         let status = if collisions.is_empty() && warnings.is_empty() {
             "CLEAR".to_string()
@@ -4904,10 +5182,10 @@ print('ok')
         );
 
         if collisions.is_empty() && warnings.is_empty() {
-            output.push_str("No pads within collision or clearance distance. Safe to route.\n");
+            output.push_str("No pads or existing traces within collision or clearance distance. Safe to route.\n");
         }
         if !collisions.is_empty() {
-            output.push_str(&format!("COLLISIONS ({}) — trace physically overlaps these pads:\n", collisions.len()));
+            output.push_str(&format!("COLLISIONS ({}) — trace physically overlaps these pads/existing traces:\n", collisions.len()));
             for c in &collisions { output.push_str(c); output.push('\n'); }
         }
         if !warnings.is_empty() {
@@ -5265,18 +5543,18 @@ async fn collect_kicad_files(
 /// Only matches top-level symbol blocks (2-space indent): `\n  (symbol (lib_id "`.
 fn find_symbol_blocks(content: &str) -> std::collections::HashMap<String, std::ops::Range<usize>> {
     let mut result = std::collections::HashMap::new();
-    let needle = "\n  (symbol (lib_id \"";
-    let mut search_from = 0;
-
-    while let Some(rel) = content[search_from..].find(needle) {
-        let i = search_from + rel + 1; // skip '\n', point at '('
-        let end = pcb_edit::block_end(content, i);
-        let block = &content[i..end];
+    // Matches both the compact single-line form `(symbol (lib_id "...")` and the
+    // modern multi-line form where `(symbol` and `(lib_id ...)` sit on separate
+    // lines, and both 2-space and tab indentation — for_each_top_level only checks
+    // the leading whitespace on the matched line, not what follows the keyword.
+    // This also correctly skips nested `(symbol "Library:Name" ...)` library
+    // definitions inside `(lib_symbols ...)`, which sit two indent levels deep.
+    for_each_top_level(content, "(symbol", |start, end| {
+        let block = &content[start..end];
         if let Some(reference) = sch_property_value(block, "Reference") {
-            result.insert(reference, i..end);
+            result.insert(reference, start..end);
         }
-        search_from = end;
-    }
+    });
     result
 }
 
@@ -5502,6 +5780,7 @@ struct PcbPad {
     width: f64,
     height: f64,
     is_thru_hole: bool,
+    layers: Vec<String>,
 }
 
 /// Extract the pad number from a pad block: `(pad "NUM" ...`.
@@ -5575,6 +5854,7 @@ fn parse_pcb_pads(content: &str) -> Vec<PcbPad> {
                 let (pw, ph) = extract_pad_size(pad_block).unwrap_or((0.0, 0.0));
                 let net = extract_pcb_pad_net(pad_block).unwrap_or_default();
                 let is_thru_hole = pad_block.contains("thru_hole") || pad_block.contains("\"*.Cu\"");
+                let layers = parse_layers_field(pad_block);
 
                 // Apply footprint rotation to pad local offset
                 let abs_x = fp_x + dx * cos_r - dy * sin_r;
@@ -5589,6 +5869,7 @@ fn parse_pcb_pads(content: &str) -> Vec<PcbPad> {
                     width: pw,
                     height: ph,
                     is_thru_hole,
+                    layers,
                 });
             }
             search = pad_end;
@@ -5612,6 +5893,113 @@ fn point_to_segment_dist(px: f64, py: f64, ax: f64, ay: f64, bx: f64, by: f64) -
     ((px - cx).powi(2) + (py - cy).powi(2)).sqrt()
 }
 
+/// Minimum distance between segment A1→A2 and segment B1→B2. Returns 0.0 if
+/// the two segments properly intersect (or touch); otherwise the minimum of
+/// the four endpoint-to-opposite-segment distances.
+fn segment_to_segment_dist(
+    ax1: f64, ay1: f64, ax2: f64, ay2: f64,
+    bx1: f64, by1: f64, bx2: f64, by2: f64,
+) -> f64 {
+    // Standard orientation test: sign of the cross product (p2-p1) x (p3-p1).
+    fn orientation(px: f64, py: f64, qx: f64, qy: f64, rx: f64, ry: f64) -> f64 {
+        (qx - px) * (ry - py) - (qy - py) * (rx - px)
+    }
+    fn on_segment(px: f64, py: f64, qx: f64, qy: f64, rx: f64, ry: f64) -> bool {
+        // Assumes p, q, r are collinear; checks r lies within the p..q bounding box.
+        rx <= px.max(qx) + 1e-9 && rx >= px.min(qx) - 1e-9
+            && ry <= py.max(qy) + 1e-9 && ry >= py.min(qy) - 1e-9
+    }
+
+    let o1 = orientation(ax1, ay1, ax2, ay2, bx1, by1);
+    let o2 = orientation(ax1, ay1, ax2, ay2, bx2, by2);
+    let o3 = orientation(bx1, by1, bx2, by2, ax1, ay1);
+    let o4 = orientation(bx1, by1, bx2, by2, ax2, ay2);
+
+    let general_case = (o1 > 0.0) != (o2 > 0.0) && (o3 > 0.0) != (o4 > 0.0);
+    let collinear_overlap = (o1.abs() < 1e-9 && on_segment(ax1, ay1, ax2, ay2, bx1, by1))
+        || (o2.abs() < 1e-9 && on_segment(ax1, ay1, ax2, ay2, bx2, by2))
+        || (o3.abs() < 1e-9 && on_segment(bx1, by1, bx2, by2, ax1, ay1))
+        || (o4.abs() < 1e-9 && on_segment(bx1, by1, bx2, by2, ax2, ay2));
+
+    if general_case || collinear_overlap {
+        return 0.0;
+    }
+
+    point_to_segment_dist(ax1, ay1, bx1, by1, bx2, by2)
+        .min(point_to_segment_dist(ax2, ay2, bx1, by1, bx2, by2))
+        .min(point_to_segment_dist(bx1, by1, ax1, ay1, ax2, ay2))
+        .min(point_to_segment_dist(bx2, by2, ax1, ay1, ax2, ay2))
+}
+
+/// Shared clearance-check core used by both the `check_trace_clearance` tool
+/// and `add_trace`'s optional pre-write check. Checks a proposed segment
+/// against every pad (any layer, conservative) and every existing same-layer
+/// trace on a DIFFERENT net (same-net copper is allowed to touch/overlap at
+/// T-junctions and vias). Returns (collisions, warnings) as formatted lines.
+fn compute_clearance(
+    content: &str,
+    x1: f64, y1: f64, x2: f64, y2: f64,
+    layer: &str, width: f64, clearance: f64, net: &str,
+) -> (Vec<String>, Vec<String>) {
+    let half_trace = width / 2.0;
+    let mut collisions: Vec<String> = Vec::new();
+    let mut warnings: Vec<String> = Vec::new();
+
+    let all_pads = parse_pcb_pads(content);
+    for pad in &all_pads {
+        // THT pads affect all layers; SMD pads we check regardless (conservative)
+        let dist = point_to_segment_dist(pad.x, pad.y, x1, y1, x2, y2);
+        let half_pad = (pad.width.max(pad.height)) / 2.0;
+        let collision_dist = half_trace + half_pad;
+        let warn_dist = collision_dist + clearance;
+
+        if dist < collision_dist {
+            collisions.push(format!(
+                "  COLLISION  {:<10} pad {:>4}  net={:<30}  pos=({:.3},{:.3})  size={:.3}×{:.3}  dist={:.3}mm",
+                pad.reference, pad.pad_num, pad.net, pad.x, pad.y, pad.width, pad.height, dist
+            ));
+        } else if dist < warn_dist {
+            warnings.push(format!(
+                "  CLOSE      {:<10} pad {:>4}  net={:<30}  pos=({:.3},{:.3})  size={:.3}×{:.3}  dist={:.3}mm  (min={:.3}mm)",
+                pad.reference, pad.pad_num, pad.net, pad.x, pad.y, pad.width, pad.height, dist, warn_dist
+            ));
+        }
+    }
+
+    // Trace-vs-trace: the actual gap this check used to miss entirely — a
+    // proposed segment could silently cross an existing same-layer, different-net
+    // trace with no warning at all until a much later run_drc call.
+    let all_segments = parse_pcb_segments(content);
+    for seg in &all_segments {
+        if seg.layer != layer { continue; }
+        // Same-net copper touching is a legitimate T-junction/continuation, not a
+        // collision — but an EMPTY proposed net is never treated as a wildcard
+        // match against other empty/unrouted segments, since two unrouted traces
+        // touching is exactly the failure mode this check exists to catch.
+        if !net.is_empty() && seg.net == net { continue; }
+
+        let dist = segment_to_segment_dist(x1, y1, x2, y2, seg.x1, seg.y1, seg.x2, seg.y2);
+        let half_other = seg.width / 2.0;
+        let collision_dist = half_trace + half_other;
+        let warn_dist = collision_dist + clearance;
+        let seg_net = if seg.net.is_empty() { "<unrouted>" } else { &seg.net };
+
+        if dist < collision_dist {
+            collisions.push(format!(
+                "  COLLISION  trace      net={:<30}  layer={:<6}  ({:.3},{:.3})→({:.3},{:.3})  width={:.3}mm  dist={:.3}mm",
+                seg_net, seg.layer, seg.x1, seg.y1, seg.x2, seg.y2, seg.width, dist
+            ));
+        } else if dist < warn_dist {
+            warnings.push(format!(
+                "  CLOSE      trace      net={:<30}  layer={:<6}  ({:.3},{:.3})→({:.3},{:.3})  width={:.3}mm  dist={:.3}mm  (min={:.3}mm)",
+                seg_net, seg.layer, seg.x1, seg.y1, seg.x2, seg.y2, seg.width, dist, warn_dist
+            ));
+        }
+    }
+
+    (collisions, warnings)
+}
+
 /// One routed segment parsed from a PCB file.
 struct PcbSegment {
     x1: f64,
@@ -5619,29 +6007,49 @@ struct PcbSegment {
     x2: f64,
     y2: f64,
     layer: String,
+    net: String,
+    width: f64,
 }
 
 /// Parse all `(segment ...)` entries from a PCB file.
 fn parse_pcb_segments(content: &str) -> Vec<PcbSegment> {
-    use pcb_edit::block_end;
     let mut result = Vec::new();
-    let mut search = 0;
-    while let Some(rel) = content[search..].find("\n\t(segment") {
-        let seg_start = search + rel + 1;
-        let seg_end = block_end(content, seg_start);
+    // for_each_top_level handles both 2-space (KiCad 6/7) and tab (KiCad 9/10)
+    // indentation — the previous hardcoded "\n\t(segment" search only matched
+    // tab-indented files, silently finding zero segments in 2-space files.
+    for_each_top_level(content, "(segment", |seg_start, seg_end| {
         let block = &content[seg_start..seg_end];
 
         // Parse (start X Y) and (end X Y)
         let start = parse_xy_field(block, "(start ");
         let end   = parse_xy_field(block, "(end ");
         let layer = parse_quoted_field(block, "(layer \"");
+        let net = parse_quoted_field(block, "(net \"").unwrap_or_default();
+        let width = parse_number_field(block, "(width ").unwrap_or(0.25);
 
         if let (Some((x1, y1)), Some((x2, y2)), Some(layer)) = (start, end, layer) {
-            result.push(PcbSegment { x1, y1, x2, y2, layer });
+            result.push(PcbSegment { x1, y1, x2, y2, layer, net, width });
         }
-        search = seg_end;
-    }
+    });
     result
+}
+
+/// Parse a single numeric `(KEYWORD N)` field, e.g. `(width 0.4)`.
+fn parse_number_field(block: &str, keyword: &str) -> Option<f64> {
+    let pos = block.find(keyword)?;
+    let after = &block[pos + keyword.len()..];
+    let close = after.find(')')?;
+    after[..close].trim().parse().ok()
+}
+
+/// AABB-vs-AABB overlap test between a segment's own bounding box and a query
+/// region. Conservative (a shallow diagonal segment could rarely be reported
+/// when only its bbox — not the segment itself — clips the region), same spirit
+/// as `check_trace_clearance`'s existing layer approximation.
+fn segment_bbox_overlaps_region(seg: &PcbSegment, x_min: f64, y_min: f64, x_max: f64, y_max: f64) -> bool {
+    let (sxmin, sxmax) = (seg.x1.min(seg.x2), seg.x1.max(seg.x2));
+    let (symin, symax) = (seg.y1.min(seg.y2), seg.y1.max(seg.y2));
+    sxmin <= x_max && sxmax >= x_min && symin <= y_max && symax >= y_min
 }
 
 /// One via parsed from a PCB file.
@@ -5842,4 +6250,594 @@ pub async fn run() -> anyhow::Result<()> {
         .waiting()
         .await?;
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Regression tests for the tab-indented, multi-line schematic symbol format
+// (real modern KiCad output) that several schematic-editing helpers used to
+// silently fail to parse — see P0-8 in the MCP tool improvement plan.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A minimal but structurally real tab-indented, multi-line schematic,
+    /// mirroring the exact shape of modern KiCad output (and the real file
+    /// that exposed these bugs): `(symbol` and `(lib_id ...)` on separate
+    /// lines, a `(wire ...)` block, and a `(lib_symbols ...)` section.
+    fn sample_schematic() -> String {
+        "\
+(kicad_sch
+	(version 20231120)
+	(lib_symbols
+		(symbol \"Connector:USB_B_Mini\"
+			(pin_names
+				(offset 1.016)
+			)
+			(symbol \"USB_B_Mini_1_1\"
+				(pin power_out line
+					(at 7.62 5.08 180)
+					(length 2.54)
+					(name \"VBUS\")
+					(number \"1\")
+				)
+			)
+		)
+	)
+	(wire
+		(pts
+			(xy 72.39 53.34) (xy 74.93 53.34)
+		)
+		(stroke
+			(width 0)
+			(type default)
+		)
+		(uuid \"200f4132-b397-4ea7-b4b3-866ee1e7c310\")
+	)
+	(symbol
+		(lib_id \"Connector:USB_B_Mini\")
+		(at 74.93 43.18 0)
+		(unit 1)
+		(property \"Reference\" \"PWR1\"
+			(at 76.3778 31.3182 0)
+		)
+		(property \"Value\" \"USB_B_Mini\"
+			(at 76.3778 33.6296 0)
+		)
+		(property \"Footprint\" \"\"
+			(at 78.74 44.45 0)
+		)
+		(instances
+			(project \"test\"
+				(path \"/abc\"
+					(reference \"PWR1\")
+					(unit 1)
+				)
+			)
+		)
+	)
+)
+".to_string()
+    }
+
+    #[test]
+    fn find_symbol_blocks_matches_multiline_tab_indented_form() {
+        let content = sample_schematic();
+        let blocks = find_symbol_blocks(&content);
+        assert!(
+            blocks.contains_key("PWR1"),
+            "expected to find reference PWR1 in a tab-indented, multi-line schematic; got keys: {:?}",
+            blocks.keys().collect::<Vec<_>>()
+        );
+        // Must not have picked up the nested lib_symbols library definition as a
+        // placed instance (it has no top-level "Reference" property at all, so it
+        // simply shouldn't appear in the map under any key).
+        assert_eq!(blocks.len(), 1, "expected exactly one placed instance, got: {:?}", blocks.keys().collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn find_sch_symbol_by_ref_finds_multiline_tab_indented_instance() {
+        let content = sample_schematic();
+        let range = find_sch_symbol_by_ref(&content, "PWR1");
+        assert!(range.is_some(), "find_sch_symbol_by_ref failed on tab-indented, multi-line schematic");
+        let block = &content[range.unwrap()];
+        assert!(block.contains("\"PWR1\""));
+        assert!(block.starts_with("(symbol"));
+    }
+
+    #[test]
+    fn sch_replace_at_locates_at_on_its_own_line() {
+        let content = sample_schematic();
+        let range = find_sch_symbol_by_ref(&content, "PWR1").expect("block not found");
+        let block = &content[range];
+        let new_block = sch_replace_at(block, 100.0, 50.0, Some(90.0));
+        assert!(new_block.contains("(at 100 50 90)"), "new placement not applied: {new_block}");
+        // The rest of the block (reference property etc.) must be preserved.
+        assert!(new_block.contains("\"PWR1\""));
+    }
+
+    #[test]
+    fn compute_pin_positions_works_on_multiline_tab_indented_instance() {
+        let content = sample_schematic();
+        let pins = compute_pin_positions(&content, "PWR1");
+        assert!(
+            !pins.is_empty(),
+            "expected at least one pin position for PWR1 in a tab-indented, multi-line schematic"
+        );
+    }
+
+    /// Regression test for P0-10: the "context after edit" preview used to
+    /// re-search the whole file for new_string's first line, which could latch
+    /// onto an earlier, unrelated occurrence of generic/repeated boilerplate
+    /// rather than the actual edit location. This builds a file with two
+    /// structurally-similar blocks sharing a generic first line, edits the
+    /// SECOND one via a globally-unique old_string, and confirms the preview
+    /// shows the second block's location (with its updated content), not the
+    /// untouched first block.
+    #[tokio::test]
+    async fn patch_kicad_file_context_preview_shows_real_edit_location() {
+        let dir = std::env::temp_dir().join(format!("kicad2print_test_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file_path = dir.join("p0_10_test.kicad_pcb");
+        // Two pads share the generic first line "(pad \"1\" thru_hole circle" —
+        // exactly the kind of repeated boilerplate that broke the old preview.
+        let content = "\
+(kicad_pcb
+\t(footprint \"A\"
+\t\t(pad \"1\" thru_hole circle
+\t\t\t(at 1 1)
+\t\t\t(uuid \"aaaa\")
+\t\t)
+\t)
+\t(footprint \"B\"
+\t\t(pad \"1\" thru_hole circle
+\t\t\t(at 99 99)
+\t\t\t(uuid \"bbbb-unique\")
+\t\t)
+\t)
+)
+";
+        std::fs::write(&file_path, content).unwrap();
+
+        let server = KiCadServer::new();
+        let params = Parameters(PatchKicadParams {
+            path: file_path.to_str().unwrap().to_string(),
+            old_string: "\t\t(pad \"1\" thru_hole circle\n\t\t\t(at 99 99)\n\t\t\t(uuid \"bbbb-unique\")".to_string(),
+            new_string: "\t\t(pad \"1\" thru_hole circle\n\t\t\t(at 42 42)\n\t\t\t(uuid \"bbbb-unique\")".to_string(),
+            replace_all: None,
+            render_preview: Some(false),
+        });
+        let result = server.patch_kicad_file(params).await.expect("call failed");
+        let text = result.content.iter()
+            .filter_map(|c| c.as_text().map(|t| t.text.clone()))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(!result.is_error.unwrap_or(false), "patch_kicad_file returned an error: {text}");
+        assert!(text.contains("(at 42 42)"), "preview should show the actual edited block (footprint B, now at 42 42): {text}");
+        assert!(!text.contains("(at 1 1)"), "preview should NOT show footprint A's untouched block: {text}");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn remove_dangling_wires_finds_tab_indented_multiline_wire_blocks() {
+        let content = sample_schematic();
+        // This wire's far endpoint (72.39, 53.34) is genuinely dangling (nothing
+        // else references that point) and its near endpoint (74.93, 53.34) is not
+        // anchored to anything in this minimal fixture either, so the whole wire
+        // should be detected and removed — the key regression check is that the
+        // wire is found at all (count != 0), not the specific anchor logic.
+        let (_new_content, count) = remove_dangling_wires(&content);
+        assert_eq!(count, 1, "expected to find and remove exactly 1 dangling wire in the tab-indented fixture");
+    }
+
+    /// Minimal PCB fixture with a single existing F.Cu trace on net "TX",
+    /// mirroring the exact TX/DATA/CLK crossing scenario from the real session
+    /// that motivated P0-1.
+    fn sample_pcb_with_trace() -> String {
+        "\
+(kicad_pcb
+\t(segment
+\t\t(start 10 10)
+\t\t(end 20 10)
+\t\t(width 0.4)
+\t\t(layer \"F.Cu\")
+\t\t(net \"TX\")
+\t)
+)
+".to_string()
+    }
+
+    #[test]
+    fn parse_pcb_segments_finds_tab_indented_segment_with_net_and_width() {
+        let content = sample_pcb_with_trace();
+        let segs = parse_pcb_segments(&content);
+        assert_eq!(segs.len(), 1, "expected exactly one parsed segment");
+        assert_eq!(segs[0].net, "TX");
+        assert!((segs[0].width - 0.4).abs() < 1e-9);
+        assert_eq!(segs[0].layer, "F.Cu");
+    }
+
+    #[test]
+    fn compute_clearance_flags_different_net_same_layer_crossing() {
+        let content = sample_pcb_with_trace();
+        // Proposed segment crosses the existing TX trace at (15, 10), different net.
+        let (collisions, _warnings) = compute_clearance(
+            &content, 15.0, 5.0, 15.0, 15.0, "F.Cu", 0.4, 0.1, "DATA",
+        );
+        assert!(!collisions.is_empty(), "expected a collision for a different-net trace crossing on the same layer");
+    }
+
+    #[test]
+    fn compute_clearance_allows_same_net_t_junction() {
+        let content = sample_pcb_with_trace();
+        // Same crossing geometry, but proposed net matches the existing trace's net.
+        let (collisions, _warnings) = compute_clearance(
+            &content, 15.0, 5.0, 15.0, 15.0, "F.Cu", 0.4, 0.1, "TX",
+        );
+        assert!(collisions.is_empty(), "same-net T-junction must not be flagged as a collision");
+    }
+
+    #[test]
+    fn compute_clearance_ignores_different_layer_traces() {
+        let content = sample_pcb_with_trace();
+        // Identical crossing geometry, but on B.Cu — must not collide with the F.Cu trace.
+        let (collisions, warnings) = compute_clearance(
+            &content, 15.0, 5.0, 15.0, 15.0, "B.Cu", 0.4, 0.1, "DATA",
+        );
+        assert!(collisions.is_empty() && warnings.is_empty(), "different-layer traces must never collide");
+    }
+
+    #[test]
+    fn compute_clearance_checks_two_unrouted_segments_against_each_other() {
+        let content = sample_pcb_with_trace();
+        // An unrouted (no-net) proposed segment crossing the existing trace's net
+        // is a real collision, but let's specifically verify the empty-net case
+        // isn't treated as a same-net wildcard against an unrouted EXISTING
+        // segment either — the exact failure mode this check exists to catch.
+        let content_two_unrouted = "\
+(kicad_pcb
+\t(segment
+\t\t(start 10 10)
+\t\t(end 20 10)
+\t\t(width 0.4)
+\t\t(layer \"F.Cu\")
+\t\t(net \"\")
+\t)
+)
+".to_string();
+        let _ = content; // unused in this variant
+        let (collisions, _warnings) = compute_clearance(
+            &content_two_unrouted, 15.0, 5.0, 15.0, 15.0, "F.Cu", 0.4, 0.1, "",
+        );
+        assert!(!collisions.is_empty(), "two unrouted segments touching must still be flagged as a collision");
+    }
+
+    #[tokio::test]
+    async fn add_trace_check_true_refuses_on_collision_and_force_overrides() {
+        let dir = std::env::temp_dir().join(format!("kicad2print_test_at_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file_path = dir.join("p1_6_test.kicad_pcb");
+        std::fs::write(&file_path, sample_pcb_with_trace()).unwrap();
+
+        let server = KiCadServer::new();
+
+        // check=true, colliding path (crosses the existing TX trace on a different net) → refused, no write.
+        let before = std::fs::read_to_string(&file_path).unwrap();
+        let params = Parameters(AddTraceParams {
+            path: file_path.to_str().unwrap().to_string(),
+            x1: 15.0, y1: 5.0, x2: 15.0, y2: 15.0,
+            layer: "F.Cu".to_string(), width: Some(0.4), net: Some("DATA".to_string()),
+            check: Some(true), force: None,
+        });
+        let result = server.add_trace(params).await.expect("call failed");
+        assert!(result.is_error.unwrap_or(false), "expected refusal on collision");
+        let after = std::fs::read_to_string(&file_path).unwrap();
+        assert_eq!(before, after, "file must be unchanged when the write is refused");
+
+        // Same colliding path with force=true → writes anyway.
+        let params = Parameters(AddTraceParams {
+            path: file_path.to_str().unwrap().to_string(),
+            x1: 15.0, y1: 5.0, x2: 15.0, y2: 15.0,
+            layer: "F.Cu".to_string(), width: Some(0.4), net: Some("DATA".to_string()),
+            check: Some(true), force: Some(true),
+        });
+        let result = server.add_trace(params).await.expect("call failed");
+        assert!(!result.is_error.unwrap_or(false), "force=true must write despite the collision");
+        let after = std::fs::read_to_string(&file_path).unwrap();
+        assert_ne!(before, after, "file must change once force=true is set");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn add_trace_check_omitted_preserves_always_write_behavior() {
+        let dir = std::env::temp_dir().join(format!("kicad2print_test_at2_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file_path = dir.join("p1_6_test2.kicad_pcb");
+        std::fs::write(&file_path, sample_pcb_with_trace()).unwrap();
+
+        let server = KiCadServer::new();
+        let before = std::fs::read_to_string(&file_path).unwrap();
+
+        // Colliding path, but check is omitted entirely — must write unconditionally (backward compat).
+        let params = Parameters(AddTraceParams {
+            path: file_path.to_str().unwrap().to_string(),
+            x1: 15.0, y1: 5.0, x2: 15.0, y2: 15.0,
+            layer: "F.Cu".to_string(), width: Some(0.4), net: Some("DATA".to_string()),
+            check: None, force: None,
+        });
+        let result = server.add_trace(params).await.expect("call failed");
+        assert!(!result.is_error.unwrap_or(false), "omitted check must never block a write");
+        let after = std::fs::read_to_string(&file_path).unwrap();
+        assert_ne!(before, after, "trace must be written when check is omitted");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn segment_bbox_overlaps_region_basic_cases() {
+        let seg = PcbSegment { x1: 10.0, y1: 10.0, x2: 20.0, y2: 10.0, layer: "F.Cu".into(), net: "TX".into(), width: 0.4 };
+        // Region fully containing the segment
+        assert!(segment_bbox_overlaps_region(&seg, 0.0, 0.0, 30.0, 30.0));
+        // Region only clipping the segment's bbox corner
+        assert!(segment_bbox_overlaps_region(&seg, 15.0, 5.0, 25.0, 15.0));
+        // Region entirely to the side, no overlap
+        assert!(!segment_bbox_overlaps_region(&seg, 50.0, 50.0, 60.0, 60.0));
+    }
+
+    #[tokio::test]
+    async fn query_traces_in_region_finds_and_filters_by_net_and_layer() {
+        let dir = std::env::temp_dir().join(format!("kicad2print_test_qtir_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file_path = dir.join("p0_2_test.kicad_pcb");
+        std::fs::write(&file_path, sample_pcb_with_trace()).unwrap();
+
+        let server = KiCadServer::new();
+
+        // Region containing the trace, no filters — should find it.
+        let params = Parameters(QueryTracesInRegionParams {
+            path: file_path.to_str().unwrap().to_string(),
+            x1: 0.0, y1: 0.0, x2: 30.0, y2: 30.0,
+            layer: None, net: None,
+        });
+        let result = server.query_traces_in_region(params).await.expect("call failed");
+        let text = result.content.iter().filter_map(|c| c.as_text().map(|t| t.text.clone())).collect::<Vec<_>>().join("\n");
+        assert!(text.contains("TX"), "expected the TX trace in the region: {text}");
+        assert!(text.contains("Total: 1 traces"), "expected exactly one match: {text}");
+
+        // Wrong net filter — should find nothing.
+        let params = Parameters(QueryTracesInRegionParams {
+            path: file_path.to_str().unwrap().to_string(),
+            x1: 0.0, y1: 0.0, x2: 30.0, y2: 30.0,
+            layer: None, net: Some("GND".to_string()),
+        });
+        let result = server.query_traces_in_region(params).await.expect("call failed");
+        let text = result.content.iter().filter_map(|c| c.as_text().map(|t| t.text.clone())).collect::<Vec<_>>().join("\n");
+        assert!(text.contains("No traces in region"), "expected no matches for a non-matching net filter: {text}");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// PCB fixture with an F.Cu-only SMD pad, a B.Cu-only SMD pad, and a THT pad, for
+    /// query_pads_in_region layer-filter tests (P1-5).
+    fn sample_pcb_with_layered_pads() -> String {
+        "\
+(kicad_pcb
+\t(footprint \"Fp\"
+\t\t(property \"Reference\" \"U1\" (at 0 0 0))
+\t\t(at 0 0)
+\t\t(pad \"1\" smd rect (at 5 5) (size 1 1) (layers \"F.Cu\" \"F.Paste\" \"F.Mask\") (net \"A\"))
+\t\t(pad \"2\" smd rect (at 6 5) (size 1 1) (layers \"B.Cu\" \"B.Paste\" \"B.Mask\") (net \"B\"))
+\t\t(pad \"3\" thru_hole circle (at 7 5) (size 1 1) (drill 0.5) (layers \"*.Cu\" \"*.Mask\") (net \"C\"))
+\t)
+)
+".to_string()
+    }
+
+    #[tokio::test]
+    async fn query_pads_in_region_layer_filter_excludes_non_matching_smd_pads() {
+        let dir = std::env::temp_dir().join(format!("kicad2print_test_qpir_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file_path = dir.join("p1_5_test.kicad_pcb");
+        std::fs::write(&file_path, sample_pcb_with_layered_pads()).unwrap();
+
+        let server = KiCadServer::new();
+
+        // Filter by F.Cu: should return the F.Cu SMD pad and the THT pad, but not the B.Cu SMD pad.
+        let params = Parameters(QueryPadsInRegionParams {
+            path: file_path.to_str().unwrap().to_string(),
+            x1: 0.0, y1: 0.0, x2: 10.0, y2: 10.0,
+            layer: Some("F.Cu".to_string()),
+        });
+        let result = server.query_pads_in_region(params).await.expect("call failed");
+        let text = result.content.iter().filter_map(|c| c.as_text().map(|t| t.text.clone())).collect::<Vec<_>>().join("\n");
+        assert!(text.contains("U1         1"), "F.Cu pad should match: {text}");
+        assert!(text.contains("U1         3"), "THT pad should match any layer filter: {text}");
+        assert!(!text.contains("U1         2"), "B.Cu-only pad must not match an F.Cu filter: {text}");
+
+        // No filter: all three pads returned.
+        let params = Parameters(QueryPadsInRegionParams {
+            path: file_path.to_str().unwrap().to_string(),
+            x1: 0.0, y1: 0.0, x2: 10.0, y2: 10.0,
+            layer: None,
+        });
+        let result = server.query_pads_in_region(params).await.expect("call failed");
+        let text = result.content.iter().filter_map(|c| c.as_text().map(|t| t.text.clone())).collect::<Vec<_>>().join("\n");
+        assert!(text.contains("Total: 3 pads"), "expected all 3 pads with no filter: {text}");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// PCB fixture with two segments on different nets, for delete_trace tests.
+    fn sample_pcb_two_traces() -> String {
+        "\
+(kicad_pcb
+\t(segment
+\t\t(start 10 10)
+\t\t(end 20 10)
+\t\t(width 0.4)
+\t\t(layer \"F.Cu\")
+\t\t(net \"TX\")
+\t\t(uuid \"tx-uuid-1234\")
+\t)
+\t(segment
+\t\t(start 50 50)
+\t\t(end 60 50)
+\t\t(width 0.4)
+\t\t(layer \"B.Cu\")
+\t\t(net \"GND\")
+\t\t(uuid \"gnd-uuid-5678\")
+\t)
+)
+".to_string()
+    }
+
+    async fn write_test_pcb(name: &str, content: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!("kicad2print_test_{name}_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file_path = dir.join("test.kicad_pcb");
+        std::fs::write(&file_path, content).unwrap();
+        (dir, file_path)
+    }
+
+    #[tokio::test]
+    async fn delete_trace_by_net_removes_only_matching_net() {
+        let (dir, file_path) = write_test_pcb("dt_net", &sample_pcb_two_traces()).await;
+        let server = KiCadServer::new();
+        let params = Parameters(DeleteTraceParams {
+            path: file_path.to_str().unwrap().to_string(),
+            net: Some("TX".to_string()), layer: None, uuid: None,
+            x1: None, y1: None, x2: None, y2: None, dry_run: None,
+        });
+        let result = server.delete_trace(params).await.expect("call failed");
+        let text = result.content.iter().filter_map(|c| c.as_text().map(|t| t.text.clone())).collect::<Vec<_>>().join("\n");
+        assert!(text.contains("Removed 1 trace segment"), "expected exactly 1 removed: {text}");
+
+        let remaining = std::fs::read_to_string(&file_path).unwrap();
+        assert!(!remaining.contains("\"TX\""), "TX segment should be gone");
+        assert!(remaining.contains("\"GND\""), "GND segment should remain untouched");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn delete_trace_dry_run_reports_without_writing() {
+        let (dir, file_path) = write_test_pcb("dt_dryrun", &sample_pcb_two_traces()).await;
+        let original = std::fs::read_to_string(&file_path).unwrap();
+        let server = KiCadServer::new();
+        let params = Parameters(DeleteTraceParams {
+            path: file_path.to_str().unwrap().to_string(),
+            net: Some("TX".to_string()), layer: None, uuid: None,
+            x1: None, y1: None, x2: None, y2: None, dry_run: Some(true),
+        });
+        let result = server.delete_trace(params).await.expect("call failed");
+        let text = result.content.iter().filter_map(|c| c.as_text().map(|t| t.text.clone())).collect::<Vec<_>>().join("\n");
+        assert!(text.contains("DRY RUN"), "expected a dry-run report: {text}");
+        assert!(text.contains("net=TX"), "expected the match description to mention the net: {text}");
+
+        let after = std::fs::read_to_string(&file_path).unwrap();
+        assert_eq!(original, after, "dry_run must not modify the file");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn delete_trace_by_uuid_removes_exactly_one() {
+        let (dir, file_path) = write_test_pcb("dt_uuid", &sample_pcb_two_traces()).await;
+        let server = KiCadServer::new();
+        let params = Parameters(DeleteTraceParams {
+            path: file_path.to_str().unwrap().to_string(),
+            net: None, layer: None, uuid: Some("gnd-uuid-5678".to_string()),
+            x1: None, y1: None, x2: None, y2: None, dry_run: None,
+        });
+        let result = server.delete_trace(params).await.expect("call failed");
+        let text = result.content.iter().filter_map(|c| c.as_text().map(|t| t.text.clone())).collect::<Vec<_>>().join("\n");
+        assert!(text.contains("Removed 1 trace segment"), "expected exactly 1 removed by uuid: {text}");
+
+        let remaining = std::fs::read_to_string(&file_path).unwrap();
+        assert!(!remaining.contains("gnd-uuid-5678"));
+        assert!(remaining.contains("tx-uuid-1234"), "TX segment should remain untouched");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn delete_trace_rejects_call_with_no_filters() {
+        let (dir, file_path) = write_test_pcb("dt_nofilter", &sample_pcb_two_traces()).await;
+        let server = KiCadServer::new();
+        let params = Parameters(DeleteTraceParams {
+            path: file_path.to_str().unwrap().to_string(),
+            net: None, layer: None, uuid: None,
+            x1: None, y1: None, x2: None, y2: None, dry_run: None,
+        });
+        let result = server.delete_trace(params).await.expect("call failed");
+        assert!(result.is_error.unwrap_or(false), "expected an error when no filter is provided");
+
+        let unchanged = std::fs::read_to_string(&file_path).unwrap();
+        assert_eq!(unchanged, sample_pcb_two_traces(), "file must be untouched when the call is rejected");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn delete_trace_by_region_only_removes_overlapping_segment() {
+        let (dir, file_path) = write_test_pcb("dt_region", &sample_pcb_two_traces()).await;
+        let server = KiCadServer::new();
+        // Region around the TX segment (10,10)-(20,10) only.
+        let params = Parameters(DeleteTraceParams {
+            path: file_path.to_str().unwrap().to_string(),
+            net: None, layer: None, uuid: None,
+            x1: Some(0.0), y1: Some(0.0), x2: Some(30.0), y2: Some(30.0),
+            dry_run: None,
+        });
+        let result = server.delete_trace(params).await.expect("call failed");
+        let text = result.content.iter().filter_map(|c| c.as_text().map(|t| t.text.clone())).collect::<Vec<_>>().join("\n");
+        assert!(text.contains("Removed 1 trace segment"), "expected exactly 1 removed by region: {text}");
+
+        let remaining = std::fs::read_to_string(&file_path).unwrap();
+        assert!(!remaining.contains("\"TX\""), "TX segment inside the region should be gone");
+        assert!(remaining.contains("\"GND\""), "GND segment outside the region should remain");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn coord_key_absorbs_submicron_drift_but_not_real_separation() {
+        // Sub-micron float drift (well under 5 microns) must bucket identically —
+        // this is the exact false-negative this fix addresses.
+        assert_eq!(coord_key(10.0), coord_key(10.0 + 0.0000003));
+        // Two genuinely distinct points 0.05mm apart (well below any realistic
+        // KiCad clearance, but clearly not the same point) must NOT bucket
+        // identically — confirms the fix doesn't introduce false positives.
+        assert_ne!(coord_key(10.0), coord_key(10.05));
+    }
+
+    #[test]
+    fn check_pad_connectivity_no_longer_false_negatives_on_submicron_drift() {
+        let pads = vec![
+            PcbPad { reference: "U1".into(), pad_num: "1".into(), net: "TX".into(), x: 10.0, y: 10.0, width: 1.7, height: 1.7, is_thru_hole: true, layers: vec!["F.Cu".to_string()] },
+            PcbPad { reference: "U2".into(), pad_num: "1".into(), net: "TX".into(), x: 20.0, y: 10.0, width: 1.7, height: 1.7, is_thru_hole: true, layers: vec!["F.Cu".to_string()] },
+        ];
+        // Trace endpoint independently computed via rotation trig differs from
+        // the pad center by a fraction of a micron — exactly the real-world
+        // scenario that caused a false DISCONNECTED report before this fix.
+        let segments = vec![
+            PcbSegment { x1: 10.0 + 0.0000004, y1: 10.0, x2: 20.0 - 0.0000004, y2: 10.0, layer: "F.Cu".into(), net: "TX".into(), width: 0.4 },
+        ];
+        let result = check_pad_connectivity(&pads, &segments, &[], "U1", "1", "U2", "1");
+        assert_eq!(result, Ok(true), "sub-micron drift must not cause a false DISCONNECTED result");
+    }
+
+    #[test]
+    fn check_pad_connectivity_still_reports_disconnected_when_truly_unrouted() {
+        let pads = vec![
+            PcbPad { reference: "U1".into(), pad_num: "1".into(), net: "TX".into(), x: 10.0, y: 10.0, width: 1.7, height: 1.7, is_thru_hole: true, layers: vec!["F.Cu".to_string()] },
+            PcbPad { reference: "U2".into(), pad_num: "1".into(), net: "TX".into(), x: 20.0, y: 10.0, width: 1.7, height: 1.7, is_thru_hole: true, layers: vec!["F.Cu".to_string()] },
+        ];
+        let result = check_pad_connectivity(&pads, &[], &[], "U1", "1", "U2", "1");
+        assert_eq!(result, Ok(false), "genuinely unrouted pads must still report DISCONNECTED");
+    }
 }
