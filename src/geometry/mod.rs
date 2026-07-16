@@ -263,6 +263,13 @@ pub fn generate_model(pcb: &PcbData, config: &Config) -> Result<Mesh3D> {
         }
     }
 
+    // Force a single, consistently-outward orientation so the STL slices
+    // cleanly. Wall winding here is best-effort against the earcut-triangulated
+    // faces (same issue fixed for generate_stencil() in b798c21): without this,
+    // Cura's slicer can fill pad/via holes solid even though the preview shows
+    // them open, because some hole-wall triangles face the wrong way.
+    make_outward_consistent(&mut mesh);
+
     Ok(mesh)
 }
 
@@ -1321,6 +1328,38 @@ fn make_outward_consistent(mesh: &mut Mesh3D) {
     if n == 0 {
         return;
     }
+
+    // Weld near-coincident vertices to one canonical position first. Faces and
+    // hole walls are built independently (top/bottom faces go through several
+    // `geo` boolean ops — difference/intersection — that regenerate coordinates
+    // with tiny float drift, while hole-wall triangles read the ring vertices
+    // directly), so geometrically-identical points routinely differ by a few
+    // ULPs. Bit-exact matching then treats them as distinct vertices, leaving
+    // real micro-gaps around every hole that a slicer can trip on. Snapping to
+    // a 1e-4 mm grid (far below manufacturing precision, well above the float
+    // noise from a few chained boolean ops) merges those without touching
+    // genuine geometry.
+    let quant = |c: f32| (c as f64 * 1e4).round() as i64;
+    let qkey = |v: [f32; 3]| (quant(v[0]), quant(v[1]), quant(v[2]));
+    let mut canonical: HashMap<(i64, i64, i64), [f32; 3]> = HashMap::new();
+    for t in mesh.triangles.iter() {
+        for v in t.vertices {
+            canonical.entry(qkey(v)).or_insert(v);
+        }
+    }
+    for t in mesh.triangles.iter_mut() {
+        for v in t.vertices.iter_mut() {
+            *v = canonical[&qkey(*v)];
+        }
+    }
+    // Re-drop any triangle that welding collapsed into a degenerate sliver.
+    mesh.triangles
+        .retain(|t| t.vertices[0] != t.vertices[1] && t.vertices[1] != t.vertices[2] && t.vertices[2] != t.vertices[0]);
+    let n = mesh.triangles.len();
+    if n == 0 {
+        return;
+    }
+
     let key = |v: [f32; 3]| (v[0].to_bits(), v[1].to_bits(), v[2].to_bits());
 
     // Undirected edge → the (triangle, directed a→b) incidences that share it.
@@ -1347,24 +1386,32 @@ fn make_outward_consistent(mesh: &mut Mesh3D) {
         }
     }
 
-    // Flood-fill a flip flag across every connected component.
+    // Flood-fill a flip flag across every connected component, tracking each
+    // component's member triangles separately — components are NOT necessarily
+    // one single shell (hole-wall tubes, floating copper islands, etc. can end
+    // up vertex-disconnected from the main shell), so each needs its own
+    // independent outward-orientation decision below rather than one global one.
     let mut flip = vec![false; n];
     let mut seen = vec![false; n];
+    let mut components: Vec<Vec<usize>> = Vec::new();
     for start in 0..n {
         if seen[start] {
             continue;
         }
         seen[start] = true;
         let mut stack = vec![start];
+        let mut component = vec![start];
         while let Some(t) = stack.pop() {
             for &(nb, consistent) in &adj[t] {
                 if !seen[nb] {
                     seen[nb] = true;
                     flip[nb] = if consistent { flip[t] } else { !flip[t] };
                     stack.push(nb);
+                    component.push(nb);
                 }
             }
         }
+        components.push(component);
     }
     for (ti, t) in mesh.triangles.iter_mut().enumerate() {
         if flip[ti] {
@@ -1372,19 +1419,19 @@ fn make_outward_consistent(mesh: &mut Mesh3D) {
         }
     }
 
-    // Orient outward: a closed surface with outward normals encloses positive volume.
-    let vol: f64 = mesh
-        .triangles
-        .iter()
-        .map(|t| {
-            let [a, b, c] = t.vertices;
-            (a[0] * (b[1] * c[2] - b[2] * c[1]) - a[1] * (b[0] * c[2] - b[2] * c[0])
-                + a[2] * (b[0] * c[1] - b[1] * c[0])) as f64
-        })
-        .sum();
-    if vol < 0.0 {
-        for t in mesh.triangles.iter_mut() {
-            t.vertices.swap(1, 2);
+    // Orient each component outward independently: a closed surface with
+    // outward normals encloses positive volume.
+    let signed_vol = |t: &Triangle3D| -> f64 {
+        let [a, b, c] = t.vertices;
+        (a[0] * (b[1] * c[2] - b[2] * c[1]) - a[1] * (b[0] * c[2] - b[2] * c[0])
+            + a[2] * (b[0] * c[1] - b[1] * c[0])) as f64
+    };
+    for component in &components {
+        let vol: f64 = component.iter().map(|&ti| signed_vol(&mesh.triangles[ti])).sum();
+        if vol < 0.0 {
+            for &ti in component {
+                mesh.triangles[ti].vertices.swap(1, 2);
+            }
         }
     }
 
