@@ -796,7 +796,16 @@ fn add_ring_walls<'a>(
     exterior: bool,
     ctx: &Ctx,
 ) {
-    let coords: Vec<Coord> = coords_iter.copied().collect();
+    // Snap to the same grid `triangulate_polygon`/`push_ring_snapped` uses for
+    // the flat floor/cap faces this wall meets at z_floor and z_opening. Both
+    // paths start from the same `geo` boolean-op output, but without matching
+    // snapping the flat face's earcut-triangulated vertices and this wall's
+    // raw vertices can differ by float noise the sweep algorithm leaves
+    // behind — same coordinate, different bits — leaving a non-manifold gap
+    // right at the wall/face seam.
+    let coords: Vec<Coord> = coords_iter
+        .map(|c| Coord { x: snap_coord(c.x), y: snap_coord(c.y) })
+        .collect();
     let n = coords.len();
     if n < 2 {
         return;

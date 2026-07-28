@@ -281,31 +281,72 @@ pub fn kicad_mod_to_pcb_footprint(
 // Multi-component removal
 // ---------------------------------------------------------------------------
 
-/// Remove footprint blocks for the given references and return the modified content.
+/// Remove a set of byte ranges from `content` and return the result.
 ///
-/// Ranges are processed in reverse order so earlier byte offsets stay valid.
-pub fn remove_footprints(content: &str, refs: &[&str]) -> String {
-    let blocks = find_footprint_blocks(content);
-
-    let mut ranges: Vec<Range<usize>> = refs
-        .iter()
-        .filter_map(|r| blocks.get(*r).cloned())
-        .collect();
-
-    // Descending so removal doesn't shift earlier offsets
+/// Ranges are processed in descending order so earlier byte offsets stay
+/// valid as later (higher-offset) ranges are removed first. Always eats a
+/// trailing newline immediately after each range, if present (so removal
+/// doesn't leave a blank line where the block used to end); when
+/// `trim_leading_newline` is true, also walks back over any spaces/tabs
+/// immediately before the range (the removed block's own line-indentation —
+/// callers like `for_each_top_level` report `range.start` as the position of
+/// the keyword itself, not the start of its line, so this indentation isn't
+/// part of the range) and, if that's preceded by a newline, eats that too —
+/// removing the blank line the block's start left behind. Without walking
+/// past the indentation first, only the newline would be eaten, leaving the
+/// block's leading whitespace to merge onto the *next* surviving line (e.g.
+/// `\t)\n\t(label ...)\n\t(next` -> naively trimming just the newline before
+/// `(label` leaves `\t` orphaned right before `(next`, doubling its indent).
+/// Use `trim_leading_newline: true` for elements that sit alone on their own
+/// line with nothing else sharing it (e.g. `gr_line`/wire/label top-level
+/// blocks). Leave it false for elements where a leading newline might belong
+/// to something the caller wants preserved (e.g. footprint blocks, which
+/// historically only trimmed the trailing newline here — kept as-is to avoid
+/// changing already-tested output).
+///
+/// This consolidates what used to be three near-identical
+/// sort-descending-and-drain implementations (`remove_footprints`,
+/// `remove_edge_cuts_lines` in mcp.rs, and `remove_dangling_wires`'s removal
+/// loop in mcp.rs) into one place.
+pub fn remove_ranges(content: &str, mut ranges: Vec<Range<usize>>, trim_leading_newline: bool) -> String {
     ranges.sort_by(|a, b| b.start.cmp(&a.start));
 
     let mut result = content.to_string();
     for range in ranges {
-        // Eat a trailing newline if present
         let end = if result.as_bytes().get(range.end) == Some(&b'\n') {
             range.end + 1
         } else {
             range.end
         };
-        result.drain(range.start..end);
+        let start = if trim_leading_newline {
+            // Walk back over the block's own line-indentation (spaces/tabs)
+            // only — not the newline before it. The `end` side above already
+            // eats the block's own trailing newline, so together this removes
+            // exactly one full line (indent + content + newline); also eating
+            // the newline *before* the indentation would remove a second
+            // newline that actually belongs to the *previous* surviving line,
+            // merging it with whatever follows.
+            let mut s = range.start;
+            while s > 0 && matches!(result.as_bytes().get(s - 1), Some(b' ') | Some(b'\t')) {
+                s -= 1;
+            }
+            s
+        } else {
+            range.start
+        };
+        result.drain(start..end.min(result.len()));
     }
     result
+}
+
+/// Remove footprint blocks for the given references and return the modified content.
+pub fn remove_footprints(content: &str, refs: &[&str]) -> String {
+    let blocks = find_footprint_blocks(content);
+    let ranges: Vec<Range<usize>> = refs
+        .iter()
+        .filter_map(|r| blocks.get(*r).cloned())
+        .collect();
+    remove_ranges(content, ranges, false)
 }
 
 // ---------------------------------------------------------------------------
@@ -320,13 +361,24 @@ fn fmt_at(x: f64, y: f64, rot: f64) -> String {
     }
 }
 
-/// Generate a pseudo-tstamp from the current wall-clock time.
-/// Not a proper UUID but fits the `XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX` format.
+/// Process-local counter mixed into `new_tstamp()` so multiple calls within
+/// the same wall-clock microsecond (common when a single tool call builds
+/// several new elements back-to-back, e.g. an instance plus several pins)
+/// can't produce byte-identical "UUIDs". Thread-safe via `AtomicU64`.
+static TSTAMP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Generate a pseudo-tstamp from the current wall-clock time, perturbed by a
+/// monotonic counter to avoid same-tick collisions across rapid sequential
+/// calls. Not a proper random UUID but fits the
+/// `XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX` format and is guaranteed unique
+/// across calls within this process.
 pub fn new_tstamp() -> String {
     let ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_micros();
+    let salt = TSTAMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed) as u128;
+    let ts = ts.wrapping_add(salt);
     format!(
         "{:08x}-{:04x}-{:04x}-{:04x}-{:012x}",
         (ts >> 64) as u32,
@@ -344,6 +396,88 @@ pub fn new_tstamp() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn remove_ranges_trims_trailing_newline_when_leading_trim_disabled() {
+        let content = "AAA\nBBB\nCCC\n";
+        // Remove "BBB" (bytes 4..7) without trimming its leading newline: the
+        // "AAA\n" prefix's own trailing newline survives, "BBB\n" is gone.
+        let result = remove_ranges(content, vec![4..7], false);
+        assert_eq!(result, "AAA\nCCC\n", "expected only BBB's own trailing newline eaten");
+    }
+
+    #[test]
+    fn remove_ranges_with_leading_trim_removes_indentation_not_previous_lines_newline() {
+        // With no indentation before the removed range at all (block directly
+        // preceded by a bare newline), leading trim has nothing to walk back
+        // over, so it behaves the same as trim_leading_newline=false.
+        let content = "AAA\nBBB\nCCC\n";
+        let result = remove_ranges(content, vec![4..7], true);
+        assert_eq!(result, "AAA\nCCC\n", "no indentation to trim, so this should match the disabled case");
+
+        // With tab-indentation before the block (the realistic KiCad case),
+        // leading trim removes that indentation too, leaving AAA and CCC each
+        // on their own still-correctly-indented line.
+        let indented = "\tAAA\n\tBBB\n\tCCC\n";
+        let b_start = indented.find("BBB").unwrap();
+        let b_end = b_start + 3; // "BBB", not including its own trailing newline
+        let result = remove_ranges(indented, vec![b_start..b_end], true);
+        assert_eq!(result, "\tAAA\n\tCCC\n", "expected BBB's own indentation removed, AAA/CCC's indentation untouched");
+    }
+
+    #[test]
+    fn remove_ranges_does_not_leave_orphaned_indentation_before_the_next_block() {
+        // Regression test: a naive "trim one newline before range.start" only
+        // eats the newline, not the removed block's own line-indentation
+        // (since callers like for_each_top_level report range.start as the
+        // position of the keyword, not the line start) — leaving that
+        // indentation to merge onto the next surviving line and double its
+        // apparent indent. Simulates a tab-indented block sandwiched between
+        // two others, as in a real .kicad_sch file. Built via explicit byte
+        // offsets (not fragile substring re-search) so the range matches
+        // exactly what for_each_top_level/block_end actually produce: start
+        // at the keyword (not the line's leading tab), end just past the
+        // matching close-paren (not including the trailing newline).
+        let prefix = "(root\n\t(a)\n\t";
+        let block = "(b\n\t\tinner\n\t)";
+        let suffix = "\n\t(c)\n)\n";
+        let content = format!("{prefix}{block}{suffix}");
+        let b_start = prefix.len();
+        let b_end = prefix.len() + block.len();
+
+        let result = remove_ranges(&content, vec![b_start..b_end], true);
+        assert_eq!(
+            result, "(root\n\t(a)\n\t(c)\n)\n",
+            "expected (c)'s original single-tab indent preserved, not doubled by an orphaned tab from the removed (b) block"
+        );
+    }
+
+    #[test]
+    fn remove_ranges_processes_multiple_ranges_in_descending_order() {
+        let content = "\tAAA\n\tBBB\n\tCCC\n\tDDD\n";
+        // Remove both "BBB" and "DDD" in one call, passed in ascending order —
+        // the function must sort descending internally so removing the later
+        // range doesn't invalidate the earlier range's byte offsets.
+        let b_start = content.find("BBB").unwrap();
+        let d_start = content.find("DDD").unwrap();
+        let result = remove_ranges(content, vec![b_start..b_start + 3, d_start..d_start + 3], true);
+        assert_eq!(result, "\tAAA\n\tCCC\n");
+    }
+
+    #[test]
+    fn new_tstamp_produces_distinct_values_on_rapid_sequential_calls() {
+        // Regression test: new_tstamp() used to be pure wall-clock microseconds
+        // with no counter, so several calls in a tight loop (e.g. building an
+        // instance UUID plus multiple pin UUIDs in one tool call) could land in
+        // the same microsecond tick and produce identical "UUIDs".
+        let stamps: Vec<String> = (0..64).map(|_| new_tstamp()).collect();
+        let unique: std::collections::HashSet<&String> = stamps.iter().collect();
+        assert_eq!(
+            unique.len(),
+            stamps.len(),
+            "expected all 64 rapid sequential new_tstamp() calls to be distinct, got duplicates: {stamps:?}"
+        );
+    }
 
     const MINI_PCB: &str = r#"(kicad_pcb
   (footprint "Lib:FP_A" (layer "F.Cu")

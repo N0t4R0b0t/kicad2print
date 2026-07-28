@@ -169,6 +169,50 @@ pub struct DeleteComponentParams {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct DeleteSymbolParams {
+    /// Absolute path to the .kicad_sch file
+    pub path: String,
+    /// Reference designators to remove (e.g. ["C1", "C2"])
+    pub refs: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct DeleteWireParams {
+    /// Absolute path to the .kicad_sch file
+    pub path: String,
+    /// Start X in mm (all four of x1/y1/x2/y2 required if uuid not given)
+    #[schemars(default)]
+    pub x1: Option<f64>,
+    #[schemars(default)]
+    pub y1: Option<f64>,
+    #[schemars(default)]
+    pub x2: Option<f64>,
+    #[schemars(default)]
+    pub y2: Option<f64>,
+    /// Wire UUID (alternative to endpoint coordinates; substring match)
+    #[schemars(default)]
+    pub uuid: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct DeleteLabelParams {
+    /// Absolute path to the .kicad_sch file
+    pub path: String,
+    /// Label text (required if uuid not given)
+    #[schemars(default)]
+    pub text: Option<String>,
+    /// X position in mm (required with text if uuid not given)
+    #[schemars(default)]
+    pub x: Option<f64>,
+    /// Y position in mm (required with text if uuid not given)
+    #[schemars(default)]
+    pub y: Option<f64>,
+    /// Label UUID (alternative to text+position; substring match)
+    #[schemars(default)]
+    pub uuid: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct PadSpec {
     /// Pad number (e.g. "1", "A1")
     pub number: String,
@@ -717,6 +761,28 @@ pub struct AddPowerSymbolParams {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct AddSymbolParams {
+    /// Absolute path to the .kicad_sch schematic file
+    pub path: String,
+    /// Library symbol id in "Library:Symbol" form (e.g. "Device:C", "Device:R")
+    pub lib_id: String,
+    /// Reference designator for the new instance (e.g. "C4")
+    pub reference: String,
+    /// Value string (e.g. "100nF", "10k")
+    pub value: String,
+    /// X position in schematic coordinates (mm)
+    pub x: f64,
+    /// Y position in schematic coordinates (mm)
+    pub y: f64,
+    /// Rotation in degrees (default: 0)
+    #[schemars(default)]
+    pub rotation: Option<f64>,
+    /// Footprint field value (e.g. "Capacitor_SMD:C_0603_1608Metric"); left empty if omitted
+    #[schemars(default)]
+    pub footprint: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct GetNetForPadParams {
     /// Absolute path to the .kicad_pcb file
     pub path: String,
@@ -724,6 +790,18 @@ pub struct GetNetForPadParams {
     pub reference: String,
     /// Pad number as a string (e.g. "1", "A3")
     pub pad_number: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct GetSchematicNetParams {
+    /// Absolute path to the .kicad_sch file
+    pub path: String,
+    /// Reference designator to query (e.g. "U1") — omit to list all nets
+    #[schemars(default)]
+    pub reference: Option<String>,
+    /// Pin number to query (requires reference) — omit to list all pins of the reference
+    #[schemars(default)]
+    pub pin: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
@@ -1119,15 +1197,7 @@ fn remove_edge_cuts_lines(content: &str) -> String {
             }
         });
     }
-    ranges.sort_by(|a, b| b.start.cmp(&a.start));
-    let mut result = content.to_string();
-    for range in ranges {
-        let end = if result.as_bytes().get(range.end) == Some(&b'\n') { range.end + 1 } else { range.end };
-        let start = if range.start > 0 && result.as_bytes().get(range.start - 1) == Some(&b'\n') {
-            range.start - 1
-        } else { range.start };
-        result.drain(start..end.min(result.len()));
-    }
+    let result = pcb_edit::remove_ranges(content, ranges, true);
     result
 }
 
@@ -1390,20 +1460,17 @@ fn extract_pad_positions(block: &str) -> Vec<(String, f64, f64, String)> {
 /// A wire is dangling if either endpoint doesn't touch any other wire endpoint,
 /// pin position, junction, label, or no_connect marker.
 /// Returns (new_content, count_removed).
-fn remove_dangling_wires(content: &str) -> (String, usize) {
-    // Collect all wire endpoints
-    struct Wire { range: std::ops::Range<usize>, x1: f64, y1: f64, x2: f64, y2: f64 }
+/// A parsed `(wire (pts (xy X1 Y1) (xy X2 Y2)) ...)` block: its byte range and
+/// both endpoints. Shared by `remove_dangling_wires` and `delete_wire`.
+struct SchWire { range: std::ops::Range<usize>, x1: f64, y1: f64, x2: f64, y2: f64 }
 
-    let coord_k = |v: f64| (v * 10_000.0).round() as i64;
-    let pt_k = |x: f64, y: f64| (coord_k(x), coord_k(y));
-
-    let mut wires: Vec<Wire> = Vec::new();
-    // for_each_top_level matches both single-line and multi-line `(wire ...)` forms
-    // and both 2-space/tab indentation (see find_symbol_blocks for the same fix).
+/// Parse every top-level `(wire ...)` block in a schematic into its endpoints.
+/// Matches both single-line and multi-line forms and both 2-space/tab
+/// indentation (see `find_symbol_blocks` for the same fix).
+fn parse_sch_wires(content: &str) -> Vec<SchWire> {
+    let mut wires = Vec::new();
     for_each_top_level(content, "(wire", |start, end| {
         let block = &content[start..end];
-
-        // Parse (pts (xy X1 Y1) (xy X2 Y2))
         let mut pts = block.split("(xy ").skip(1);
         let parse_pt = |s: &str| -> Option<(f64, f64)> {
             let mut parts = s.split_whitespace();
@@ -1412,9 +1479,17 @@ fn remove_dangling_wires(content: &str) -> (String, usize) {
             Some((x, y))
         };
         if let (Some(p1), Some(p2)) = (pts.next().and_then(parse_pt), pts.next().and_then(parse_pt)) {
-            wires.push(Wire { range: start..end, x1: p1.0, y1: p1.1, x2: p2.0, y2: p2.1 });
+            wires.push(SchWire { range: start..end, x1: p1.0, y1: p1.1, x2: p2.0, y2: p2.1 });
         }
     });
+    wires
+}
+
+fn remove_dangling_wires(content: &str) -> (String, usize) {
+    let coord_k = |v: f64| (v * 10_000.0).round() as i64;
+    let pt_k = |x: f64, y: f64| (coord_k(x), coord_k(y));
+
+    let wires = parse_sch_wires(content);
 
     // Build set of all "anchored" points: pin positions, label positions, junctions, no_connects
     let mut anchors: std::collections::HashSet<(i64, i64)> = std::collections::HashSet::new();
@@ -1466,15 +1541,7 @@ fn remove_dangling_wires(content: &str) -> (String, usize) {
     }
 
     let count = to_remove.len();
-    to_remove.sort_by(|a, b| b.start.cmp(&a.start));
-    let mut result = content.to_string();
-    for range in to_remove {
-        let end = if result.as_bytes().get(range.end) == Some(&b'\n') { range.end + 1 } else { range.end };
-        let start = if range.start > 0 && result.as_bytes().get(range.start - 1) == Some(&b'\n') {
-            range.start - 1
-        } else { range.start };
-        result.drain(start..end.min(result.len()));
-    }
+    let result = pcb_edit::remove_ranges(content, to_remove, true);
     (result, count)
 }
 
@@ -1515,11 +1582,15 @@ fn sch_replace_at(block: &str, new_x: f64, new_y: f64, rotation: Option<f64>) ->
             } else { 0.0 }
         };
         let rot = rotation.unwrap_or(existing_rot);
-        let new_at = if rot.abs() < 0.001 {
-            format!("(at {} {})", new_x, new_y)
-        } else {
-            format!("(at {} {} {})", new_x, new_y, rot)
-        };
+        // Unlike PCB footprints (where a 2-value `(at x y)` omitting 0°
+        // rotation is valid, see pcb_edit::fmt_at), schematic symbol
+        // instances require the 3-value form even at 0° — every symbol in
+        // real KiCad output uses it, and kicad-cli's schematic loader
+        // rejects the 2-value form outright (confirmed: it silently produced
+        // a `(at x y)` for a 0°-rotation move that made a real project file
+        // fail to load with "Failed to load schematic", exit code 3, until
+        // fixed by hand). Always emit the 3-value form here.
+        let new_at = format!("(at {} {} {})", new_x, new_y, rot);
         format!("{}{}{}", &block[..at_start], new_at, &block[at_end..])
     } else {
         block.to_string()
@@ -1560,6 +1631,14 @@ fn compute_pin_positions_inner(content: &str, reference: &str) -> Option<Vec<(St
             (0.0, 0.0, 0.0)
         }
     };
+
+    // Extract the instance's mirror flag, if any: `(mirror x)` or `(mirror y)`,
+    // a sibling of `(at ...)` inside the instance block. Confirmed against a real
+    // mirrored instance (a `(mirror x)` connector) that "mirror x" means mirror
+    // *across* the X axis (negate Y), and by symmetry "mirror y" negates X.
+    let mirror: Option<char> = instance_block.find("(mirror ").and_then(|m| {
+        instance_block[m + 8..].chars().next().filter(|c| *c == 'x' || *c == 'y')
+    });
 
     // 2. Find the symbol definition in lib_symbols
     let lib_sym_start = content.find("(lib_symbols")?;
@@ -1604,9 +1683,23 @@ fn compute_pin_positions_inner(content: &str, reference: &str) -> Option<Vec<(St
 
         // Pin endpoint is at (px, py) plus length along pin direction — for label attachment
         // we return the pin base position (where the wire connects)
-        // Apply instance rotation + translation
-        let canvas_x = inst_x + px * cos_r - py * sin_r;
-        let canvas_y = inst_y + px * sin_r + py * cos_r;
+        //
+        // KiCad symbol-library space is Y-up; sheet/canvas space (instance `(at ...)`,
+        // wires, labels, no-connects) is Y-down, so the pin's local Y must be negated
+        // before rotating into canvas space. A mirrored instance negates the relevant
+        // local axis *again* before that rotation: `mirror x` (mirror across the X
+        // axis) re-negates Y, `mirror y` negates X. Verified against real KiCad output
+        // (both an unmirrored and a `mirror x` instance) — do not revert to a plain
+        // rotation without the Y-flip.
+        let mut lx = px;
+        let mut ly = -py;
+        match mirror {
+            Some('x') => ly = -ly,
+            Some('y') => lx = -lx,
+            _ => {}
+        }
+        let canvas_x = inst_x + lx * cos_r - ly * sin_r;
+        let canvas_y = inst_y + lx * sin_r + ly * cos_r;
 
         // Extract name and number
         let name = extract_quoted_after_kw(pin_block, "(name \"");
@@ -5486,6 +5579,505 @@ print('ok')
         }
         Ok(CallToolResult::success(result))
     }
+
+    /// Add a component symbol (e.g. Device:R, Device:C) to a schematic,
+    /// reusing it from lib_symbols if already embedded, otherwise importing
+    /// it from the system's installed KiCad symbol libraries.
+    #[tool(description = "Add a component symbol (e.g. \"Device:C\", \"Device:R\") to a .kicad_sch schematic. Reuses the symbol from lib_symbols if already embedded there, otherwise imports it from the installed KiCad symbol libraries (Library:Symbol form, e.g. \"Device:C\" resolves Device.kicad_sym's \"C\" symbol). Places an instance with Reference/Value/Footprint fields and one UUID per pin. Renders a schematic preview. Single-unit symbols only (v1) — multi-unit parts like op-amps are rejected with a clear error. Use this instead of manually authoring the S-expression block.")]
+    async fn add_symbol(
+        &self,
+        params: Parameters<AddSymbolParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let p = params.0;
+        let path = PathBuf::from(&p.path);
+        let _guard = self.lock_file(&path).await;
+
+        let mut content = match fs::read_to_string(&path).await {
+            Ok(c) => c,
+            Err(e) => return Ok(CallToolResult::error(vec![Content::text(format!("Failed to read: {e}"))])),
+        };
+
+        // 0. Reject a reference that's already in use — this tool takes an
+        // explicit caller-supplied reference, unlike add_power_symbol which
+        // self-generates #PWRnnn, so it must guard against duplicates itself.
+        if find_symbol_blocks(&content).contains_key(&p.reference) {
+            return Ok(CallToolResult::error(vec![Content::text(format!(
+                "Reference '{}' is already used by another symbol in this schematic.", p.reference
+            ))]));
+        }
+
+        // 1. Split lib_id into (lib_file, sym_name) — e.g. "Device:C" -> ("Device", "C").
+        let (lib_file, sym_name) = match p.lib_id.split_once(':') {
+            Some((f, n)) if !f.is_empty() && !n.is_empty() => (f, n),
+            _ => return Ok(CallToolResult::error(vec![Content::text(format!(
+                "lib_id '{}' must be in \"Library:Symbol\" form, e.g. \"Device:C\".", p.lib_id
+            ))])),
+        };
+
+        let lib_sym_start = match content.find("(lib_symbols") {
+            Some(pos) => pos,
+            None => return Ok(CallToolResult::error(vec![Content::text(
+                "No (lib_symbols ...) section found in schematic. Is this a valid .kicad_sch file?".to_string()
+            )])),
+        };
+        let lib_id_marker = format!("(symbol \"{}\"", p.lib_id);
+        let already_in_lib = {
+            let lib_sym_end = pcb_edit::block_end(&content, lib_sym_start);
+            content[lib_sym_start..lib_sym_end].contains(&lib_id_marker)
+        };
+
+        // 2. Reuse the embedded definition if present, otherwise resolve and
+        // import it from the system symbol libraries.
+        let sym_def_owned: String;
+        let mut lib_note = " (lib_symbols already present)";
+        if already_in_lib {
+            let lib_sym_end = pcb_edit::block_end(&content, lib_sym_start);
+            let sym_pos = content[lib_sym_start..lib_sym_end].find(&lib_id_marker).unwrap() + lib_sym_start;
+            let sym_end = pcb_edit::block_end(&content, sym_pos);
+            sym_def_owned = content[sym_pos..sym_end].to_string();
+        } else {
+            let lib_path = match find_symbol_lib_file(lib_file) {
+                Some(p) => p,
+                None => return Ok(CallToolResult::error(vec![Content::text(format!(
+                    "Symbol library '{lib_file}.kicad_sym' not found in any KiCad symbol search path \
+                     (checked ~/.local/share/kicad/{{9.0,8.0,7.0}}/symbols, /usr/share/kicad/symbols, /usr/local/share/kicad/symbols)."
+                ))])),
+            };
+            let lib_content = match std::fs::read_to_string(&lib_path) {
+                Ok(c) => c,
+                Err(e) => return Ok(CallToolResult::error(vec![Content::text(format!(
+                    "Failed to read symbol library {}: {e}", lib_path.display()
+                ))])),
+            };
+            let new_def = match extract_named_lib_symbol(&lib_content, sym_name, &p.lib_id) {
+                Some(d) => d,
+                None => return Ok(CallToolResult::error(vec![Content::text(format!(
+                    "Symbol '{}' not found in {}.", sym_name, lib_path.display()
+                ))])),
+            };
+
+            if count_symbol_units(&new_def) > 1 {
+                return Ok(CallToolResult::error(vec![Content::text(format!(
+                    "'{}' is a multi-unit symbol (e.g. an op-amp or multi-pole relay) — \
+                     add_symbol only supports single-unit parts for now.",
+                    p.lib_id
+                ))]));
+            }
+
+            let insert_after = content[lib_sym_start..].find('\n')
+                .map(|r| lib_sym_start + r + 1)
+                .unwrap_or(lib_sym_start + "(lib_symbols".len());
+            content.insert_str(insert_after, &format!("{new_def}\n"));
+
+            sym_def_owned = new_def;
+            lib_note = " (lib_symbols definition imported)";
+        }
+
+        // 3. Enumerate pins so we emit exactly one (pin "N" (uuid ...)) per
+        // real pin, instead of hardcoding a single pin.
+        let pin_numbers = extract_symbol_pin_numbers(&sym_def_owned);
+        if pin_numbers.is_empty() {
+            return Ok(CallToolResult::error(vec![Content::text(format!(
+                "Symbol '{}' has no pins in its definition — nothing to place.", p.lib_id
+            ))]));
+        }
+
+        // 4. Project name / root path UUID for the instance, same pattern as add_power_symbol.
+        let project_name = path.file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("project")
+            .to_string();
+        let root_uuid = {
+            let mut found = String::from("00000000-0000-0000-0000-000000000000");
+            if let Some(pos) = content.find("(path \"/") {
+                let after = &content[pos + 8..];
+                if let Some(end) = after.find('"') {
+                    found = after[..end].to_string();
+                }
+            }
+            found
+        };
+
+        // 5. Generate UUIDs and build the placed instance.
+        let inst_uuid = pcb_edit::new_tstamp();
+        let rotation = p.rotation.unwrap_or(0.0);
+        let footprint = p.footprint.clone().unwrap_or_default();
+        let pins_sexpr: String = pin_numbers.iter()
+            .map(|n| format!("\t\t(pin \"{n}\" (uuid \"{}\"))\n", pcb_edit::new_tstamp()))
+            .collect();
+
+        let instance_sexpr = format!(
+            "\n\t(symbol\n\
+             \t\t(lib_id \"{lib_id}\")\n\
+             \t\t(at {x} {y} {rot})\n\
+             \t\t(unit 1)\n\
+             \t\t(body_style 1)\n\
+             \t\t(exclude_from_sim no)\n\
+             \t\t(in_bom yes)\n\
+             \t\t(on_board yes)\n\
+             \t\t(in_pos_files yes)\n\
+             \t\t(dnp no)\n\
+             \t\t(fields_autoplaced yes)\n\
+             \t\t(uuid \"{inst_uuid}\")\n\
+             \t\t(property \"Reference\" \"{reference}\"\n\
+             \t\t\t(at {x} {py_ref} 0)\n\
+             \t\t\t(show_name no)\n\
+             \t\t\t(do_not_autoplace no)\n\
+             \t\t\t(effects (font (size 1.27 1.27)))\n\
+             \t\t)\n\
+             \t\t(property \"Value\" \"{value}\"\n\
+             \t\t\t(at {x} {py_val} 0)\n\
+             \t\t\t(show_name no)\n\
+             \t\t\t(do_not_autoplace no)\n\
+             \t\t\t(effects (font (size 1.27 1.27)))\n\
+             \t\t)\n\
+             \t\t(property \"Footprint\" \"{footprint}\"\n\
+             \t\t\t(at {x} {y} 0)\n\
+             \t\t\t(hide yes)\n\
+             \t\t\t(show_name no)\n\
+             \t\t\t(do_not_autoplace no)\n\
+             \t\t\t(effects (font (size 1.27 1.27)))\n\
+             \t\t)\n\
+             \t\t(property \"Datasheet\" \"\"\n\
+             \t\t\t(at {x} {y} 0)\n\
+             \t\t\t(hide yes)\n\
+             \t\t\t(show_name no)\n\
+             \t\t\t(do_not_autoplace no)\n\
+             \t\t\t(effects (font (size 1.27 1.27)))\n\
+             \t\t)\n\
+             {pins}\
+             \t\t(instances\n\
+             \t\t\t(project \"{proj}\"\n\
+             \t\t\t\t(path \"/{root}\"\n\
+             \t\t\t\t\t(reference \"{reference}\")\n\
+             \t\t\t\t\t(unit 1)\n\
+             \t\t\t\t)\n\
+             \t\t\t)\n\
+             \t\t)\n\
+             \t)",
+            lib_id = p.lib_id,
+            x = p.x, y = p.y, rot = rotation,
+            py_ref = p.y + 3.81, py_val = p.y - 3.556,
+            reference = p.reference, value = p.value, footprint = footprint,
+            pins = pins_sexpr,
+            inst_uuid = inst_uuid,
+            proj = project_name, root = root_uuid,
+        );
+
+        if let Some(pos) = content.rfind("\n)") {
+            content.insert_str(pos, &instance_sexpr);
+        } else {
+            return Ok(CallToolResult::error(vec![Content::text(
+                "Could not find end of schematic file.".to_string()
+            )]));
+        }
+
+        if let Err(e) = fs::write(&path, &content).await {
+            return Ok(CallToolResult::error(vec![Content::text(format!("Failed to write: {e}"))]));
+        }
+
+        let mut result = vec![Content::text(format!(
+            "Added symbol '{}' at ({}, {}) rot={}° as {} ({} pin{}){}",
+            p.lib_id, p.x, p.y, rotation, p.reference,
+            pin_numbers.len(), if pin_numbers.len() == 1 { "" } else { "s" },
+            lib_note,
+        ))];
+
+        if let Some(img) = self.render_schematic_png(&p.path, None, false, 2400).await {
+            result.push(img);
+        }
+        Ok(CallToolResult::success(result))
+    }
+
+    /// Delete one or more symbol instances from a schematic by reference
+    /// designator. Only removes the symbol instance block itself — not
+    /// wires/labels that referenced its pins.
+    #[tool(description = "Remove one or more symbol instances from a .kicad_sch schematic by reference designator — pass a list like [\"C1\",\"C3\"] to delete multiple at once. Only deletes the symbol instance block itself, not wires/labels that were connected to its pins — run cleanup_dangling_wires afterward if needed. Writes the file and returns an updated render.")]
+    async fn delete_symbol(
+        &self,
+        params: Parameters<DeleteSymbolParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let p = params.0;
+        let path = PathBuf::from(&p.path);
+        let _guard = self.lock_file(&path).await;
+
+        let content = match fs::read_to_string(&path).await {
+            Ok(c) => c,
+            Err(e) => return Ok(CallToolResult::error(vec![Content::text(format!(
+                "Failed to read {}: {e}", p.path
+            ))])),
+        };
+
+        let blocks = find_symbol_blocks(&content);
+        let mut found = Vec::new();
+        let mut missing = Vec::new();
+        for r in &p.refs {
+            if blocks.contains_key(r.as_str()) {
+                found.push(r.as_str());
+            } else {
+                missing.push(r.as_str());
+            }
+        }
+
+        if found.is_empty() {
+            return Ok(CallToolResult::error(vec![Content::text(format!(
+                "None of the requested refs found: {}", p.refs.join(", ")
+            ))]));
+        }
+
+        let ranges: Vec<std::ops::Range<usize>> = found.iter()
+            .filter_map(|r| blocks.get(*r).cloned())
+            .collect();
+        let new_content = pcb_edit::remove_ranges(&content, ranges, false);
+
+        if let Err(e) = fs::write(&path, &new_content).await {
+            return Ok(CallToolResult::error(vec![Content::text(format!(
+                "Failed to write {}: {e}", p.path
+            ))]));
+        }
+
+        let mut summary = format!("Removed {} symbol(s): {}", found.len(), found.join(", "));
+        if !missing.is_empty() {
+            summary.push_str(&format!("\nNot found (skipped): {}", missing.join(", ")));
+        }
+
+        let mut result = vec![Content::text(summary)];
+        if let Some(img) = self.render_schematic_png(&p.path, None, false, 2400).await {
+            result.push(img);
+        }
+        Ok(CallToolResult::success(result))
+    }
+
+    /// Delete a wire segment from a schematic, matched by endpoint
+    /// coordinates (in either order) or by uuid.
+    #[tool(description = "Delete a wire from a .kicad_sch schematic, matched either by its (x1,y1)-(x2,y2) endpoints (in either order — a wire's stored point order isn't guaranteed to match \"start\"/\"end\") or by uuid (substring match). Removes all matches if duplicate-coordinate wires exist and reports a count. Writes the file and returns an updated render.")]
+    async fn delete_wire(
+        &self,
+        params: Parameters<DeleteWireParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let p = params.0;
+        let path = PathBuf::from(&p.path);
+        let _guard = self.lock_file(&path).await;
+
+        let content = match fs::read_to_string(&path).await {
+            Ok(c) => c,
+            Err(e) => return Ok(CallToolResult::error(vec![Content::text(format!(
+                "Failed to read {}: {e}", p.path
+            ))])),
+        };
+
+        let wires = parse_sch_wires(&content);
+        const EPS: f64 = 1e-3;
+        let close = |a: f64, b: f64| (a - b).abs() < EPS;
+
+        let ranges: Vec<std::ops::Range<usize>> = if let Some(uuid) = &p.uuid {
+            wires.iter()
+                .filter(|w| content[w.range.clone()].contains(&format!("(uuid \"{uuid}")))
+                .map(|w| w.range.clone())
+                .collect()
+        } else {
+            let (x1, y1, x2, y2) = match (p.x1, p.y1, p.x2, p.y2) {
+                (Some(x1), Some(y1), Some(x2), Some(y2)) => (x1, y1, x2, y2),
+                _ => return Ok(CallToolResult::error(vec![Content::text(
+                    "Provide either 'uuid', or all four of x1/y1/x2/y2.".to_string()
+                )])),
+            };
+            wires.iter()
+                .filter(|w| {
+                    (close(w.x1, x1) && close(w.y1, y1) && close(w.x2, x2) && close(w.y2, y2))
+                        || (close(w.x1, x2) && close(w.y1, y2) && close(w.x2, x1) && close(w.y2, y1))
+                })
+                .map(|w| w.range.clone())
+                .collect()
+        };
+
+        if ranges.is_empty() {
+            let criteria = p.uuid.as_ref().map(|u| format!("uuid containing '{u}'"))
+                .unwrap_or_else(|| format!("endpoints ({:?},{:?})-({:?},{:?})", p.x1, p.y1, p.x2, p.y2));
+            return Ok(CallToolResult::error(vec![Content::text(format!(
+                "No wire found matching {criteria} in {}", p.path
+            ))]));
+        }
+
+        let count = ranges.len();
+        let new_content = pcb_edit::remove_ranges(&content, ranges, true);
+
+        if let Err(e) = fs::write(&path, &new_content).await {
+            return Ok(CallToolResult::error(vec![Content::text(format!(
+                "Failed to write {}: {e}", p.path
+            ))]));
+        }
+
+        let mut result = vec![Content::text(format!("Removed {count} wire(s)."))];
+        if let Some(img) = self.render_schematic_png(&p.path, None, false, 2400).await {
+            result.push(img);
+        }
+        Ok(CallToolResult::success(result))
+    }
+
+    /// Delete a local or global label from a schematic, matched by text+position or by uuid.
+    #[tool(description = "Delete a local or global label from a .kicad_sch schematic, matched by exact text+position (x,y) or by uuid (substring match). Writes the file and returns an updated render.")]
+    async fn delete_label(
+        &self,
+        params: Parameters<DeleteLabelParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let p = params.0;
+        let path = PathBuf::from(&p.path);
+        let _guard = self.lock_file(&path).await;
+
+        let content = match fs::read_to_string(&path).await {
+            Ok(c) => c,
+            Err(e) => return Ok(CallToolResult::error(vec![Content::text(format!(
+                "Failed to read {}: {e}", p.path
+            ))])),
+        };
+
+        if p.uuid.is_none() && (p.text.is_none() || p.x.is_none() || p.y.is_none()) {
+            return Ok(CallToolResult::error(vec![Content::text(
+                "Provide either 'uuid', or 'text' with 'x' and 'y'.".to_string()
+            )]));
+        }
+        // Match text as a quoted substring and the (at X Y ...) clause as a
+        // substring anywhere inside the block — NOT requiring them to share a
+        // line, since real KiCad output commonly puts a label's text and its
+        // `(at ...)` clause on separate lines (the modern multi-line form).
+        let escaped_text = p.text.as_ref().map(|t| format!("\"{}\"", t.replace('"', "\\\"")));
+        let at_needle = p.x.zip(p.y).map(|(x, y)| format!("(at {x} {y}"));
+
+        let mut target_range: Option<std::ops::Range<usize>> = None;
+        for kw in &["(label ", "(global_label "] {
+            for_each_top_level(&content, kw, |start, end| {
+                if target_range.is_some() {
+                    return;
+                }
+                let block = &content[start..end];
+                let matches = if let Some(uuid) = &p.uuid {
+                    block.contains(&format!("(uuid \"{uuid}"))
+                } else {
+                    escaped_text.as_deref().is_some_and(|t| block.contains(t))
+                        && at_needle.as_deref().is_some_and(|a| block.contains(a))
+                };
+                if matches {
+                    target_range = Some(start..end);
+                }
+            });
+            if target_range.is_some() {
+                break;
+            }
+        }
+
+        let range = match target_range {
+            Some(r) => r,
+            None => {
+                let criteria = p.uuid.as_ref().map(|u| format!("uuid containing '{u}'"))
+                    .unwrap_or_else(|| format!("text \"{}\" at ({:?}, {:?})", p.text.as_deref().unwrap_or(""), p.x, p.y));
+                return Ok(CallToolResult::error(vec![Content::text(format!(
+                    "No label found matching {criteria} in {}", p.path
+                ))]));
+            }
+        };
+
+        let new_content = pcb_edit::remove_ranges(&content, vec![range], true);
+
+        if let Err(e) = fs::write(&path, &new_content).await {
+            return Ok(CallToolResult::error(vec![Content::text(format!(
+                "Failed to write {}: {e}", p.path
+            ))]));
+        }
+
+        let mut result = vec![Content::text("Removed 1 label.".to_string())];
+        if let Some(img) = self.render_schematic_png(&p.path, None, false, 2400).await {
+            result.push(img);
+        }
+        Ok(CallToolResult::success(result))
+    }
+
+    /// Query schematic net connectivity by delegating to `kicad-cli sch
+    /// export netlist` — deliberately does not hand-trace wires/labels/
+    /// junctions from the raw schematic text (see the MCP tool improvement
+    /// plan's non-goals: that's exactly the error-prone, manual process a
+    /// prior debugging session had to do by hand).
+    #[tool(description = "Query net connectivity in a .kicad_sch schematic via kicad-cli's netlist export. Omit 'reference' to list all nets and their connected pins. Give 'reference' alone to list all nets touching that symbol's pins. Give 'reference' and 'pin' to get the single net name for that exact pin.")]
+    async fn get_schematic_net(
+        &self,
+        params: Parameters<GetSchematicNetParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let p = params.0;
+
+        let out_path = std::env::temp_dir().join(format!(
+            "kicad_schnet_{}.net",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis()
+        ));
+
+        let (_, stderr, code) = run_kicad_cli(&[
+            "sch", "export", "netlist",
+            "--output", out_path.to_str().unwrap_or("/tmp/schnet.net"),
+            "--format", "kicadsexpr",
+            &p.path,
+        ]).await?;
+
+        let netlist_content = match fs::read_to_string(&out_path).await {
+            Ok(c) => {
+                let _ = fs::remove_file(&out_path).await;
+                c
+            }
+            Err(_) => return Ok(CallToolResult::error(vec![Content::text(format!(
+                "kicad-cli netlist export failed (exit {code}):\n{stderr}\n\
+                 A common cause is an unresolvable lib_id mid-edit (e.g. a symbol added via \
+                 patch_kicad_file without updating lib_symbols) — try run_erc first to check \
+                 for that kind of issue."
+            ))])),
+        };
+
+        let nets = parse_netlist_nets(&netlist_content);
+        if nets.is_empty() {
+            return Ok(CallToolResult::error(vec![Content::text(
+                "No nets found in the netlist export — is this schematic fully wired?".to_string()
+            )]));
+        }
+
+        let output = match (&p.reference, &p.pin) {
+            (Some(reference), Some(pin)) => {
+                match nets.iter().find(|n| n.nodes.iter().any(|(r, pn)| r == reference && pn == pin)) {
+                    Some(net) => format!("Pin {pin} of {reference} is on net \"{}\"", net.name),
+                    None => format!("Pin {pin} of {reference} not found in any net (unconnected, or reference/pin doesn't exist)"),
+                }
+            }
+            (Some(reference), None) => {
+                let mut lines = vec![format!("Nets touching {reference}:")];
+                let mut found = false;
+                for net in &nets {
+                    let pins: Vec<&str> = net.nodes.iter()
+                        .filter(|(r, _)| r == reference)
+                        .map(|(_, pn)| pn.as_str())
+                        .collect();
+                    if !pins.is_empty() {
+                        found = true;
+                        lines.push(format!("  \"{}\": pin(s) {}", net.name, pins.join(", ")));
+                    }
+                }
+                if !found {
+                    lines.push(format!("  (none — '{reference}' not found or has no connected pins)"));
+                }
+                lines.join("\n")
+            }
+            (None, _) => {
+                let mut lines = vec!["All nets:".to_string()];
+                for net in &nets {
+                    let nodes: Vec<String> = net.nodes.iter()
+                        .map(|(r, pn)| format!("{r}/{pn}"))
+                        .collect();
+                    lines.push(format!("  \"{}\": {}", net.name, nodes.join(", ")));
+                }
+                lines.join("\n")
+            }
+        };
+
+        Ok(CallToolResult::success(vec![Content::text(output)]))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -6237,6 +6829,184 @@ fn extract_lib_symbol(lib_content: &str, net_name: &str) -> Option<String> {
     Some(indented)
 }
 
+/// Search dirs for general (non-power) KiCad symbol libraries, mirroring
+/// `footprint_library_search_dirs()`'s ordering/convention but for `.kicad_sym`.
+fn symbol_library_search_dirs() -> Vec<std::path::PathBuf> {
+    let mut dirs = Vec::new();
+    if let Ok(home) = std::env::var("HOME") {
+        for ver in &["9.0", "8.0", "7.0"] {
+            dirs.push(PathBuf::from(&home).join(format!(".local/share/kicad/{ver}/symbols")));
+        }
+    }
+    dirs.push(PathBuf::from("/usr/share/kicad/symbols"));
+    dirs.push(PathBuf::from("/usr/local/share/kicad/symbols"));
+    dirs.into_iter().filter(|d| d.is_dir()).collect()
+}
+
+/// Resolve a bare library filename (e.g. "Device") to its `.kicad_sym` path
+/// by searching `symbol_library_search_dirs()` in order.
+fn find_symbol_lib_file(lib_file: &str) -> Option<std::path::PathBuf> {
+    symbol_library_search_dirs()
+        .into_iter()
+        .map(|d| d.join(format!("{lib_file}.kicad_sym")))
+        .find(|p| p.exists())
+}
+
+/// Extract a `(symbol "NAME" ...)` block from a `.kicad_sym` library file by
+/// its bare in-file name (e.g. "C" inside Device.kicad_sym — most libraries,
+/// including this system's installed power.kicad_sym as of KiCad 10.0, store
+/// symbols under their bare name, not a "Library:Name"-prefixed one), and
+/// rewrite the block's header to the full `lib_id` form (e.g. "Device:C"),
+/// matching how KiCad itself writes embedded `lib_symbols` entries.
+fn extract_named_lib_symbol(lib_content: &str, sym_name: &str, lib_id: &str) -> Option<String> {
+    use pcb_edit::block_end;
+    let marker = format!("(symbol \"{sym_name}\"");
+    let pos = lib_content.find(&marker)?;
+    let start = lib_content[..pos].rfind('\n').map(|p| p + 1).unwrap_or(pos);
+    let end = block_end(lib_content, pos);
+    let raw = &lib_content[start..end];
+    let raw = raw.replacen(&marker, &format!("(symbol \"{lib_id}\""), 1);
+    let indented: String = raw.lines()
+        .map(|l| if l.is_empty() { String::new() } else { format!("\t\t{l}") })
+        .collect::<Vec<_>>()
+        .join("\n");
+    Some(indented)
+}
+
+/// Enumerate `(number "N")` pin numbers directly inside an extracted symbol
+/// definition block (same whitespace-agnostic-but-own-line scan used by
+/// `compute_pin_positions_inner`), in source order. Does not currently
+/// distinguish multi-unit sub-blocks — callers should reject multi-unit
+/// symbols before relying on this for placement (see `add_symbol`).
+fn extract_symbol_pin_numbers(sym_def: &str) -> Vec<String> {
+    use pcb_edit::block_end;
+    let mut numbers = Vec::new();
+    let mut pos = 0;
+    while let Some(rel) = sym_def[pos..].find("(pin ") {
+        let pin_start = pos + rel;
+        let line_start = sym_def[..pin_start].rfind('\n').map(|p| p + 1).unwrap_or(0);
+        let prefix = &sym_def[line_start..pin_start];
+        if !prefix.chars().all(|c| c == ' ' || c == '\t') {
+            pos = pin_start + 1;
+            continue;
+        }
+        let end = block_end(sym_def, pin_start);
+        let pin_block = &sym_def[pin_start..end];
+        let number = extract_quoted_after_kw(pin_block, "(number \"");
+        if !number.is_empty() {
+            numbers.push(number);
+        }
+        pos = end;
+    }
+    numbers
+}
+
+/// Count how many distinct *real* unit sub-blocks (`(symbol "NAME_N_M" ...)`
+/// with N != 0) a symbol definition has. KiCad names sub-blocks
+/// "Name_UNIT_STYLE"; unit 0 is shared graphics common to all units, not a
+/// selectable unit itself, so it's excluded — a plain single-unit part (e.g.
+/// "C_0_1" + "C_1_1") must count as 1, not 2. Multi-unit parts (op-amps,
+/// multi-pole relays) have more than one non-zero unit; `add_symbol` v1
+/// doesn't support placing those.
+fn count_symbol_units(sym_def: &str) -> usize {
+    use pcb_edit::block_end;
+    let mut units = std::collections::HashSet::new();
+    let mut pos = 0;
+    while let Some(rel) = sym_def[pos..].find("(symbol \"") {
+        let start = pos + rel;
+        let line_start = sym_def[..start].rfind('\n').map(|p| p + 1).unwrap_or(0);
+        let prefix = &sym_def[line_start..start];
+        if !prefix.chars().all(|c| c == ' ' || c == '\t') {
+            pos = start + 1;
+            continue;
+        }
+        let end = block_end(sym_def, start);
+        // Skip the outer symbol's own header (matched at pos 0 of sym_def) —
+        // only count nested unit sub-blocks.
+        if start > 0 {
+            let name = extract_quoted_after_kw(&sym_def[start..end], "(symbol \"");
+            if let Some(unit_part) = name.rsplit('_').nth(1) {
+                if unit_part != "0" {
+                    units.insert(unit_part.to_string());
+                }
+            }
+        }
+        pos = end;
+    }
+    units.len().max(1)
+}
+
+/// A single net entry parsed from `kicad-cli sch export netlist --format
+/// kicadsexpr` output: its name and every (reference, pin) node on it.
+struct SchNet {
+    name: String,
+    nodes: Vec<(String, String)>,
+}
+
+/// Parse the `(nets (net (code ...) (name "...") (node (ref "...") (pin "...") ...) ...) ...)`
+/// section of a kicad-cli schematic netlist export.
+///
+/// This is read-only parsing of disposable, freshly-generated, well-formed
+/// CLI output (not a live hand-edited file), so unlike the rest of this
+/// file's editing helpers it doesn't need to preserve untouched bytes — a
+/// small purpose-built scanner is enough. Uses the same whitespace-agnostic
+/// "must be on its own line" style as compute_pin_positions_inner rather
+/// than the strict single-indent-level for_each_top_level helper, since this
+/// content sits several indent levels deep inside the full export.
+fn parse_netlist_nets(netlist_content: &str) -> Vec<SchNet> {
+    use pcb_edit::block_end;
+    let mut nets = Vec::new();
+
+    let nets_start = match netlist_content.find("(nets") {
+        Some(p) => p,
+        None => return nets,
+    };
+    let nets_end = block_end(netlist_content, nets_start);
+    let section = &netlist_content[nets_start..nets_end];
+
+    let mut pos = 0;
+    while let Some(rel) = section[pos..].find("(net") {
+        let start = pos + rel;
+        // Require "(net" to be followed by whitespace, not more letters —
+        // this is what distinguishes a real `(net ...)` entry from the
+        // section's own `(nets ...)` header (`(net` + `s`, no whitespace).
+        if !section[start + 4..].starts_with(|c: char| c.is_whitespace()) {
+            pos = start + 1;
+            continue;
+        }
+        // Must be on its own line (whitespace-only prefix).
+        let line_start = section[..start].rfind('\n').map(|p| p + 1).unwrap_or(0);
+        if !section[line_start..start].chars().all(|c| c == ' ' || c == '\t') {
+            pos = start + 1;
+            continue;
+        }
+
+        let end = block_end(section, start);
+        let block = &section[start..end];
+        let name = extract_quoted_after_kw(block, "(name \"");
+
+        let mut node_pos = 0;
+        let mut node_nets = Vec::new();
+        while let Some(nrel) = block[node_pos..].find("(node") {
+            let nstart = node_pos + nrel;
+            let nend = block_end(block, nstart);
+            let node_block = &block[nstart..nend];
+            let r = extract_quoted_after_kw(node_block, "(ref \"");
+            let pin = extract_quoted_after_kw(node_block, "(pin \"");
+            if !r.is_empty() && !pin.is_empty() {
+                node_nets.push((r, pin));
+            }
+            node_pos = nend;
+        }
+
+        if !name.is_empty() {
+            nets.push(SchNet { name, nodes: node_nets });
+        }
+        pos = end;
+    }
+    nets
+}
+
 // ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
@@ -6358,6 +7128,28 @@ mod tests {
     }
 
     #[test]
+    fn sch_replace_at_always_emits_three_value_form_even_at_zero_rotation() {
+        // Regression test: this used to special-case ~0 rotation into a
+        // 2-value `(at x y)` (matching pcb_edit::fmt_at's valid convention for
+        // PCB footprints), but schematic symbol instances require the
+        // 3-value form even at 0° — kicad-cli's schematic loader rejects the
+        // 2-value form outright, which corrupted a real project file into
+        // being unloadable via a move_symbol call landing on 0° rotation.
+        let content = sample_schematic();
+        let range = find_sch_symbol_by_ref(&content, "PWR1").expect("block not found");
+        let block = &content[range];
+        let new_block = sch_replace_at(block, 100.0, 50.0, Some(0.0));
+        assert!(
+            new_block.contains("(at 100 50 0)"),
+            "expected explicit 3-value at-clause with rotation 0, got: {new_block}"
+        );
+        assert!(
+            !new_block.contains("(at 100 50)"),
+            "must not emit the 2-value form for a schematic symbol instance: {new_block}"
+        );
+    }
+
+    #[test]
     fn compute_pin_positions_works_on_multiline_tab_indented_instance() {
         let content = sample_schematic();
         let pins = compute_pin_positions(&content, "PWR1");
@@ -6365,6 +7157,770 @@ mod tests {
             !pins.is_empty(),
             "expected at least one pin position for PWR1 in a tab-indented, multi-line schematic"
         );
+    }
+
+    /// A schematic with one 4-pin symbol placed twice: once rotated 90° with no
+    /// mirror (U1), once unrotated with `(mirror x)` (U2). Pin local offsets are
+    /// deliberately asymmetric (px != py) so a missing Y-flip or wrong mirror
+    /// axis produces a detectably different result, not a coincidental match.
+    fn sample_schematic_rotated_and_mirrored() -> String {
+        "\
+(kicad_sch
+\t(version 20231120)
+\t(lib_symbols
+\t\t(symbol \"TestLib:Multi\"
+\t\t\t(pin_names
+\t\t\t\t(offset 1.016)
+\t\t\t)
+\t\t\t(symbol \"Multi_1_1\"
+\t\t\t\t(pin passive line
+\t\t\t\t\t(at 5 0 0)
+\t\t\t\t\t(length 2.54)
+\t\t\t\t\t(name \"P1\")
+\t\t\t\t\t(number \"1\")
+\t\t\t\t)
+\t\t\t\t(pin passive line
+\t\t\t\t\t(at 0 5 90)
+\t\t\t\t\t(length 2.54)
+\t\t\t\t\t(name \"P2\")
+\t\t\t\t\t(number \"2\")
+\t\t\t\t)
+\t\t\t\t(pin passive line
+\t\t\t\t\t(at -5 0 180)
+\t\t\t\t\t(length 2.54)
+\t\t\t\t\t(name \"P3\")
+\t\t\t\t\t(number \"3\")
+\t\t\t\t)
+\t\t\t\t(pin passive line
+\t\t\t\t\t(at 0 -5 270)
+\t\t\t\t\t(length 2.54)
+\t\t\t\t\t(name \"P4\")
+\t\t\t\t\t(number \"4\")
+\t\t\t\t)
+\t\t\t)
+\t\t)
+\t)
+\t(symbol
+\t\t(lib_id \"TestLib:Multi\")
+\t\t(at 100 50 90)
+\t\t(unit 1)
+\t\t(property \"Reference\" \"U1\"
+\t\t\t(at 100 45 0)
+\t\t)
+\t\t(property \"Value\" \"Multi\"
+\t\t\t(at 100 55 0)
+\t\t)
+\t\t(instances
+\t\t\t(project \"test\"
+\t\t\t\t(path \"/abc\"
+\t\t\t\t\t(reference \"U1\")
+\t\t\t\t\t(unit 1)
+\t\t\t\t)
+\t\t\t)
+\t\t)
+\t)
+\t(symbol
+\t\t(lib_id \"TestLib:Multi\")
+\t\t(at 100 50 0)
+\t\t(mirror x)
+\t\t(unit 1)
+\t\t(property \"Reference\" \"U2\"
+\t\t\t(at 100 45 0)
+\t\t)
+\t\t(property \"Value\" \"Multi\"
+\t\t\t(at 100 55 0)
+\t\t)
+\t\t(instances
+\t\t\t(project \"test\"
+\t\t\t\t(path \"/abc\"
+\t\t\t\t\t(reference \"U2\")
+\t\t\t\t\t(unit 1)
+\t\t\t\t)
+\t\t\t)
+\t\t)
+\t)
+)
+".to_string()
+    }
+
+    /// Regression test: with the pre-fix formula (`canvas = inst + rotate(px, py)`,
+    /// no Y-flip), pin 1 of U1 (rotated 90°, local (5,0)) would compute to
+    /// (100, 55) — which is actually P2's correct position, not P1's. The
+    /// corrected Y-up->Y-down flip must be applied before rotation.
+    #[test]
+    fn compute_pin_positions_applies_y_flip_for_rotated_unmirrored_instance() {
+        let content = sample_schematic_rotated_and_mirrored();
+        let pins = compute_pin_positions(&content, "U1");
+        let by_num: std::collections::HashMap<_, _> =
+            pins.iter().map(|(n, _, x, y)| (n.as_str(), (*x, *y))).collect();
+
+        let assert_close = |num: &str, expected: (f64, f64)| {
+            let (x, y) = by_num[num];
+            assert!(
+                (x - expected.0).abs() < 1e-6 && (y - expected.1).abs() < 1e-6,
+                "pin {num}: got ({x}, {y}), expected {expected:?}"
+            );
+        };
+        assert_close("1", (100.0, 55.0));
+        assert_close("2", (105.0, 50.0));
+        assert_close("3", (100.0, 45.0));
+        assert_close("4", (95.0, 50.0));
+    }
+
+    /// Regression test for the `(mirror x)` case: verified against a real
+    /// KiCad-authored mirrored instance (a Conn_02x02_Odd_Even connector) —
+    /// mirror x re-negates the already-flipped Y, so for a 0°-rotation mirror-x
+    /// instance the net effect on Y cancels out relative to the unmirrored case.
+    #[test]
+    fn compute_pin_positions_applies_mirror_x_correctly() {
+        let content = sample_schematic_rotated_and_mirrored();
+        let pins = compute_pin_positions(&content, "U2");
+        let by_num: std::collections::HashMap<_, _> =
+            pins.iter().map(|(n, _, x, y)| (n.as_str(), (*x, *y))).collect();
+
+        let assert_close = |num: &str, expected: (f64, f64)| {
+            let (x, y) = by_num[num];
+            assert!(
+                (x - expected.0).abs() < 1e-6 && (y - expected.1).abs() < 1e-6,
+                "pin {num}: got ({x}, {y}), expected {expected:?}"
+            );
+        };
+        assert_close("1", (105.0, 50.0));
+        assert_close("2", (100.0, 55.0));
+        assert_close("3", (95.0, 50.0));
+        assert_close("4", (100.0, 45.0));
+    }
+
+    #[tokio::test]
+    async fn get_pin_position_tool_call_matches_hand_computed_coordinates() {
+        let dir = std::env::temp_dir().join(format!("kicad2print_test_pinpos_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file_path = dir.join("pinpos_test.kicad_sch");
+        std::fs::write(&file_path, sample_schematic_rotated_and_mirrored()).unwrap();
+
+        let server = KiCadServer::new();
+        let params = Parameters(GetPinPositionParams {
+            path: file_path.to_str().unwrap().to_string(),
+            reference: "U1".to_string(),
+            pin: Some("2".to_string()),
+        });
+        let result = server.get_pin_position(params).await.expect("call failed");
+        let text = result.content.iter()
+            .filter_map(|c| c.as_text().map(|t| t.text.clone()))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(!result.is_error.unwrap_or(false), "get_pin_position returned an error: {text}");
+        assert!(text.contains("(105.0000, 50.0000)"), "expected pin 2 of U1 at (105, 50): {text}");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A minimal schematic with a 2-pin "TestLib:R"-style symbol already
+    /// embedded in lib_symbols (no placed instance yet) — for testing
+    /// add_symbol's "already embedded, just reuse it" path.
+    fn sample_schematic_with_embedded_resistor() -> String {
+        "\
+(kicad_sch
+\t(version 20231120)
+\t(lib_symbols
+\t\t(symbol \"TestLib:R\"
+\t\t\t(pin_names
+\t\t\t\t(offset 0)
+\t\t\t)
+\t\t\t(symbol \"R_0_1\"
+\t\t\t\t(rectangle
+\t\t\t\t\t(start -1.016 -2.54) (end 1.016 2.54)
+\t\t\t\t)
+\t\t\t)
+\t\t\t(symbol \"R_1_1\"
+\t\t\t\t(pin passive line
+\t\t\t\t\t(at 0 3.81 270)
+\t\t\t\t\t(length 1.27)
+\t\t\t\t\t(name \"~\")
+\t\t\t\t\t(number \"1\")
+\t\t\t\t)
+\t\t\t\t(pin passive line
+\t\t\t\t\t(at 0 -3.81 90)
+\t\t\t\t\t(length 1.27)
+\t\t\t\t\t(name \"~\")
+\t\t\t\t\t(number \"2\")
+\t\t\t\t)
+\t\t\t)
+\t\t)
+\t)
+\t(symbol
+\t\t(lib_id \"TestLib:R\")
+\t\t(at 50 50 0)
+\t\t(unit 1)
+\t\t(property \"Reference\" \"R1\"
+\t\t\t(at 50 45 0)
+\t\t)
+\t\t(property \"Value\" \"10k\"
+\t\t\t(at 50 55 0)
+\t\t)
+\t\t(instances
+\t\t\t(project \"test\"
+\t\t\t\t(path \"/abc\"
+\t\t\t\t\t(reference \"R1\")
+\t\t\t\t\t(unit 1)
+\t\t\t\t)
+\t\t\t)
+\t\t)
+\t)
+)
+".to_string()
+    }
+
+    async fn write_test_sch(name: &str, content: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("kicad2print_test_{}_{}", name, std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file_path = dir.join(format!("{name}.kicad_sch"));
+        std::fs::write(&file_path, content).unwrap();
+        file_path
+    }
+
+    #[tokio::test]
+    async fn add_symbol_reuses_already_embedded_definition() {
+        let file_path = write_test_sch("add_symbol_reuse", &sample_schematic_with_embedded_resistor()).await;
+        let server = KiCadServer::new();
+        let result = server.add_symbol(Parameters(AddSymbolParams {
+            path: file_path.to_str().unwrap().to_string(),
+            lib_id: "TestLib:R".to_string(),
+            reference: "R2".to_string(),
+            value: "4.7k".to_string(),
+            x: 80.0, y: 50.0,
+            rotation: None,
+            footprint: None,
+        })).await.expect("call failed");
+        let text = result.content.iter()
+            .filter_map(|c| c.as_text().map(|t| t.text.clone()))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!result.is_error.unwrap_or(false), "add_symbol returned an error: {text}");
+        assert!(text.contains("already present"), "expected reuse-path note in output: {text}");
+
+        let written = std::fs::read_to_string(&file_path).unwrap();
+        assert_eq!(
+            written.matches("(symbol \"TestLib:R\"").count(), 1,
+            "expected exactly one lib_symbols definition of TestLib:R (no duplicate import), got file:\n{written}"
+        );
+        assert!(written.contains("\"R2\""), "expected new R2 instance in file");
+        assert!(written.contains("\"R1\""), "expected original R1 instance to survive");
+
+        std::fs::remove_dir_all(file_path.parent().unwrap()).ok();
+    }
+
+    #[tokio::test]
+    async fn add_symbol_rejects_duplicate_reference() {
+        let file_path = write_test_sch("add_symbol_dup_ref", &sample_schematic_with_embedded_resistor()).await;
+        let server = KiCadServer::new();
+        let result = server.add_symbol(Parameters(AddSymbolParams {
+            path: file_path.to_str().unwrap().to_string(),
+            lib_id: "TestLib:R".to_string(),
+            reference: "R1".to_string(), // already used in the fixture
+            value: "4.7k".to_string(),
+            x: 80.0, y: 50.0,
+            rotation: None,
+            footprint: None,
+        })).await.expect("call failed");
+        assert!(result.is_error.unwrap_or(false), "expected an error for a duplicate reference");
+
+        std::fs::remove_dir_all(file_path.parent().unwrap()).ok();
+    }
+
+    #[tokio::test]
+    async fn add_symbol_generates_distinct_uuids_for_all_pins() {
+        let file_path = write_test_sch("add_symbol_uuids", &sample_schematic_with_embedded_resistor()).await;
+        let server = KiCadServer::new();
+        server.add_symbol(Parameters(AddSymbolParams {
+            path: file_path.to_str().unwrap().to_string(),
+            lib_id: "TestLib:R".to_string(),
+            reference: "R2".to_string(),
+            value: "4.7k".to_string(),
+            x: 80.0, y: 50.0,
+            rotation: None,
+            footprint: None,
+        })).await.expect("call failed");
+
+        let written = std::fs::read_to_string(&file_path).unwrap();
+        // Extract the R2 instance block and collect every uuid inside it.
+        let r2_pos = written.find("\"R2\"").expect("R2 instance not found");
+        let block_start = written[..r2_pos].rfind("\n\t(symbol").unwrap();
+        let block = &written[block_start..];
+        let block_end = block.find("\n\t)\n").map(|e| e + 4).unwrap_or(block.len());
+        let block = &block[..block_end];
+
+        let uuids: Vec<&str> = block.match_indices("(uuid \"").map(|(i, _)| {
+            let after = &block[i + 7..];
+            &after[..after.find('"').unwrap()]
+        }).collect();
+        assert!(uuids.len() >= 3, "expected at least 3 UUIDs (instance + 2 pins) in R2's block, found {}: {block}", uuids.len());
+        let unique: std::collections::HashSet<&&str> = uuids.iter().collect();
+        assert_eq!(unique.len(), uuids.len(), "expected all UUIDs in R2's instance block to be distinct, got: {uuids:?}");
+
+        std::fs::remove_dir_all(file_path.parent().unwrap()).ok();
+    }
+
+    #[tokio::test]
+    async fn add_symbol_imports_from_real_device_library_if_present() {
+        // Integration test against the real system-installed Device.kicad_sym.
+        // Skips gracefully if this machine doesn't have it (e.g. CI without KiCad).
+        if !std::path::Path::new("/usr/share/kicad/symbols/Device.kicad_sym").exists() {
+            eprintln!("skipping: /usr/share/kicad/symbols/Device.kicad_sym not present on this machine");
+            return;
+        }
+        let file_path = write_test_sch("add_symbol_real_lib", &sample_schematic()).await;
+        let server = KiCadServer::new();
+        let result = server.add_symbol(Parameters(AddSymbolParams {
+            path: file_path.to_str().unwrap().to_string(),
+            lib_id: "Device:C".to_string(),
+            reference: "C1".to_string(),
+            value: "100nF".to_string(),
+            x: 120.0, y: 60.0,
+            rotation: None,
+            footprint: Some("Capacitor_SMD:C_0603_1608Metric".to_string()),
+        })).await.expect("call failed");
+        let text = result.content.iter()
+            .filter_map(|c| c.as_text().map(|t| t.text.clone()))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!result.is_error.unwrap_or(false), "add_symbol returned an error importing Device:C: {text}");
+        assert!(text.contains("imported"), "expected import-path note in output: {text}");
+
+        let written = std::fs::read_to_string(&file_path).unwrap();
+        assert!(written.contains("(symbol \"Device:C\""), "expected Device:C embedded in lib_symbols");
+        assert!(written.contains("\"C1\""), "expected new C1 instance in file");
+
+        std::fs::remove_dir_all(file_path.parent().unwrap()).ok();
+    }
+
+    #[tokio::test]
+    async fn add_symbol_then_get_pin_position_matches_hand_computed_coordinates() {
+        // Ties Priority 0 (get_pin_position's Y-flip fix) and Priority 1
+        // (add_symbol) together: place a symbol at a non-zero rotation via
+        // add_symbol, then confirm get_pin_position reports correct coordinates
+        // for it.
+        let file_path = write_test_sch("add_symbol_then_pinpos", &sample_schematic_with_embedded_resistor()).await;
+        let server = KiCadServer::new();
+        server.add_symbol(Parameters(AddSymbolParams {
+            path: file_path.to_str().unwrap().to_string(),
+            lib_id: "TestLib:R".to_string(),
+            reference: "R2".to_string(),
+            value: "4.7k".to_string(),
+            x: 100.0, y: 50.0,
+            rotation: Some(90.0),
+            footprint: None,
+        })).await.expect("add_symbol call failed");
+
+        // R2's pin 1 is at local (0, 3.81). With the corrected Y-flip formula
+        // at 90° rotation: lx=0, ly=-3.81, canvas=(100+3.81, 50)=(103.81, 50).
+        let result = server.get_pin_position(Parameters(GetPinPositionParams {
+            path: file_path.to_str().unwrap().to_string(),
+            reference: "R2".to_string(),
+            pin: Some("1".to_string()),
+        })).await.expect("get_pin_position call failed");
+        let text = result.content.iter()
+            .filter_map(|c| c.as_text().map(|t| t.text.clone()))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!result.is_error.unwrap_or(false), "get_pin_position returned an error: {text}");
+        assert!(text.contains("(103.8100, 50.0000)"), "expected R2 pin 1 at (103.81, 50): {text}");
+
+        std::fs::remove_dir_all(file_path.parent().unwrap()).ok();
+    }
+
+    #[tokio::test]
+    async fn delete_symbol_by_ref_removes_only_matching_instance() {
+        let file_path = write_test_sch("delete_symbol", &sample_schematic_with_embedded_resistor()).await;
+        let server = KiCadServer::new();
+        server.add_symbol(Parameters(AddSymbolParams {
+            path: file_path.to_str().unwrap().to_string(),
+            lib_id: "TestLib:R".to_string(),
+            reference: "R2".to_string(),
+            value: "4.7k".to_string(),
+            x: 80.0, y: 50.0,
+            rotation: None,
+            footprint: None,
+        })).await.expect("add_symbol call failed");
+
+        let result = server.delete_symbol(Parameters(DeleteSymbolParams {
+            path: file_path.to_str().unwrap().to_string(),
+            refs: vec!["R1".to_string()],
+        })).await.expect("delete_symbol call failed");
+        assert!(!result.is_error.unwrap_or(false));
+
+        let written = std::fs::read_to_string(&file_path).unwrap();
+        assert!(!written.contains("\"R1\""), "expected R1 instance to be removed: {written}");
+        assert!(written.contains("\"R2\""), "expected R2 instance to survive: {written}");
+
+        std::fs::remove_dir_all(file_path.parent().unwrap()).ok();
+    }
+
+    #[tokio::test]
+    async fn delete_symbol_missing_ref_returns_error_without_modifying_file() {
+        let file_path = write_test_sch("delete_symbol_missing", &sample_schematic_with_embedded_resistor()).await;
+        let before = std::fs::read_to_string(&file_path).unwrap();
+        let server = KiCadServer::new();
+        let result = server.delete_symbol(Parameters(DeleteSymbolParams {
+            path: file_path.to_str().unwrap().to_string(),
+            refs: vec!["DOES_NOT_EXIST".to_string()],
+        })).await.expect("delete_symbol call failed");
+        assert!(result.is_error.unwrap_or(false), "expected an error when no requested ref exists");
+
+        let after = std::fs::read_to_string(&file_path).unwrap();
+        assert_eq!(before, after, "file must be unmodified when nothing was deleted");
+
+        std::fs::remove_dir_all(file_path.parent().unwrap()).ok();
+    }
+
+    #[tokio::test]
+    async fn delete_wire_by_coordinates_matches_either_endpoint_order() {
+        // sample_schematic() has one wire: (xy 72.39 53.34) (xy 74.93 53.34).
+        // Request deletion with the endpoints reversed — must still match.
+        let file_path = write_test_sch("delete_wire_reversed", &sample_schematic()).await;
+        let server = KiCadServer::new();
+        let result = server.delete_wire(Parameters(DeleteWireParams {
+            path: file_path.to_str().unwrap().to_string(),
+            x1: Some(74.93), y1: Some(53.34),
+            x2: Some(72.39), y2: Some(53.34),
+            uuid: None,
+        })).await.expect("delete_wire call failed");
+        let text = result.content.iter()
+            .filter_map(|c| c.as_text().map(|t| t.text.clone()))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!result.is_error.unwrap_or(false), "delete_wire returned an error: {text}");
+
+        let written = std::fs::read_to_string(&file_path).unwrap();
+        assert!(!written.contains("72.39 53.34"), "expected the wire to be removed: {written}");
+
+        std::fs::remove_dir_all(file_path.parent().unwrap()).ok();
+    }
+
+    /// Two wires sharing identical endpoints (e.g. after a copy/paste error) —
+    /// uuid-based deletion must remove only the targeted one.
+    fn sample_schematic_with_duplicate_coordinate_wires() -> String {
+        "\
+(kicad_sch
+\t(version 20231120)
+\t(lib_symbols
+\t)
+\t(wire
+\t\t(pts
+\t\t\t(xy 10 10) (xy 20 10)
+\t\t)
+\t\t(stroke
+\t\t\t(width 0)
+\t\t\t(type default)
+\t\t)
+\t\t(uuid \"aaaaaaaa-0000-0000-0000-000000000001\")
+\t)
+\t(wire
+\t\t(pts
+\t\t\t(xy 10 10) (xy 20 10)
+\t\t)
+\t\t(stroke
+\t\t\t(width 0)
+\t\t\t(type default)
+\t\t)
+\t\t(uuid \"bbbbbbbb-0000-0000-0000-000000000002\")
+\t)
+)
+".to_string()
+    }
+
+    #[tokio::test]
+    async fn delete_wire_by_uuid_removes_correct_wire_when_duplicate_coordinates_exist() {
+        let file_path = write_test_sch("delete_wire_dup_coords", &sample_schematic_with_duplicate_coordinate_wires()).await;
+        let server = KiCadServer::new();
+        let result = server.delete_wire(Parameters(DeleteWireParams {
+            path: file_path.to_str().unwrap().to_string(),
+            x1: None, y1: None, x2: None, y2: None,
+            uuid: Some("aaaaaaaa".to_string()),
+        })).await.expect("delete_wire call failed");
+        assert!(!result.is_error.unwrap_or(false));
+
+        let written = std::fs::read_to_string(&file_path).unwrap();
+        assert!(!written.contains("aaaaaaaa-0000"), "expected the targeted wire to be removed");
+        assert!(written.contains("bbbbbbbb-0000"), "expected the other duplicate-coordinate wire to survive");
+        assert_eq!(written.matches("(wire").count(), 1, "expected exactly one wire left: {written}");
+
+        std::fs::remove_dir_all(file_path.parent().unwrap()).ok();
+    }
+
+    #[tokio::test]
+    async fn delete_wire_no_match_returns_error() {
+        let file_path = write_test_sch("delete_wire_no_match", &sample_schematic()).await;
+        let server = KiCadServer::new();
+        let result = server.delete_wire(Parameters(DeleteWireParams {
+            path: file_path.to_str().unwrap().to_string(),
+            x1: Some(0.0), y1: Some(0.0), x2: Some(1.0), y2: Some(1.0),
+            uuid: None,
+        })).await.expect("delete_wire call failed");
+        assert!(result.is_error.unwrap_or(false), "expected an error when no wire matches");
+
+        std::fs::remove_dir_all(file_path.parent().unwrap()).ok();
+    }
+
+    /// A schematic with one local label and one global label, both at
+    /// distinct positions — for testing delete_label removes exactly the
+    /// targeted one regardless of local/global form.
+    fn sample_schematic_with_labels() -> String {
+        "\
+(kicad_sch
+\t(version 20231120)
+\t(lib_symbols
+\t)
+\t(label \"LOCAL_NET\"
+\t\t(at 30 30 0)
+\t\t(effects
+\t\t\t(font
+\t\t\t\t(size 1.27 1.27)
+\t\t\t)
+\t\t)
+\t\t(uuid \"cccccccc-0000-0000-0000-000000000001\")
+\t)
+\t(global_label \"GLOBAL_NET\"
+\t\t(shape input)
+\t\t(at 60 60 0)
+\t\t(effects
+\t\t\t(font
+\t\t\t\t(size 1.27 1.27)
+\t\t\t)
+\t\t)
+\t\t(uuid \"dddddddd-0000-0000-0000-000000000002\")
+\t)
+)
+".to_string()
+    }
+
+    #[tokio::test]
+    async fn delete_label_removes_local_and_global_forms() {
+        let file_path = write_test_sch("delete_label", &sample_schematic_with_labels()).await;
+        let server = KiCadServer::new();
+
+        let result = server.delete_label(Parameters(DeleteLabelParams {
+            path: file_path.to_str().unwrap().to_string(),
+            text: Some("LOCAL_NET".to_string()),
+            x: Some(30.0), y: Some(30.0),
+            uuid: None,
+        })).await.expect("delete_label call failed (local)");
+        assert!(!result.is_error.unwrap_or(false));
+
+        let after_local = std::fs::read_to_string(&file_path).unwrap();
+        assert!(!after_local.contains("LOCAL_NET"), "expected local label removed: {after_local}");
+        assert!(after_local.contains("GLOBAL_NET"), "expected global label to survive the local deletion");
+        assert!(!after_local.contains("\t\t(global_label"), "expected no orphaned double-indent before the surviving global label: {after_local}");
+
+        let result = server.delete_label(Parameters(DeleteLabelParams {
+            path: file_path.to_str().unwrap().to_string(),
+            text: Some("GLOBAL_NET".to_string()),
+            x: Some(60.0), y: Some(60.0),
+            uuid: None,
+        })).await.expect("delete_label call failed (global)");
+        assert!(!result.is_error.unwrap_or(false));
+
+        let after_global = std::fs::read_to_string(&file_path).unwrap();
+        assert!(!after_global.contains("GLOBAL_NET"), "expected global label removed: {after_global}");
+
+        std::fs::remove_dir_all(file_path.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn parse_netlist_nets_extracts_names_and_nodes_from_hand_authored_netlist() {
+        // A small hand-authored netlist S-expression matching real
+        // `kicad-cli sch export netlist --format kicadsexpr` output shape —
+        // no kicad-cli dependency needed for this parsing-logic test.
+        let netlist = "\
+(export
+\t(version \"E\")
+\t(design
+\t\t(source \"/tmp/x.kicad_sch\")
+\t)
+\t(components
+\t)
+\t(nets
+\t\t(net
+\t\t\t(code \"1\")
+\t\t\t(name \"CLK\")
+\t\t\t(class \"Default\")
+\t\t\t(node
+\t\t\t\t(ref \"MOUSE1\")
+\t\t\t\t(pin \"5\")
+\t\t\t\t(pintype \"passive\")
+\t\t\t)
+\t\t\t(node
+\t\t\t\t(ref \"U1\")
+\t\t\t\t(pin \"5\")
+\t\t\t\t(pinfunction \"D2_5\")
+\t\t\t\t(pintype \"bidirectional\")
+\t\t\t)
+\t\t)
+\t\t(net
+\t\t\t(code \"2\")
+\t\t\t(name \"unconnected-(R1-Pad2)\")
+\t\t\t(class \"Default\")
+\t\t\t(node
+\t\t\t\t(ref \"R1\")
+\t\t\t\t(pin \"2\")
+\t\t\t\t(pintype \"passive\")
+\t\t\t)
+\t\t)
+\t)
+)
+".to_string();
+
+        let nets = parse_netlist_nets(&netlist);
+        assert_eq!(nets.len(), 2, "expected exactly 2 nets, got: {}", nets.iter().map(|n| n.name.as_str()).collect::<Vec<_>>().join(", "));
+
+        let clk = nets.iter().find(|n| n.name == "CLK").expect("CLK net not found");
+        assert_eq!(clk.nodes.len(), 2);
+        assert!(clk.nodes.contains(&("MOUSE1".to_string(), "5".to_string())));
+        assert!(clk.nodes.contains(&("U1".to_string(), "5".to_string())));
+
+        let unconn = nets.iter().find(|n| n.name == "unconnected-(R1-Pad2)").expect("unconnected net not found");
+        assert_eq!(unconn.nodes, vec![("R1".to_string(), "2".to_string())]);
+    }
+
+    /// Two resistors joined by a wire between R1 pin 1 and R2 pin 1 — for
+    /// testing get_schematic_net's real kicad-cli-backed path end to end.
+    fn sample_schematic_with_two_connected_resistors() -> String {
+        "\
+(kicad_sch
+\t(version 20231120)
+\t(generator \"eeschema\")
+\t(generator_version \"10.0\")
+\t(uuid \"11111111-1111-1111-1111-111111111111\")
+\t(paper \"A4\")
+\t(lib_symbols
+\t\t(symbol \"TestLib:R\"
+\t\t\t(pin_names
+\t\t\t\t(offset 0)
+\t\t\t)
+\t\t\t(symbol \"R_0_1\"
+\t\t\t\t(rectangle
+\t\t\t\t\t(start -1.016 -2.54) (end 1.016 2.54)
+\t\t\t\t)
+\t\t\t)
+\t\t\t(symbol \"R_1_1\"
+\t\t\t\t(pin passive line
+\t\t\t\t\t(at 0 3.81 270)
+\t\t\t\t\t(length 1.27)
+\t\t\t\t\t(name \"~\")
+\t\t\t\t\t(number \"1\")
+\t\t\t\t)
+\t\t\t\t(pin passive line
+\t\t\t\t\t(at 0 -3.81 90)
+\t\t\t\t\t(length 1.27)
+\t\t\t\t\t(name \"~\")
+\t\t\t\t\t(number \"2\")
+\t\t\t\t)
+\t\t\t)
+\t\t)
+\t)
+\t(wire
+\t\t(pts
+\t\t\t(xy 50 46.19) (xy 70 46.19)
+\t\t)
+\t\t(stroke
+\t\t\t(width 0)
+\t\t\t(type default)
+\t\t)
+\t\t(uuid \"22222222-2222-2222-2222-222222222222\")
+\t)
+\t(symbol
+\t\t(lib_id \"TestLib:R\")
+\t\t(at 50 50 0)
+\t\t(unit 1)
+\t\t(property \"Reference\" \"R1\"
+\t\t\t(at 50 45 0)
+\t\t)
+\t\t(property \"Value\" \"10k\"
+\t\t\t(at 50 55 0)
+\t\t)
+\t\t(instances
+\t\t\t(project \"test\"
+\t\t\t\t(path \"/11111111-1111-1111-1111-111111111111\"
+\t\t\t\t\t(reference \"R1\")
+\t\t\t\t\t(unit 1)
+\t\t\t\t)
+\t\t\t)
+\t\t)
+\t)
+\t(symbol
+\t\t(lib_id \"TestLib:R\")
+\t\t(at 70 50 0)
+\t\t(unit 1)
+\t\t(property \"Reference\" \"R2\"
+\t\t\t(at 70 45 0)
+\t\t)
+\t\t(property \"Value\" \"10k\"
+\t\t\t(at 70 55 0)
+\t\t)
+\t\t(instances
+\t\t\t(project \"test\"
+\t\t\t\t(path \"/11111111-1111-1111-1111-111111111111\"
+\t\t\t\t\t(reference \"R2\")
+\t\t\t\t\t(unit 1)
+\t\t\t\t)
+\t\t\t)
+\t\t)
+\t)
+\t(sheet_instances
+\t\t(path \"/\"
+\t\t\t(page \"1\")
+\t\t)
+\t)
+)
+".to_string()
+    }
+
+    #[tokio::test]
+    async fn get_schematic_net_reports_shared_net_for_wired_pins() {
+        if std::process::Command::new("kicad-cli").arg("--version").output().is_err() {
+            eprintln!("skipping: kicad-cli not found on this machine");
+            return;
+        }
+        let file_path = write_test_sch("schnet_wired", &sample_schematic_with_two_connected_resistors()).await;
+        let server = KiCadServer::new();
+
+        let result = server.get_schematic_net(Parameters(GetSchematicNetParams {
+            path: file_path.to_str().unwrap().to_string(),
+            reference: Some("R1".to_string()),
+            pin: Some("1".to_string()),
+        })).await.expect("get_schematic_net call failed");
+        let text = result.content.iter()
+            .filter_map(|c| c.as_text().map(|t| t.text.clone()))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!result.is_error.unwrap_or(false), "get_schematic_net returned an error: {text}");
+
+        // R1 pin 1 and R2 pin 1 are joined by the wire, so they must share a net.
+        let result2 = server.get_schematic_net(Parameters(GetSchematicNetParams {
+            path: file_path.to_str().unwrap().to_string(),
+            reference: Some("R2".to_string()),
+            pin: Some("1".to_string()),
+        })).await.expect("get_schematic_net call failed (R2)");
+        let text2 = result2.content.iter()
+            .filter_map(|c| c.as_text().map(|t| t.text.clone()))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!result2.is_error.unwrap_or(false), "get_schematic_net returned an error: {text2}");
+
+        // Extract the reported net name from each ("... is on net \"NAME\"") and
+        // confirm they match — proving both pins landed on the same net.
+        let extract_net = |t: &str| -> String {
+            let start = t.find("net \"").map(|p| p + 5).unwrap_or(0);
+            let rest = &t[start..];
+            rest[..rest.find('"').unwrap_or(0)].to_string()
+        };
+        let net1 = extract_net(&text);
+        let net2 = extract_net(&text2);
+        assert!(!net1.is_empty(), "expected a net name in output: {text}");
+        assert_eq!(net1, net2, "R1 pin 1 and R2 pin 1 should report the same net: {text} / {text2}");
+
+        std::fs::remove_dir_all(file_path.parent().unwrap()).ok();
     }
 
     /// Regression test for P0-10: the "context after edit" preview used to

@@ -33,10 +33,12 @@ channel_depth_mm = 0.8
 # VIA / EYELET CONFIGURATION
 # ============================================================================
 
-# Full holes are preferred for electrolysis — the conductive primer can coat
-# the hole walls, and eyelets bridge the layers more reliably than indents.
-eyelet_style = "hole"
+# Shallow indents on top and bottom — no drilling, no eyelets required. The
+# conductive primer coats the dimple and electrolysis fills it with copper,
+# bridging the layers directly.
+eyelet_style = "indent"
 eyelet_diameter_mm = 1.5
+indent_depth_mm = 0.3
 
 # ============================================================================
 # COMPONENT PAD CONFIGURATION
