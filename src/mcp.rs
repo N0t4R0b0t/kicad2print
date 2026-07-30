@@ -85,6 +85,18 @@ pub struct RenderPcbParams {
 pub struct DrcParams {
     /// Absolute path to the .kicad_pcb file
     pub path: String,
+    /// Attach a board render highlighting violations (default: false — ask again with
+    /// this set to true only if you need to see the violations visually)
+    #[schemars(default)]
+    pub include_render: Option<bool>,
+    /// Max number of individual violations to list in full detail; type counts are
+    /// always shown for all violations regardless of this cap (default: 50)
+    #[schemars(default)]
+    pub max_details: Option<u32>,
+    /// Return the unprocessed KiCad JSON report instead of a condensed, grouped
+    /// summary (default: false)
+    #[schemars(default)]
+    pub raw: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
@@ -123,6 +135,24 @@ pub struct ExportSvgParams {
     /// Comma-separated layer names to export (e.g. "F.Cu,B.Cu,Edge.Cuts").
     /// Common layers: F.Cu, B.Cu, F.Silkscreen, B.Silkscreen, Edge.Cuts, F.Fab, B.Fab
     pub layers: String,
+    /// Inline the full SVG markup in the response (default: false). The SVG for a
+    /// real board runs to tens of thousands of tokens and will usually be truncated;
+    /// the file is always kept on disk and its path returned, so read or grep that
+    /// instead when you need exact coordinates.
+    #[schemars(default)]
+    pub include_svg_source: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct NetlistParams {
+    /// Absolute path to the .kicad_sch file
+    pub path: String,
+    /// Return the raw kicad-cli netlist S-expression instead of the condensed
+    /// component + connectivity listing (default: false). The raw form is mostly
+    /// per-component metadata and library-part boilerplate; the condensed form
+    /// keeps the part that answers "what connects to what".
+    #[schemars(default)]
+    pub raw: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
@@ -357,6 +387,14 @@ pub struct AddComponentParams {
 pub struct ErcParams {
     /// Absolute path to the .kicad_sch file
     pub path: String,
+    /// Max number of individual violations to list in full detail; type counts are
+    /// always shown for all violations regardless of this cap (default: 50)
+    #[schemars(default)]
+    pub max_details: Option<u32>,
+    /// Return the unprocessed KiCad JSON report instead of a condensed, grouped
+    /// summary (default: false)
+    #[schemars(default)]
+    pub raw: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
@@ -549,6 +587,55 @@ pub struct AddTraceParams {
     /// unless check is also true. Default false.
     #[schemars(default)]
     pub force: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct RouteNetParams {
+    /// Absolute path to the .kicad_pcb file
+    pub path: String,
+    /// Source component reference (e.g. "U1")
+    pub from_ref: String,
+    /// Source pad number (e.g. "8")
+    pub from_pad: String,
+    /// Destination component reference (e.g. "JP1")
+    pub to_ref: String,
+    /// Destination pad number (e.g. "6")
+    pub to_pad: String,
+    /// Copper layer to route on (e.g. "B.Cu"). Omit to try B.Cu first, then F.Cu.
+    /// Set this explicitly to enforce a layer convention across a board.
+    #[schemars(default)]
+    pub layer: Option<String>,
+    /// Trace width in mm (default: 0.25)
+    #[schemars(default)]
+    pub width: Option<f64>,
+    /// Required clearance to other nets in mm (default: 0.2)
+    #[schemars(default)]
+    pub clearance: Option<f64>,
+    /// Routing grid pitch in mm (default: 0.635 — a quarter of the 2.54mm
+    /// through-hole pitch). Coarser is faster but finds fewer squeezes.
+    #[schemars(default)]
+    pub grid: Option<f64>,
+    /// Compute and report the route without writing it to the file (default: false)
+    #[schemars(default)]
+    pub dry_run: Option<bool>,
+    /// Reject a route longer than this multiple of the straight-line pad-to-pad
+    /// distance (default: 3.0). A route that only succeeds by snaking around the
+    /// whole board is usually a signal that something else should move or be
+    /// ripped up — this surfaces that as a failure instead of silently committing
+    /// a bad trace. Raise it to accept a detour you have judged acceptable.
+    #[schemars(default)]
+    pub max_length_ratio: Option<f64>,
+    /// Via pad diameter in mm (default: 0.8)
+    #[schemars(default)]
+    pub via_diameter: Option<f64>,
+    /// Via drill diameter in mm (default: 0.4)
+    #[schemars(default)]
+    pub via_drill: Option<f64>,
+    /// How much one layer change costs the search, as an equivalent trace length
+    /// in mm (default: 2.5). Raise it to make the router work harder to stay on
+    /// one layer; lower it to accept more vias in exchange for shorter routes.
+    #[schemars(default)]
+    pub via_cost: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
@@ -1072,6 +1159,85 @@ async fn run_kicad_cli(args: &[&str]) -> Result<(String, String, i32), McpError>
     Ok((stdout, stderr, code))
 }
 
+/// Condense a raw KiCad DRC/ERC JSON report into a grouped, human-readable summary.
+/// `groups` is a list of (label, violations_array) — DRC passes
+/// [("violations", ...), ("unconnected", ...)], ERC passes each sheet's violations
+/// flattened under one "violations" label. Drops uuids and report metadata
+/// ($schema/date/kicad_version/ignored_checks/...) that add nothing for triage.
+fn summarize_kicad_report(kind: &str, groups: &[(&str, &serde_json::Value)], max_details: u32) -> String {
+    #[derive(Default)]
+    struct Entry {
+        severity: String,
+        vtype: String,
+        description: String,
+        items: Vec<String>,
+    }
+
+    let mut entries: Vec<Entry> = Vec::new();
+    for (_label, arr) in groups {
+        for v in arr.as_array().unwrap_or(&Vec::new()) {
+            let item_lines = v["items"]
+                .as_array()
+                .map(|items| {
+                    items
+                        .iter()
+                        .map(|it| {
+                            let desc = it["description"].as_str().unwrap_or("");
+                            match (it["pos"]["x"].as_f64(), it["pos"]["y"].as_f64()) {
+                                (Some(x), Some(y)) => format!("{desc} @ ({x:.2}, {y:.2})"),
+                                _ => desc.to_string(),
+                            }
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            entries.push(Entry {
+                severity: v["severity"].as_str().unwrap_or("unknown").to_string(),
+                vtype: v["type"].as_str().unwrap_or("unknown").to_string(),
+                description: v["description"].as_str().unwrap_or("").to_string(),
+                items: item_lines,
+            });
+        }
+    }
+
+    if entries.is_empty() {
+        return format!("{kind}: no violations found.");
+    }
+
+    let mut by_type: std::collections::BTreeMap<&str, u32> = std::collections::BTreeMap::new();
+    let mut by_severity: std::collections::BTreeMap<&str, u32> = std::collections::BTreeMap::new();
+    for e in &entries {
+        *by_type.entry(e.vtype.as_str()).or_default() += 1;
+        *by_severity.entry(e.severity.as_str()).or_default() += 1;
+    }
+
+    let mut out = format!("{kind}: {} violation(s)", entries.len());
+    let sev_summary: Vec<String> = by_severity.iter().map(|(s, c)| format!("{c} {s}")).collect();
+    out.push_str(&format!(" ({})\n\n", sev_summary.join(" / ")));
+
+    out.push_str("By type:\n");
+    for (t, c) in &by_type {
+        out.push_str(&format!("  {t}: {c}\n"));
+    }
+
+    out.push_str("\nDetails:\n");
+    let shown = max_details.min(entries.len() as u32) as usize;
+    for e in &entries[..shown] {
+        out.push_str(&format!("[{}] {} — {}\n", e.severity, e.vtype, e.description));
+        for line in &e.items {
+            out.push_str(&format!("  {line}\n"));
+        }
+    }
+    if entries.len() > shown {
+        out.push_str(&format!(
+            "... {} more violation(s) not shown (raise max_details or set raw=true for the full report)\n",
+            entries.len() - shown
+        ));
+    }
+
+    out
+}
+
 /// Upgrade a single .kicad_mod file to the current KiCad format by copying it
 /// into a temporary .pretty library, running `kicad-cli fp upgrade`, and reading
 /// back the result. Returns the upgraded S-expression content.
@@ -1124,23 +1290,32 @@ struct TraceSegment {
 // ---------------------------------------------------------------------------
 
 /// Iterate over all top-level S-expression blocks in `content` that open with `keyword`
-/// (e.g. `"(gr_line "`, `"(segment "`, `"(zone "`).
+/// (e.g. `"(gr_line"`, `"(segment"`, `"(zone"`).
 ///
 /// "Top-level" means the line containing the opener is indented by exactly one
 /// indent unit — two spaces (KiCad 6/7) or one tab (KiCad 9/10). This avoids
 /// matching the same keyword when it appears nested inside another block.
+///
+/// A trailing space in `keyword` is ignored: KiCad 6/7 wrote `(gr_line (start …)`
+/// on one line, but KiCad 9/10 writes `(gr_line\n\t\t(start …)`, so a needle with a
+/// hardcoded trailing space silently matches nothing on modern files. Instead the
+/// character after the keyword must be a separator, which still keeps `(gr_text`
+/// from matching `(gr_text_box` and `(zone` from matching `(zone_connect`.
 ///
 /// Calls `f(block_start_byte, block_end_byte)` for each match.
 fn for_each_top_level<F>(content: &str, keyword: &str, mut f: F)
 where
     F: FnMut(usize, usize),
 {
+    let keyword = keyword.trim_end();
     let mut pos = 0;
     while let Some(rel) = content[pos..].find(keyword) {
         let kw_start = pos + rel;
         let line_start = content[..kw_start].rfind('\n').map(|p| p + 1).unwrap_or(0);
         let prefix = &content[line_start..kw_start];
-        if prefix == "  " || prefix == "\t" {
+        let next = content[kw_start + keyword.len()..].chars().next();
+        let separated = matches!(next, Some(' ') | Some('\n') | Some('\t') | Some('(') | Some(')') | None);
+        if (prefix == "  " || prefix == "\t") && separated {
             let end = pcb_edit::block_end(content, kw_start);
             f(kw_start, end);
             pos = end;
@@ -2097,12 +2272,14 @@ impl KiCadServer {
     // ---- KiCad CLI — DRC ---------------------------------------------------
 
     /// Run KiCad's Design Rules Check on a PCB file.
-    /// Returns a structured JSON report of all violations, clearance errors, and unconnected nets.
-    #[tool(description = "Run DRC (Design Rules Check) on a .kicad_pcb file and return a JSON report of violations")]
+    /// Returns a condensed, grouped-by-type summary by default (pass raw=true for
+    /// the unprocessed KiCad JSON report).
+    #[tool(description = "Run DRC (Design Rules Check) on a .kicad_pcb file and return a condensed summary of violations grouped by type (pass raw=true for the full JSON report, include_render=true for a board image)")]
     async fn run_drc(
         &self,
         params: Parameters<DrcParams>,
     ) -> Result<CallToolResult, McpError> {
+        let p = params.0;
         let out_path = std::env::temp_dir().join(format!(
             "kicad_drc_{}.json",
             std::time::SystemTime::now()
@@ -2117,15 +2294,29 @@ impl KiCadServer {
             "--format", "json",
             "--severity-all",
             "--units", "mm",
-            &params.0.path,
+            &p.path,
         ]).await?;
 
         match fs::read_to_string(&out_path).await {
             Ok(report) => {
                 let _ = fs::remove_file(&out_path).await;
-                let mut contents = vec![Content::text(report)];
-                // Append a board render so violations are visually obvious
-                contents.extend(self.render_board(&params.0.path).await);
+                let text = if p.raw.unwrap_or(false) {
+                    report
+                } else {
+                    let v: serde_json::Value = serde_json::from_str(&report).unwrap_or_default();
+                    let empty = serde_json::Value::Array(Vec::new());
+                    let violations = v.get("violations").unwrap_or(&empty);
+                    let unconnected = v.get("unconnected_items").unwrap_or(&empty);
+                    summarize_kicad_report(
+                        "DRC",
+                        &[("violations", violations), ("unconnected", unconnected)],
+                        p.max_details.unwrap_or(50),
+                    )
+                };
+                let mut contents = vec![Content::text(text)];
+                if p.include_render.unwrap_or(false) {
+                    contents.extend(self.render_board(&p.path).await);
+                }
                 Ok(CallToolResult::success(contents))
             }
             Err(_) => {
@@ -2141,11 +2332,12 @@ impl KiCadServer {
     /// Export the schematic netlist. Shows every component, its reference, value,
     /// footprint, and all net connections — essential for understanding the design
     /// before modifying the PCB.
-    #[tool(description = "Export the schematic netlist from a .kicad_sch file — shows all components and net connections")]
+    #[tool(description = "Export the schematic netlist from a .kicad_sch file — returns a condensed listing of every component (ref, value, footprint) and every net with the pads on it (pass raw=true for the full kicad-cli S-expression)")]
     async fn export_netlist(
         &self,
-        params: Parameters<SchematicParams>,
+        params: Parameters<NetlistParams>,
     ) -> Result<CallToolResult, McpError> {
+        let p = params.0;
         let out_path = std::env::temp_dir().join(format!(
             "kicad_netlist_{}.net",
             std::time::SystemTime::now()
@@ -2158,13 +2350,18 @@ impl KiCadServer {
             "sch", "export", "netlist",
             "--output", out_path.to_str().unwrap_or("/tmp/netlist.net"),
             "--format", "kicadsexpr",
-            &params.0.path,
+            &p.path,
         ]).await?;
 
         match fs::read_to_string(&out_path).await {
             Ok(content) => {
                 let _ = fs::remove_file(&out_path).await;
-                Ok(CallToolResult::success(vec![Content::text(content)]))
+                let text = if p.raw.unwrap_or(false) {
+                    content
+                } else {
+                    summarize_netlist(&content)
+                };
+                Ok(CallToolResult::success(vec![Content::text(text)]))
             }
             Err(_) => Ok(CallToolResult::error(vec![Content::text(format!(
                 "netlist export failed (exit {code}):\n{stderr}"
@@ -2481,7 +2678,7 @@ impl KiCadServer {
 
     /// Export one or more PCB layers as SVG — useful for inspecting copper routing,
     /// silkscreen, or fab layers during editing. Returns the SVG text content.
-    #[tool(description = "Export PCB layers as SVG (e.g. 'F.Cu,B.Cu,Edge.Cuts') for detailed layer inspection")]
+    #[tool(description = "Export PCB layers as SVG (e.g. 'F.Cu,B.Cu,Edge.Cuts') and return a PNG preview image plus the path to the saved SVG. The SVG markup is NOT inlined by default because it runs to tens of thousands of tokens — grep the saved file for exact coordinates, or pass include_svg_source=true to inline it anyway.")]
     async fn export_layer_svg(
         &self,
         params: Parameters<ExportSvgParams>,
@@ -2512,6 +2709,12 @@ impl KiCadServer {
         };
 
         let mut contents: Vec<Content> = Vec::new();
+        let svg_display = out_path.display().to_string();
+        let svg_kb = svg_content.len() as f64 / 1024.0;
+        // The SVG is deliberately NOT deleted: dumping its markup inline costs tens
+        // of thousands of tokens and gets truncated anyway, so the useful form is a
+        // path the caller can grep for the coordinates it actually wants.
+        let inline_source = p.include_svg_source.unwrap_or(false);
 
         // Convert SVG → PNG via rsvg-convert for visual inspection
         let png_path = out_path.with_extension("png");
@@ -2524,23 +2727,35 @@ impl KiCadServer {
             .output()
             .await;
 
-        let _ = fs::remove_file(&out_path).await;
-
         if conv.map(|o| o.status.success()).unwrap_or(false) {
             if let Ok(bytes) = fs::read(&png_path).await {
                 let _ = fs::remove_file(&png_path).await;
-                contents.push(Content::text(format!("Layer SVG rendered — layers: {}", p.layers)));
+                contents.push(Content::text(format!(
+                    "Layer SVG rendered — layers: {}\nSVG saved to: {svg_display} ({svg_kb:.0} KB)",
+                    p.layers
+                )));
                 contents.push(Content::image(BASE64_STANDARD.encode(&bytes), "image/png"));
-                // Also include raw SVG text for precise coordinate inspection
-                contents.push(Content::text(svg_content));
+                if inline_source {
+                    contents.push(Content::text(svg_content));
+                }
                 return Ok(CallToolResult::success(contents));
             }
         }
 
-        // rsvg-convert not available — return SVG text only
-        contents.push(Content::text(format!(
-            "Layer SVG exported (rsvg-convert not available for PNG preview):\n{svg_content}"
-        )));
+        // rsvg-convert not available — no preview image, but still don't dump markup.
+        contents.push(Content::text(if inline_source {
+            format!(
+                "Layer SVG exported to {svg_display} ({svg_kb:.0} KB) — layers: {}\n\
+                 (rsvg-convert not available for PNG preview)\n{svg_content}",
+                p.layers
+            )
+        } else {
+            format!(
+                "Layer SVG exported to {svg_display} ({svg_kb:.0} KB) — layers: {}\n\
+                 (rsvg-convert not installed, so no PNG preview was produced)",
+                p.layers
+            )
+        }));
         Ok(CallToolResult::success(contents))
     }
 
@@ -3296,12 +3511,14 @@ print(json.dumps({{"ok": True, "pads": pads, "old_pad_count": len(old_nets), "ca
     // ---- ERC / fabrication -------------------------------------------------
 
     /// Run KiCad's Electrical Rules Check on a schematic.
-    /// Returns a structured JSON report of all ERC violations.
-    #[tool(description = "Run ERC (Electrical Rules Check) on a .kicad_sch schematic and return a JSON report of violations — call after schematic edits to verify correctness")]
+    /// Returns a condensed, grouped-by-type summary by default (pass raw=true for
+    /// the unprocessed KiCad JSON report).
+    #[tool(description = "Run ERC (Electrical Rules Check) on a .kicad_sch schematic and return a condensed summary of violations grouped by type — call after schematic edits to verify correctness (pass raw=true for the full JSON report)")]
     async fn run_erc(
         &self,
         params: Parameters<ErcParams>,
     ) -> Result<CallToolResult, McpError> {
+        let p = params.0;
         let out_path = std::env::temp_dir().join(format!(
             "kicad_erc_{}.json",
             std::time::SystemTime::now()
@@ -3316,13 +3533,26 @@ print(json.dumps({{"ok": True, "pads": pads, "old_pad_count": len(old_nets), "ca
             "--format", "json",
             "--severity-all",
             "--units", "mm",
-            &params.0.path,
+            &p.path,
         ]).await?;
 
         match fs::read_to_string(&out_path).await {
             Ok(report) => {
                 let _ = fs::remove_file(&out_path).await;
-                Ok(CallToolResult::success(vec![Content::text(report)]))
+                let text = if p.raw.unwrap_or(false) {
+                    report
+                } else {
+                    let v: serde_json::Value = serde_json::from_str(&report).unwrap_or_default();
+                    let empty = Vec::new();
+                    let sheets = v.get("sheets").and_then(|s| s.as_array()).unwrap_or(&empty);
+                    let empty_v = serde_json::Value::Array(Vec::new());
+                    let violation_arrays: Vec<(&str, &serde_json::Value)> = sheets
+                        .iter()
+                        .map(|sheet| ("violations", sheet.get("violations").unwrap_or(&empty_v)))
+                        .collect();
+                    summarize_kicad_report("ERC", &violation_arrays, p.max_details.unwrap_or(50))
+                };
+                Ok(CallToolResult::success(vec![Content::text(text)]))
             }
             Err(_) => Ok(CallToolResult::error(vec![Content::text(format!(
                 "ERC failed (exit {code}):\n{stderr}"
@@ -4454,6 +4684,181 @@ print(json.dumps({{"changed": changed}}))
         let mut contents = vec![Content::text(summary)];
         contents.extend(self.render_board(&p.path).await);
         Ok(CallToolResult::success(contents))
+    }
+
+    /// Route one net between two pads with a server-side octilinear A* search.
+    #[tool(description = "Route a net between two pads automatically, using an octilinear (45-degree) A* search that avoids all existing pads and traces with proper clearance. Supply intent — which pads, which layer, how wide — and the server computes the geometry and writes every segment. Prefer this over emitting individual add_trace calls: one call replaces a whole polyline of hand-computed coordinates. Omit layer to try B.Cu then F.Cu. Use dry_run=true to preview the path first. Returns a condensed summary (no render).")]
+    async fn route_net(
+        &self,
+        params: Parameters<RouteNetParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let p = params.0;
+        let path = PathBuf::from(&p.path);
+        let _guard = self.lock_file(&path).await;
+
+        let content = match fs::read_to_string(&path).await {
+            Ok(c) => c,
+            Err(e) => return Ok(CallToolResult::error(vec![Content::text(format!("Failed to read: {e}"))])),
+        };
+
+        let width = p.width.unwrap_or(0.25);
+        let clearance = p.clearance.unwrap_or(0.2);
+        let grid = p.grid.unwrap_or(0.635);
+
+        let pads = parse_pcb_pads(&content);
+        let find_pad = |r: &str, n: &str| {
+            pads.iter().find(|pad| pad.reference == r && pad.pad_num == n)
+        };
+
+        let Some(from) = find_pad(&p.from_ref, &p.from_pad) else {
+            return Ok(CallToolResult::error(vec![Content::text(format!(
+                "Pad {}.{} not found.", p.from_ref, p.from_pad
+            ))]));
+        };
+        let Some(to) = find_pad(&p.to_ref, &p.to_pad) else {
+            return Ok(CallToolResult::error(vec![Content::text(format!(
+                "Pad {}.{} not found.", p.to_ref, p.to_pad
+            ))]));
+        };
+
+        if from.net.is_empty() {
+            return Ok(CallToolResult::error(vec![Content::text(format!(
+                "Pad {}.{} has no net assigned — nothing to route.", p.from_ref, p.from_pad
+            ))]));
+        }
+        if from.net != to.net {
+            return Ok(CallToolResult::error(vec![Content::text(format!(
+                "Refusing to route: {}.{} is on net '{}' but {}.{} is on net '{}'. \
+                 These pads are not meant to be connected.",
+                p.from_ref, p.from_pad, from.net, p.to_ref, p.to_pad, to.net
+            ))]));
+        }
+
+        let net = from.net.clone();
+        let (start, goal) = ((from.x, from.y), (to.x, to.y));
+        let segments = parse_pcb_segments(&content);
+        let bounds = parse_edge_cuts_bounds(&content);
+
+        // A single named layer pins the net to that side; otherwise the router gets
+        // both sides and may drop vias to switch between them.
+        let layers: Vec<String> = match &p.layer {
+            Some(l) => vec![l.clone()],
+            None => vec!["B.Cu".to_string(), "F.Cu".to_string()],
+        };
+
+        // Through-hole pads are reachable from every layer; SMD pads only from theirs.
+        let pad_layers = |pad: &PcbPad| -> Vec<usize> {
+            if pad.is_thru_hole {
+                (0..layers.len()).collect()
+            } else {
+                layers.iter().enumerate()
+                    .filter(|(_, l)| pad.layers.iter().any(|pl| pl == *l))
+                    .map(|(i, _)| i)
+                    .collect()
+            }
+        };
+        let (start_layers, goal_layers) = (pad_layers(from), pad_layers(to));
+        if start_layers.is_empty() || goal_layers.is_empty() {
+            return Ok(CallToolResult::error(vec![Content::text(format!(
+                "Pad {}.{} or {}.{} is not present on the requested layer(s) {}.",
+                p.from_ref, p.from_pad, p.to_ref, p.to_pad, layers.join("/")
+            ))]));
+        }
+
+        let via_diameter = p.via_diameter.unwrap_or(0.8);
+        let cfg = RouteConfig {
+            layers: &layers,
+            net: &net,
+            width,
+            clearance,
+            grid,
+            bounds,
+            via_diameter,
+            via_cost_mm: p.via_cost.unwrap_or(2.5),
+            max_nodes: 400_000,
+        };
+
+        let steps = match route_octilinear(
+            &pads, &segments, start, goal, &start_layers, &goal_layers, &cfg,
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                return Ok(CallToolResult::error(vec![Content::text(format!(
+                    "No route found for net '{net}' from {}.{} ({:.2},{:.2}) to {}.{} ({:.2},{:.2}).\n  {e}\n\n\
+                     Options: rip up a blocking net and re-route it, use a finer grid \
+                     (e.g. grid=0.3175), reduce width/clearance, or move a component out of the way.",
+                    p.from_ref, p.from_pad, start.0, start.1,
+                    p.to_ref, p.to_pad, goal.0, goal.1,
+                ))]));
+            }
+        };
+
+        let total_len: f64 = steps.windows(2)
+            .filter(|w| w[0].layer == w[1].layer)
+            .map(|w| ((w[1].x - w[0].x).powi(2) + (w[1].y - w[0].y).powi(2)).sqrt())
+            .sum();
+        let via_count = steps.windows(2).filter(|w| w[0].layer != w[1].layer).count();
+        let seg_count = steps.windows(2).filter(|w| w[0].layer == w[1].layer).count();
+        let bends = steps.len().saturating_sub(2 + via_count);
+
+        let direct = ((goal.0 - start.0).powi(2) + (goal.1 - start.1).powi(2)).sqrt();
+        let ratio = if direct > 1e-9 { total_len / direct } else { 1.0 };
+        let max_ratio = p.max_length_ratio.unwrap_or(3.0);
+        if ratio > max_ratio {
+            return Ok(CallToolResult::error(vec![Content::text(format!(
+                "Rejected route for net '{net}' {}.{} → {}.{}: {total_len:.2}mm is {ratio:.1}x the \
+                 {direct:.2}mm direct distance (limit {max_ratio:.1}x).\n\
+                 A detour this large usually means the direct corridor is blocked by another net. \
+                 Consider ripping up what is in the way, or pass max_length_ratio={:.1} to accept it.",
+                p.from_ref, p.from_pad, p.to_ref, p.to_pad, ratio.ceil()
+            ))]));
+        }
+
+        let path_desc = steps.iter()
+            .map(|s| format!("({:.2},{:.2}){}", s.x, s.y, cfg.layers[s.layer]))
+            .collect::<Vec<_>>()
+            .join(" → ");
+        let headline = format!(
+            "net '{net}' {}.{} → {}.{}: {seg_count} segment(s), {via_count} via(s), \
+             {bends} bend(s), {total_len:.2}mm ({ratio:.1}x direct)",
+            p.from_ref, p.from_pad, p.to_ref, p.to_pad
+        );
+
+        if p.dry_run.unwrap_or(false) {
+            return Ok(CallToolResult::success(vec![Content::text(format!(
+                "DRY RUN — routable: {headline}\n{path_desc}\n\
+                 Nothing written. Re-run without dry_run to commit."
+            ))]));
+        }
+
+        let mut blocks = String::new();
+        for w in steps.windows(2) {
+            if w[0].layer == w[1].layer {
+                blocks.push_str(&format!(
+                    "\t(segment\n\t\t(start {} {})\n\t\t(end {} {})\n\t\t(width {})\n\t\t(layer \"{}\")\n\t\t(net \"{}\")\n\t\t(uuid \"{}\")\n\t)\n",
+                    w[0].x, w[0].y, w[1].x, w[1].y, width, cfg.layers[w[0].layer], net,
+                    pcb_edit::new_tstamp()
+                ));
+            } else {
+                blocks.push_str(&format!(
+                    "\t(via\n\t\t(at {} {})\n\t\t(size {})\n\t\t(drill {})\n\t\t(layers \"{}\" \"{}\")\n\t\t(net \"{}\")\n\t\t(uuid \"{}\")\n\t)\n",
+                    w[0].x, w[0].y, via_diameter, p.via_drill.unwrap_or(0.4),
+                    cfg.layers[w[0].layer], cfg.layers[w[1].layer], net,
+                    pcb_edit::new_tstamp()
+                ));
+            }
+        }
+
+        let insert_pos = content.rfind("\n)").unwrap_or(content.len());
+        let new_content = format!("{}\n{}{}", &content[..insert_pos], blocks.trim_end(), &content[insert_pos..]);
+
+        if let Err(e) = fs::write(&path, &new_content).await {
+            return Ok(CallToolResult::error(vec![Content::text(format!("Failed to write: {e}"))]));
+        }
+
+        Ok(CallToolResult::success(vec![Content::text(format!(
+            "Routed {headline}\n{path_desc}"
+        ))]))
     }
 
     /// Delete gr_text, gr_line, or gr_rect elements from a PCB, filtered by text content,
@@ -6448,9 +6853,17 @@ fn parse_pcb_pads(content: &str) -> Vec<PcbPad> {
                 let is_thru_hole = pad_block.contains("thru_hole") || pad_block.contains("\"*.Cu\"");
                 let layers = parse_layers_field(pad_block);
 
-                // Apply footprint rotation to pad local offset
-                let abs_x = fp_x + dx * cos_r - dy * sin_r;
-                let abs_y = fp_y + dx * sin_r + dy * cos_r;
+                // Apply footprint rotation to the pad's local offset.
+                //
+                // KiCad's footprint angle is counter-clockwise as drawn, but the
+                // PCB Y axis points DOWN, so a textbook CCW matrix rotates the
+                // wrong way. The sin terms are therefore negated relative to the
+                // naive form. Getting this backwards is invisible on unrotated
+                // footprints and mirrors the pad to the opposite corner on every
+                // rotated one — e.g. U1 at rot=-90 reported (108.02,72.73) instead
+                // of its true (123.26,57.73).
+                let abs_x = fp_x + dx * cos_r + dy * sin_r;
+                let abs_y = fp_y - dx * sin_r + dy * cos_r;
 
                 result.push(PcbPad {
                     reference: reference.clone(),
@@ -6642,6 +7055,343 @@ fn segment_bbox_overlaps_region(seg: &PcbSegment, x_min: f64, y_min: f64, x_max:
     let (sxmin, sxmax) = (seg.x1.min(seg.x2), seg.x1.max(seg.x2));
     let (symin, symax) = (seg.y1.min(seg.y2), seg.y1.max(seg.y2));
     sxmin <= x_max && sxmax >= x_min && symin <= y_max && symax >= y_min
+}
+
+/// Fast clearance test for a proposed segment against a PRE-PARSED obstacle set.
+///
+/// `compute_clearance` re-parses the whole PCB on every call, which is fine for a
+/// one-shot check but far too slow inside a router that tests thousands of candidate
+/// edges. This takes the already-parsed pads/segments and answers a single yes/no.
+///
+/// Stricter than `compute_clearance`'s COLLISION test on purpose: the required gap
+/// here is `half_trace + half_obstacle + clearance`, so a route that passes is
+/// DRC-clean rather than merely non-overlapping. Same-net copper is skipped (a trace
+/// is allowed to land on its own pads and tee into its own tracks).
+fn segment_is_clear(
+    pads: &[PcbPad],
+    segments: &[PcbSegment],
+    x1: f64, y1: f64, x2: f64, y2: f64,
+    layer: &str, net: &str, width: f64, clearance: f64,
+) -> bool {
+    let half_trace = width / 2.0;
+
+    for pad in pads {
+        if !net.is_empty() && pad.net == net { continue; }
+        // THT pads occupy every copper layer; SMD pads only obstruct their own.
+        if !pad.is_thru_hole && !pad.layers.iter().any(|l| l == layer) { continue; }
+        let dist = point_to_segment_dist(pad.x, pad.y, x1, y1, x2, y2);
+        if dist < half_trace + pad.width.max(pad.height) / 2.0 + clearance {
+            return false;
+        }
+    }
+
+    for seg in segments {
+        if seg.layer != layer { continue; }
+        if !net.is_empty() && seg.net == net { continue; }
+        let dist = segment_to_segment_dist(x1, y1, x2, y2, seg.x1, seg.y1, seg.x2, seg.y2);
+        if dist < half_trace + seg.width / 2.0 + clearance {
+            return false;
+        }
+    }
+
+    true
+}
+
+/// Clearance test for dropping a via at (x, y). A via is plated through every
+/// copper layer, so unlike a trace it must clear obstacles on *all* of them.
+fn via_is_clear(
+    pads: &[PcbPad],
+    segments: &[PcbSegment],
+    x: f64, y: f64,
+    layers: &[String],
+    net: &str,
+    via_diameter: f64,
+    clearance: f64,
+) -> bool {
+    let half_via = via_diameter / 2.0;
+
+    for pad in pads {
+        if !net.is_empty() && pad.net == net { continue; }
+        let dist = ((pad.x - x).powi(2) + (pad.y - y).powi(2)).sqrt();
+        if dist < half_via + pad.width.max(pad.height) / 2.0 + clearance {
+            return false;
+        }
+    }
+
+    for seg in segments {
+        if !layers.iter().any(|l| *l == seg.layer) { continue; }
+        if !net.is_empty() && seg.net == net { continue; }
+        let dist = point_to_segment_dist(x, y, seg.x1, seg.y1, seg.x2, seg.y2);
+        if dist < half_via + seg.width / 2.0 + clearance {
+            return false;
+        }
+    }
+
+    true
+}
+
+/// The eight octilinear directions, in (dx, dy) grid steps.
+const ROUTE_DIRS: [(i32, i32); 8] = [
+    (1, 0), (1, 1), (0, 1), (-1, 1), (-1, 0), (-1, -1), (0, -1), (1, -1),
+];
+
+/// Tunable inputs for `route_octilinear`, bundled so the search signature stays
+/// readable as via support adds parameters.
+struct RouteConfig<'a> {
+    /// Copper layers available to the router, in preference order.
+    layers: &'a [String],
+    net: &'a str,
+    width: f64,
+    clearance: f64,
+    grid: f64,
+    bounds: (f64, f64, f64, f64),
+    via_diameter: f64,
+    /// Cost of one layer change, expressed as an equivalent trace length in mm.
+    /// High enough that the router prefers staying on a layer, low enough that it
+    /// will hop rather than take a long detour.
+    via_cost_mm: f64,
+    max_nodes: usize,
+}
+
+/// One point along a computed route, tagged with the layer it sits on.
+/// A layer change between consecutive steps at the same (x, y) is a via.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct RouteStep {
+    x: f64,
+    y: f64,
+    layer: usize,
+}
+
+/// Octilinear A* router for a single net across one or more copper layers.
+///
+/// Searches a square grid **anchored on the start pad**, so the start point is
+/// always exactly on-grid and every routed segment leaves it at a true 45° multiple.
+/// The goal pad is generally off-grid, so the search terminates at any grid node
+/// adjacent to the goal's nearest node from which a clear "stub" to the exact pad
+/// centre exists — that stub is the only segment that may be off-45°, and it is
+/// never longer than one grid cell.
+///
+/// The search space is three-dimensional: (grid x, grid y, layer). Moving between
+/// layers at the same grid node costs `via_cost_mm` and requires room for a via on
+/// every layer. Without this a single-layer router has to snake around congested
+/// copper — on a real board that turns a 16mm hop into a 99mm detour — which is
+/// exactly why two-layer boards use vias in the first place.
+///
+/// Search state also includes the arrival direction so direction changes can be
+/// penalised, which keeps routes as long straight runs with few bends instead of
+/// the staircase a plain distance-only A* produces.
+///
+/// `start_layers` / `goal_layers` are the layer indices each pad can be reached on
+/// — every layer for a through-hole pad, just its own for SMD.
+fn route_octilinear(
+    pads: &[PcbPad],
+    segments: &[PcbSegment],
+    start: (f64, f64),
+    goal: (f64, f64),
+    start_layers: &[usize],
+    goal_layers: &[usize],
+    cfg: &RouteConfig,
+) -> Result<Vec<RouteStep>, String> {
+    use std::cmp::Reverse;
+    use std::collections::{BinaryHeap, HashMap};
+
+    if cfg.grid <= 0.0 {
+        return Err("grid must be positive".to_string());
+    }
+    if cfg.layers.is_empty() || start_layers.is_empty() || goal_layers.is_empty() {
+        return Err("no usable copper layer for this net".to_string());
+    }
+
+    let grid = cfg.grid;
+    let net = cfg.net;
+
+    // Keep the whole route inside the board outline by the trace's own half-width
+    // plus clearance, so the router never proposes copper that a DRC edge-clearance
+    // rule would immediately reject.
+    let margin = cfg.width / 2.0 + cfg.clearance;
+    let (bx_min, by_min, bx_max, by_max) = cfg.bounds;
+    let (bx_min, by_min, bx_max, by_max) =
+        (bx_min + margin, by_min + margin, bx_max - margin, by_max - margin);
+
+    let node_xy = |i: i32, j: i32| (start.0 + i as f64 * grid, start.1 + j as f64 * grid);
+
+    // Grid node closest to the goal — the search aims at this, then stubs across.
+    let gi = ((goal.0 - start.0) / grid).round() as i32;
+    let gj = ((goal.1 - start.1) / grid).round() as i32;
+
+    // Octile distance: admissible for 8-way movement with unit/diagonal costs.
+    // Ignores via cost, which keeps it admissible in the layered search too.
+    let heuristic = |x: f64, y: f64| {
+        let dx = (goal.0 - x).abs();
+        let dy = (goal.1 - y).abs();
+        dx.max(dy) + (std::f64::consts::SQRT_2 - 1.0) * dx.min(dy)
+    };
+
+    // Costs are carried as integer micrometres so they can live in a BinaryHeap.
+    let q = |mm: f64| -> i64 { (mm * 1000.0).round() as i64 };
+    // A bend costs half a grid step. Enough to prefer straight runs, not so much
+    // that the router takes a long detour purely to avoid a corner.
+    let bend_penalty = q(grid * 0.5);
+    let via_penalty = q(cfg.via_cost_mm);
+
+    // State: grid position, layer, and arrival direction (8 = "no direction yet").
+    type State = (i32, i32, u8, u8);
+
+    let mut open: BinaryHeap<Reverse<(i64, State)>> = BinaryHeap::new();
+    let mut g_score: HashMap<State, i64> = HashMap::new();
+    let mut came_from: HashMap<State, State> = HashMap::new();
+
+    // A through-hole start pad can be left on any layer at no cost.
+    for &l in start_layers {
+        let s: State = (0, 0, l as u8, 8);
+        g_score.insert(s, 0);
+        open.push(Reverse((q(heuristic(start.0, start.1)), s)));
+    }
+
+    let mut expanded = 0usize;
+    let mut goal_state: Option<State> = None;
+    // Tracks how close the search actually got, for a useful failure message.
+    let mut best_dist = f64::MAX;
+
+    while let Some(Reverse((_, current))) = open.pop() {
+        if expanded >= cfg.max_nodes {
+            return Err(format!(
+                "search exhausted after {} nodes (closest approach {best_dist:.2}mm) \
+                 — try a coarser grid, or free up space near the destination",
+                cfg.max_nodes
+            ));
+        }
+        expanded += 1;
+
+        let (ci, cj, clayer, cdir) = current;
+        let (cx, cy) = node_xy(ci, cj);
+        let layer_name = &cfg.layers[clayer as usize];
+
+        let d_goal = ((goal.0 - cx).powi(2) + (goal.1 - cy).powi(2)).sqrt();
+        if d_goal < best_dist { best_dist = d_goal; }
+
+        // Accept from any node neighbouring the goal's nearest grid node, provided
+        // we are on a layer the goal pad actually reaches and the final stub is
+        // clear — checking a ring rather than a single node keeps the route from
+        // failing just because one approach happens to be blocked.
+        if (ci - gi).abs() <= 1 && (cj - gj).abs() <= 1
+            && goal_layers.contains(&(clayer as usize))
+        {
+            let reached = (cx - goal.0).abs() < 1e-9 && (cy - goal.1).abs() < 1e-9;
+            if reached
+                || segment_is_clear(pads, segments, cx, cy, goal.0, goal.1,
+                                    layer_name, net, cfg.width, cfg.clearance)
+            {
+                goal_state = Some(current);
+                break;
+            }
+        }
+
+        let current_g = *g_score.get(&current).unwrap_or(&i64::MAX);
+
+        // In-plane moves.
+        for (dir_idx, (dx, dy)) in ROUTE_DIRS.iter().enumerate() {
+            let (ni, nj) = (ci + dx, cj + dy);
+            let (nx, ny) = node_xy(ni, nj);
+
+            if nx < bx_min || nx > bx_max || ny < by_min || ny > by_max { continue; }
+
+            let step_mm = if *dx != 0 && *dy != 0 { grid * std::f64::consts::SQRT_2 } else { grid };
+            let turn = if cdir == 8 || cdir as usize == dir_idx { 0 } else { bend_penalty };
+            let tentative = current_g + q(step_mm) + turn;
+
+            let next: State = (ni, nj, clayer, dir_idx as u8);
+            if tentative >= *g_score.get(&next).unwrap_or(&i64::MAX) { continue; }
+
+            if !segment_is_clear(pads, segments, cx, cy, nx, ny,
+                                 layer_name, net, cfg.width, cfg.clearance) {
+                continue;
+            }
+
+            g_score.insert(next, tentative);
+            came_from.insert(next, current);
+            open.push(Reverse((tentative + q(heuristic(nx, ny)), next)));
+        }
+
+        // Layer change (via) — same grid node, different layer.
+        if cfg.layers.len() > 1 {
+            let mut via_ok: Option<bool> = None;
+            for other in 0..cfg.layers.len() {
+                if other == clayer as usize { continue; }
+                let tentative = current_g + via_penalty;
+                // Reset direction after a via: the trace may leave any way it likes.
+                let next: State = (ci, cj, other as u8, 8);
+                if tentative >= *g_score.get(&next).unwrap_or(&i64::MAX) { continue; }
+
+                // Only pay for the (relatively expensive) via clearance test once,
+                // and only when a layer change would actually improve something.
+                let ok = *via_ok.get_or_insert_with(|| {
+                    via_is_clear(pads, segments, cx, cy, cfg.layers, net,
+                                 cfg.via_diameter, cfg.clearance)
+                });
+                if !ok { break; }
+
+                g_score.insert(next, tentative);
+                came_from.insert(next, current);
+                open.push(Reverse((tentative + q(heuristic(cx, cy)), next)));
+            }
+        }
+    }
+
+    let Some(end_state) = goal_state else {
+        let names = cfg.layers.join("/");
+        return Err(format!(
+            "no clear path on {names} (explored {expanded} nodes, closest approach {best_dist:.2}mm)"
+        ));
+    };
+
+    // Walk the parent chain back to the start, then flip it.
+    let mut chain = vec![end_state];
+    let mut cur = end_state;
+    while let Some(&prev) = came_from.get(&cur) {
+        chain.push(prev);
+        cur = prev;
+    }
+    chain.reverse();
+
+    let mut steps: Vec<RouteStep> = chain.iter()
+        .map(|&(i, j, l, _)| {
+            let (x, y) = node_xy(i, j);
+            RouteStep { x, y, layer: l as usize }
+        })
+        .collect();
+
+    if let Some(last) = steps.last() {
+        if (last.x - goal.0).abs() > 1e-9 || (last.y - goal.1).abs() > 1e-9 {
+            steps.push(RouteStep { x: goal.0, y: goal.1, layer: last.layer });
+        }
+    }
+
+    Ok(collapse_collinear(&steps))
+}
+
+/// Collapse runs of collinear same-layer points so the caller emits one segment
+/// per bend rather than one per grid step. Layer changes are always preserved —
+/// each one becomes a via. Always keeps the first and last step.
+fn collapse_collinear(steps: &[RouteStep]) -> Vec<RouteStep> {
+    if steps.len() < 3 {
+        return steps.to_vec();
+    }
+    let mut out = vec![steps[0]];
+    for w in steps.windows(3) {
+        let (a, b, c) = (w[0], w[1], w[2]);
+        // A point where the layer changes is a via and must survive.
+        if a.layer != b.layer || b.layer != c.layer {
+            out.push(b);
+            continue;
+        }
+        let cross = (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x);
+        if cross.abs() > 1e-9 {
+            out.push(b);
+        }
+    }
+    out.push(steps[steps.len() - 1]);
+    out
 }
 
 /// One via parsed from a PCB file.
@@ -6941,6 +7691,77 @@ fn count_symbol_units(sym_def: &str) -> usize {
 struct SchNet {
     name: String,
     nodes: Vec<(String, String)>,
+}
+
+/// Condense a kicad-cli netlist export into the part that actually answers
+/// "what is on this board and what connects to what".
+///
+/// A real netlist is dominated by per-component metadata (datasheet fields,
+/// tstamps, sheetpaths) and a `(libparts ...)` section restating every library
+/// symbol — on a 15-component board that is ~26 KB of the 38 KB total, and none of
+/// it is needed to reason about connectivity. This keeps one line per component and
+/// one line per net.
+fn summarize_netlist(content: &str) -> String {
+    use pcb_edit::block_end;
+
+    let mut out = String::new();
+
+    // Components: ref, value, footprint — one line each.
+    let mut comps: Vec<(String, String, String)> = Vec::new();
+    if let Some(cstart) = content.find("(components") {
+        let cend = block_end(content, cstart);
+        let section = &content[cstart..cend];
+        let mut pos = 0;
+        // Match `(comp` followed by a separator, never a bare `"(comp "` needle:
+        // KiCad writes `(comp\n\t\t\t(ref ...)` on modern exports, so a hardcoded
+        // trailing space silently finds nothing. The separator check also stops
+        // `(comp` matching a longer keyword like `(components`.
+        while let Some(rel) = section[pos..].find("(comp") {
+            let start = pos + rel;
+            let next = section[start + 5..].chars().next();
+            if !matches!(next, Some(' ') | Some('\n') | Some('\t') | Some('(')) {
+                pos = start + 1;
+                continue;
+            }
+            let end = block_end(section, start);
+            let block = &section[start..end];
+            comps.push((
+                extract_quoted_after_kw(block, "(ref \""),
+                extract_quoted_after_kw(block, "(value \""),
+                extract_quoted_after_kw(block, "(footprint \""),
+            ));
+            pos = end;
+        }
+    }
+
+    if comps.is_empty() {
+        out.push_str("Components: none found.\n");
+    } else {
+        out.push_str(&format!("Components ({}):\n", comps.len()));
+        for (r, v, f) in &comps {
+            let fp = if f.is_empty() { "<no footprint>" } else { f.as_str() };
+            out.push_str(&format!("  {r:<8} {v:<24} {fp}\n"));
+        }
+    }
+
+    let nets = parse_netlist_nets(content);
+    if nets.is_empty() {
+        out.push_str("\nNets: none found.\n");
+        return out;
+    }
+
+    out.push_str(&format!("\nNets ({}):\n", nets.len()));
+    for net in &nets {
+        let nodes: Vec<String> = net.nodes.iter()
+            .map(|(r, pin)| format!("{r}.{pin}"))
+            .collect();
+        out.push_str(&format!(
+            "  {:<28} [{}] {}\n",
+            net.name, nodes.len(), nodes.join(", ")
+        ));
+    }
+    out.push_str("\n(pass raw=true for the full netlist S-expression)\n");
+    out
 }
 
 /// Parse the `(nets (net (code ...) (name "...") (node (ref "...") (pin "...") ...) ...) ...)`
@@ -8193,6 +9014,66 @@ mod tests {
 ".to_string()
     }
 
+    /// Two footprints copied from a real board, both rotated, plus one unrotated
+    /// control. Expected absolute pad positions are KiCad's own — taken from the
+    /// coordinates its DRC report cites for these exact pads.
+    fn sample_pcb_rotated_footprints() -> String {
+        "\
+(kicad_pcb
+\t(footprint \"Nano\"
+\t\t(layer \"F.Cu\")
+\t\t(at 115.64 65.23 -90)
+\t\t(property \"Reference\" \"U1\"
+\t\t\t(at 0 0 0)
+\t\t)
+\t\t(pad \"5\" thru_hole circle (at -7.5 -7.62) (size 1.7 1.7) (drill 1) (layers \"*.Cu\" \"*.Mask\") (net \"CLK\"))
+\t)
+\t(footprint \"Conn\"
+\t\t(layer \"F.Cu\")
+\t\t(at 138.86 68.73 90)
+\t\t(property \"Reference\" \"MOUSE1\"
+\t\t\t(at 0 0 0)
+\t\t)
+\t\t(pad \"5\" thru_hole circle (at 6.8 0) (size 1.7 1.7) (drill 1.1) (layers \"*.Cu\" \"*.Mask\") (net \"CLK\"))
+\t)
+\t(footprint \"Res\"
+\t\t(layer \"F.Cu\")
+\t\t(at 123.33 61.73 0)
+\t\t(property \"Reference\" \"R1\"
+\t\t\t(at 0 0 0)
+\t\t)
+\t\t(pad \"2\" thru_hole circle (at 7.62 0) (size 1.7 1.7) (drill 0.8) (layers \"*.Cu\" \"*.Mask\") (net \"CLK\"))
+\t)
+)
+".to_string()
+    }
+
+    #[test]
+    fn parse_pcb_pads_matches_kicad_absolute_positions_for_rotated_footprints() {
+        let pads = parse_pcb_pads(&sample_pcb_rotated_footprints());
+        let get = |r: &str, n: &str| {
+            pads.iter().find(|p| p.reference == r && p.pad_num == n)
+                .unwrap_or_else(|| panic!("pad {r}.{n} not parsed"))
+        };
+
+        // Ground truth: the positions KiCad's own DRC reports for these pads.
+        // The Y axis points down, so footprint rotation must negate the sin terms.
+        // With the naive CCW matrix these came out mirrored to the opposite corner
+        // — U1.5 landed at (108.02,72.73) and MOUSE1.5 at (138.86,75.53), which is
+        // what made route_net start a trace from thin air.
+        for (r, n, ex, ey) in [
+            ("U1", "5", 123.26, 57.73),
+            ("MOUSE1", "5", 138.86, 61.93),
+            ("R1", "2", 130.95, 61.73), // unrotated control — sign error is invisible here
+        ] {
+            let p = get(r, n);
+            assert!(
+                (p.x - ex).abs() < 0.01 && (p.y - ey).abs() < 0.01,
+                "{r}.{n} parsed as ({:.2},{:.2}), KiCad says ({ex:.2},{ey:.2})", p.x, p.y
+            );
+        }
+    }
+
     #[tokio::test]
     async fn query_pads_in_region_layer_filter_excludes_non_matching_smd_pads() {
         let dir = std::env::temp_dir().join(format!("kicad2print_test_qpir_{}", std::process::id()));
@@ -8395,5 +9276,403 @@ mod tests {
         ];
         let result = check_pad_connectivity(&pads, &[], &[], "U1", "1", "U2", "1");
         assert_eq!(result, Ok(false), "genuinely unrouted pads must still report DISCONNECTED");
+    }
+
+    #[test]
+    fn summarize_kicad_report_groups_drc_violations_and_caps_details() {
+        let drc_json = r#"{
+            "violations": [
+                {"description": "Clearance violation (netclass 'Default' clearance 0.2000 mm; actual 0.0650 mm)",
+                 "severity": "error", "type": "clearance",
+                 "items": [
+                    {"description": "Track [JP56] on F.Cu, length 5.1500 mm", "pos": {"x": 118.1, "y": 77.96}, "uuid": "b067ed13-3072-4a67-99a4-74469ba9900b"},
+                    {"description": "PTH pad 1 [JP12] of JP1", "pos": {"x": 118.1, "y": 77.96}, "uuid": "e9e8d1b5-bc7d-40c1-abaf-b6eceae27b60"}
+                 ]},
+                {"description": "Courtyards overlap", "severity": "warning", "type": "courtyards_overlap", "items": []}
+            ],
+            "unconnected_items": [
+                {"description": "Missing connection between items", "severity": "error", "type": "unconnected_items",
+                 "items": [
+                    {"description": "PTH pad 1 [VBUS] of U2", "pos": {"x": 97.64, "y": 63.46}, "uuid": "9af7e782-d02f-4e9f-ae47-cd5e5c120291"},
+                    {"description": "PTH pad 3 [VBUS] of U2", "pos": {"x": 113.14, "y": 66.0}, "uuid": "94c0deca-099b-4891-b68b-e2fc53ca0e24"}
+                 ]}
+            ]
+        }"#;
+        let v: serde_json::Value = serde_json::from_str(drc_json).unwrap();
+        let summary = summarize_kicad_report(
+            "DRC",
+            &[("violations", &v["violations"]), ("unconnected", &v["unconnected_items"])],
+            50,
+        );
+
+        assert!(summary.contains("DRC: 3 violation(s)"));
+        assert!(summary.contains("clearance: 1"));
+        assert!(summary.contains("courtyards_overlap: 1"));
+        assert!(summary.contains("unconnected_items: 1"));
+        assert!(summary.contains("Track [JP56] on F.Cu, length 5.1500 mm @ (118.10, 77.96)"));
+        // uuids must never leak into the condensed report
+        assert!(!summary.contains("uuid"));
+        assert!(!summary.contains("b067ed13"));
+
+        // max_details caps the itemized list but never the type counts
+        let capped = summarize_kicad_report(
+            "DRC",
+            &[("violations", &v["violations"]), ("unconnected", &v["unconnected_items"])],
+            1,
+        );
+        assert!(capped.contains("clearance: 1"));
+        assert!(capped.contains("courtyards_overlap: 1"));
+        assert!(capped.contains("2 more violation(s) not shown"));
+    }
+
+    fn rt_pad(reference: &str, num: &str, net: &str, x: f64, y: f64, size: f64) -> PcbPad {
+        PcbPad {
+            reference: reference.into(), pad_num: num.into(), net: net.into(),
+            x, y, width: size, height: size, is_thru_hole: true,
+            layers: vec!["F.Cu".to_string(), "B.Cu".to_string()],
+        }
+    }
+
+    const RT_LAYERS_BOTH: [&str; 2] = ["B.Cu", "F.Cu"];
+
+    /// Config mirroring the tool's defaults, over the given layer set.
+    fn rt_cfg<'a>(layers: &'a [String], bounds: (f64, f64, f64, f64)) -> RouteConfig<'a> {
+        RouteConfig {
+            layers,
+            net: "SIG",
+            width: 0.25,
+            clearance: 0.2,
+            grid: 0.635,
+            bounds,
+            via_diameter: 0.8,
+            via_cost_mm: 2.5,
+            max_nodes: 400_000,
+        }
+    }
+
+    fn rt_layers(names: &[&str]) -> Vec<String> {
+        names.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// Every same-layer segment of a route must run at a multiple of 45 degrees,
+    /// except the final stub onto the (off-grid) destination pad centre.
+    fn assert_octilinear_except_stub(steps: &[RouteStep]) {
+        for (idx, w) in steps.windows(2).enumerate() {
+            if w[0].layer != w[1].layer { continue; }
+            let dx = (w[1].x - w[0].x).abs();
+            let dy = (w[1].y - w[0].y).abs();
+            let ok = dx < 1e-9 || dy < 1e-9 || (dx - dy).abs() < 1e-6;
+            let is_last = idx == steps.len() - 2;
+            assert!(
+                ok || is_last,
+                "segment {idx} ({:.3},{:.3})→({:.3},{:.3}) is not at a 45-degree multiple",
+                w[0].x, w[0].y, w[1].x, w[1].y
+            );
+        }
+    }
+
+    fn rt_len(steps: &[RouteStep]) -> f64 {
+        steps.windows(2)
+            .filter(|w| w[0].layer == w[1].layer)
+            .map(|w| ((w[1].x - w[0].x).powi(2) + (w[1].y - w[0].y).powi(2)).sqrt())
+            .sum()
+    }
+
+    fn rt_vias(steps: &[RouteStep]) -> usize {
+        steps.windows(2).filter(|w| w[0].layer != w[1].layer).count()
+    }
+
+    #[test]
+    fn route_octilinear_takes_the_direct_line_across_empty_board() {
+        let layers = rt_layers(&["B.Cu"]);
+        let steps = route_octilinear(
+            &[], &[], (10.0, 10.0), (20.0, 10.0), &[0], &[0],
+            &rt_cfg(&layers, (0.0, 0.0, 50.0, 50.0)),
+        ).expect("empty board must be routable");
+
+        // Nothing in the way, so the whole run collapses to a single straight segment.
+        assert_eq!(steps.len(), 2, "unobstructed route should collapse to one segment, got {steps:?}");
+        assert_eq!((steps[0].x, steps[0].y), (10.0, 10.0));
+        assert_eq!((steps[1].x, steps[1].y), (20.0, 10.0));
+        assert_eq!(rt_vias(&steps), 0, "a straight shot must not place vias");
+    }
+
+    #[test]
+    fn route_octilinear_detours_around_a_foreign_pad_and_keeps_clearance() {
+        // A fat pad on a different net sits exactly on the straight-line path.
+        let pads = vec![rt_pad("U9", "1", "OTHER", 15.0, 10.0, 3.0)];
+        let layers = rt_layers(&["B.Cu"]);
+
+        let steps = route_octilinear(
+            &pads, &[], (10.0, 10.0), (20.0, 10.0), &[0], &[0],
+            &rt_cfg(&layers, (0.0, 0.0, 50.0, 50.0)),
+        ).expect("a detour around a single pad must exist");
+
+        assert!(steps.len() > 2, "route should have bent around the pad, got {steps:?}");
+        assert_octilinear_except_stub(&steps);
+
+        // The real assertion: every emitted segment is genuinely clear of the pad.
+        for w in steps.windows(2) {
+            assert!(
+                segment_is_clear(&pads, &[], w[0].x, w[0].y, w[1].x, w[1].y, "B.Cu", "SIG", 0.25, 0.2),
+                "emitted segment ({:.3},{:.3})→({:.3},{:.3}) violates clearance",
+                w[0].x, w[0].y, w[1].x, w[1].y
+            );
+        }
+
+        // And it must actually clear the obstacle by the required margin.
+        let required = 0.25 / 2.0 + 3.0 / 2.0 + 0.2;
+        let closest = steps.windows(2)
+            .map(|w| point_to_segment_dist(15.0, 10.0, w[0].x, w[0].y, w[1].x, w[1].y))
+            .fold(f64::MAX, f64::min);
+        assert!(closest >= required - 1e-9, "closest approach {closest:.3}mm < required {required:.3}mm");
+    }
+
+    #[test]
+    fn route_octilinear_ignores_same_net_copper_but_respects_foreign_traces() {
+        let layers = rt_layers(&["B.Cu"]);
+        // An existing trace on our own net is not an obstacle — we may tee into it.
+        let same_net = PcbSegment {
+            x1: 15.0, y1: 5.0, x2: 15.0, y2: 15.0,
+            layer: "B.Cu".into(), net: "SIG".into(), width: 0.25,
+        };
+        let steps = route_octilinear(
+            &[], std::slice::from_ref(&same_net), (10.0, 10.0), (20.0, 10.0), &[0], &[0],
+            &rt_cfg(&layers, (0.0, 0.0, 50.0, 50.0)),
+        ).expect("same-net trace must not block");
+        assert_eq!(steps.len(), 2, "same-net copper should not force a detour");
+
+        // The identical trace on a foreign net must force a detour instead.
+        let foreign = PcbSegment { net: "OTHER".into(), ..same_net };
+        let steps = route_octilinear(
+            &[], std::slice::from_ref(&foreign), (10.0, 10.0), (20.0, 10.0), &[0], &[0],
+            &rt_cfg(&layers, (0.0, 0.0, 50.0, 50.0)),
+        ).expect("route should go around the foreign trace");
+        assert!(steps.len() > 2, "foreign trace must force a detour, got {steps:?}");
+    }
+
+    #[test]
+    fn route_octilinear_ignores_obstacles_on_a_different_layer() {
+        let layers = rt_layers(&["B.Cu"]);
+        // The same blocking trace on F.Cu is irrelevant when routing on B.Cu.
+        let other_layer = PcbSegment {
+            x1: 15.0, y1: 5.0, x2: 15.0, y2: 15.0,
+            layer: "F.Cu".into(), net: "OTHER".into(), width: 0.25,
+        };
+        let steps = route_octilinear(
+            &[], std::slice::from_ref(&other_layer), (10.0, 10.0), (20.0, 10.0), &[0], &[0],
+            &rt_cfg(&layers, (0.0, 0.0, 50.0, 50.0)),
+        ).expect("different-layer copper must not block");
+        assert_eq!(steps.len(), 2, "a trace on another layer should not cause a detour");
+    }
+
+    #[test]
+    fn route_octilinear_hops_layers_to_cross_a_blocking_wall() {
+        // A long foreign trace walls off B.Cu completely — the only way past is to
+        // via down to F.Cu, cross, and via back up. This is the case that turned a
+        // 16mm hop into a 99mm detour before via support existed. Both pads are
+        // pinned to B.Cu (SMD), so the router cannot simply start on the far layer.
+        let wall = PcbSegment {
+            x1: 15.0, y1: -50.0, x2: 15.0, y2: 50.0,
+            layer: "B.Cu".into(), net: "OTHER".into(), width: 0.25,
+        };
+        let layers = rt_layers(&RT_LAYERS_BOTH);
+        let steps = route_octilinear(
+            &[], std::slice::from_ref(&wall), (10.0, 10.0), (20.0, 10.0),
+            &[0], &[0], &rt_cfg(&layers, (0.0, 0.0, 50.0, 50.0)),
+        ).expect("the router must be able to via around a full-height wall");
+
+        assert!(rt_vias(&steps) >= 1, "crossing the wall requires at least one via, got {steps:?}");
+        // Going over on the other layer should stay near the direct 10mm distance
+        // rather than snaking around the wall's ends.
+        assert!(rt_len(&steps) < 20.0, "via route should stay short, got {:.2}mm", rt_len(&steps));
+
+        // Every B.Cu segment must still clear the wall.
+        for w in steps.windows(2) {
+            if w[0].layer != w[1].layer { continue; }
+            let name = &layers[w[0].layer];
+            assert!(
+                segment_is_clear(&[], std::slice::from_ref(&wall),
+                                 w[0].x, w[0].y, w[1].x, w[1].y, name, "SIG", 0.25, 0.2),
+                "segment on {name} ({:.2},{:.2})→({:.2},{:.2}) collides with the wall",
+                w[0].x, w[0].y, w[1].x, w[1].y
+            );
+        }
+    }
+
+    #[test]
+    fn route_octilinear_will_not_drop_a_via_on_top_of_foreign_copper() {
+        // Wall on B.Cu, and F.Cu is blanketed by a foreign plane in the crossing
+        // region, so no legal via site exists near the wall — the router must go
+        // around rather than place an illegal via.
+        let wall = PcbSegment {
+            x1: 15.0, y1: -50.0, x2: 15.0, y2: 50.0,
+            layer: "B.Cu".into(), net: "OTHER".into(), width: 0.25,
+        };
+        let blanket = PcbSegment {
+            x1: 12.0, y1: 10.0, x2: 18.0, y2: 10.0,
+            layer: "F.Cu".into(), net: "OTHER".into(), width: 6.0,
+        };
+        let obstacles = vec![wall, blanket];
+        let layers = rt_layers(&RT_LAYERS_BOTH);
+        let steps = route_octilinear(
+            &[], &obstacles, (10.0, 10.0), (20.0, 10.0),
+            &[0, 1], &[0, 1], &rt_cfg(&layers, (0.0, 0.0, 50.0, 50.0)),
+        ).expect("a route around the obstacles should still exist");
+
+        // Any via that was placed must be legal on both layers.
+        for w in steps.windows(2) {
+            if w[0].layer == w[1].layer { continue; }
+            assert!(
+                via_is_clear(&[], &obstacles, w[0].x, w[0].y, &layers, "SIG", 0.8, 0.2),
+                "placed an illegal via at ({:.2},{:.2})", w[0].x, w[0].y
+            );
+        }
+    }
+
+    #[test]
+    fn route_octilinear_prefers_staying_on_one_layer_when_the_path_is_clear() {
+        // With both layers free, an unobstructed hop must not waste a via.
+        let layers = rt_layers(&RT_LAYERS_BOTH);
+        let steps = route_octilinear(
+            &[], &[], (10.0, 10.0), (20.0, 10.0), &[0, 1], &[0, 1],
+            &rt_cfg(&layers, (0.0, 0.0, 50.0, 50.0)),
+        ).expect("empty board must be routable");
+        assert_eq!(rt_vias(&steps), 0, "no via should be placed on a clear straight run");
+    }
+
+    #[test]
+    fn route_octilinear_fails_cleanly_when_fully_walled_in() {
+        // Ring the destination with foreign pads so no approach exists. THT pads
+        // block every layer, so vias cannot rescue this either.
+        let mut pads = Vec::new();
+        for (dx, dy) in [(-1.0, -1.0), (0.0, -1.0), (1.0, -1.0), (-1.0, 0.0),
+                         (1.0, 0.0), (-1.0, 1.0), (0.0, 1.0), (1.0, 1.0)] {
+            pads.push(rt_pad("W", "1", "WALL", 20.0 + dx * 1.5, 10.0 + dy * 1.5, 2.0));
+        }
+        let layers = rt_layers(&RT_LAYERS_BOTH);
+        let err = route_octilinear(
+            &pads, &[], (10.0, 10.0), (20.0, 10.0), &[0, 1], &[0, 1],
+            &rt_cfg(&layers, (0.0, 0.0, 50.0, 50.0)),
+        ).expect_err("a walled-in destination must not produce a bogus route");
+        assert!(err.contains("no clear path"), "unhelpful failure message: {err}");
+    }
+
+    #[test]
+    fn route_octilinear_stays_inside_the_board_outline() {
+        // A narrow board: the router must not step outside it to get around the pad.
+        let pads = vec![rt_pad("U9", "1", "OTHER", 15.0, 10.0, 2.0)];
+        let bounds = (0.0, 8.0, 50.0, 12.0);
+        let layers = rt_layers(&["B.Cu"]);
+        let mut cfg = rt_cfg(&layers, bounds);
+        cfg.grid = 0.3175;
+        let steps = route_octilinear(
+            &pads, &[], (10.0, 10.0), (20.0, 10.0), &[0], &[0], &cfg,
+        ).expect("a squeeze inside the narrow board should exist");
+
+        let margin = 0.25 / 2.0 + 0.2;
+        for s in &steps {
+            assert!(
+                s.y >= bounds.1 + margin - 1e-6 && s.y <= bounds.3 - margin + 1e-6,
+                "waypoint ({:.3},{:.3}) escaped the board outline", s.x, s.y
+            );
+        }
+    }
+
+    #[test]
+    fn route_octilinear_respects_smd_pad_layer_restrictions() {
+        // Destination reachable only on F.Cu — the route must end on that layer.
+        let layers = rt_layers(&RT_LAYERS_BOTH);
+        let steps = route_octilinear(
+            &[], &[], (10.0, 10.0), (20.0, 10.0), &[0, 1], &[1],
+            &rt_cfg(&layers, (0.0, 0.0, 50.0, 50.0)),
+        ).expect("an F.Cu-only destination must still be routable");
+        assert_eq!(steps.last().map(|s| s.layer), Some(1), "route must arrive on F.Cu");
+    }
+
+    #[test]
+    fn collapse_collinear_keeps_bends_and_every_layer_change() {
+        let p = |x: f64, y: f64, layer: usize| RouteStep { x, y, layer };
+
+        let straight = vec![p(0.0, 0.0, 0), p(1.0, 0.0, 0), p(2.0, 0.0, 0), p(3.0, 0.0, 0)];
+        assert_eq!(collapse_collinear(&straight), vec![p(0.0, 0.0, 0), p(3.0, 0.0, 0)]);
+
+        let with_bend = vec![p(0.0, 0.0, 0), p(1.0, 0.0, 0), p(2.0, 1.0, 0), p(3.0, 2.0, 0)];
+        assert_eq!(
+            collapse_collinear(&with_bend),
+            vec![p(0.0, 0.0, 0), p(1.0, 0.0, 0), p(3.0, 2.0, 0)]
+        );
+
+        // A via sits mid-way along an otherwise straight run: collapsing must not
+        // swallow it, or the emitted trace would jump layers with no via at all.
+        let with_via = vec![p(0.0, 0.0, 0), p(1.0, 0.0, 0), p(1.0, 0.0, 1), p(2.0, 0.0, 1)];
+        let out = collapse_collinear(&with_via);
+        assert_eq!(out.len(), 4, "layer change must survive collapsing: {out:?}");
+        assert_eq!(out.windows(2).filter(|w| w[0].layer != w[1].layer).count(), 1);
+    }
+
+    #[test]
+    fn summarize_netlist_keeps_components_and_connectivity_drops_boilerplate() {
+        let netlist = "\
+(export
+\t(components
+\t\t(comp
+\t\t\t(ref \"R1\")
+\t\t\t(value \"10k\")
+\t\t\t(footprint \"Resistor_THT:R_Axial_DIN0207_L6.3mm_D2.5mm_P7.62mm_Horizontal\")
+\t\t\t(datasheet \"~\")
+\t\t\t(sheetpath (names \"/\") (tstamps \"/\"))
+\t\t\t(tstamps \"aaaa-bbbb\")
+\t\t)
+\t\t(comp
+\t\t\t(ref \"U1\")
+\t\t\t(value \"Arduino_Nano\")
+\t\t\t(footprint \"Module:Arduino_Nano\")
+\t\t\t(datasheet \"~\")
+\t\t)
+\t)
+\t(libparts
+\t\t(libpart
+\t\t\t(lib \"Device\")
+\t\t\t(part \"R\")
+\t\t\t(description \"THIS ENTIRE SECTION IS BOILERPLATE\")
+\t\t)
+\t)
+\t(nets
+\t\t(net
+\t\t\t(code \"1\")
+\t\t\t(name \"CLK\")
+\t\t\t(node (ref \"R1\") (pin \"2\") (pintype \"passive\"))
+\t\t\t(node (ref \"U1\") (pin \"5\") (pintype \"passive\"))
+\t\t)
+\t\t(net
+\t\t\t(code \"2\")
+\t\t\t(name \"GND\")
+\t\t\t(node (ref \"U1\") (pin \"4\") (pintype \"power_in\"))
+\t\t)
+\t)
+)
+";
+        let s = summarize_netlist(netlist);
+
+        assert!(s.contains("Components (2)"), "component count missing: {s}");
+        assert!(s.contains("R1") && s.contains("10k"), "component row missing: {s}");
+        assert!(s.contains("Module:Arduino_Nano"), "footprint missing: {s}");
+
+        assert!(s.contains("Nets (2)"), "net count missing: {s}");
+        // Connectivity is the whole point — every node must survive.
+        assert!(s.contains("R1.2") && s.contains("U1.5"), "CLK nodes missing: {s}");
+        assert!(s.contains("U1.4"), "GND node missing: {s}");
+
+        // The libparts section is pure noise and must be dropped.
+        assert!(!s.contains("BOILERPLATE"), "libparts leaked into summary: {s}");
+        assert!(!s.contains("datasheet"), "per-component metadata leaked: {s}");
+        assert!(s.len() < netlist.len(), "summary should be smaller than the raw netlist");
+    }
+
+    #[test]
+    fn summarize_kicad_report_handles_empty_violations() {
+        let summary = summarize_kicad_report("ERC", &[("violations", &serde_json::Value::Array(vec![]))], 50);
+        assert_eq!(summary, "ERC: no violations found.");
     }
 }
