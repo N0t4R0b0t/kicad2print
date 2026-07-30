@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "kicad2print": {
+      "type": "stdio",
+      "command": "target/release/kicad2print",
+      "args": ["--mcp"],
+      "env": {},
+      "tools": ["*"]
+    }
+  }
+}

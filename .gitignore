@@ -11,7 +11,6 @@
 # Keep example files
 !examples/**/*.stl
 !examples/**/*.3mf
-.mcp.json
 
 # OS
 .DS_Store
@@ -21,7 +20,13 @@ desktop.ini
 # Logs
 logs/
 *.log
-.claude/
+
+# Claude Code config: local settings and worktrees stay private, but the
+# kicad-worker subagent definition ships with the repo.
+.claude/*
+!.claude/agents/
+.claude/agents/*
+!.claude/agents/kicad-worker.md
 
 # Personal / unpublished drafts
 LINKEDIN.md

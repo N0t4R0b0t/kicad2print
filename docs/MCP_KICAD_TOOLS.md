@@ -42,6 +42,51 @@ They are least useful — and most dangerous — for large routing sessions, net
 
 ---
 
+## Setup
+
+### Wiring up the server
+
+`.mcp.json` in the repo root registers the server and ships with the project. It points at the release binary, so build once first:
+
+```bash
+cargo build --release
+```
+
+Then start Claude Code from the repo root. To use the tools from a *board* project instead (the more common case — you usually want to edit a board, not this repo), add the same block to that project's `.mcp.json` or to `~/.claude.json`, with an absolute path to the binary:
+
+```json
+{
+  "mcpServers": {
+    "kicad2print": {
+      "command": "/path/to/kicad2print/target/release/kicad2print",
+      "args": ["--mcp"]
+    }
+  }
+}
+```
+
+The server does not hot-reload. After rebuilding the binary, reconnect the server (`/mcp reconnect`) or restart the session, or you will keep talking to the old build.
+
+### The `kicad-worker` subagent
+
+`.claude/agents/kicad-worker.md` ships with this repo. It is a Haiku-model subagent scoped to the `mcp__kicad2print__*` tools that executes mechanical, already-decided work — DRC/ERC runs, file reads and greps, position and net lookups, renders, and specific edits — and reports back a condensed digest instead of raw tool output.
+
+**Why it exists:** these tools return large payloads. A DRC report on a modest board is thousands of tokens; a netlist or layer SVG is tens of thousands. Routing that through a cheap subagent keeps it out of the main conversation, where it would otherwise crowd out the actual design reasoning.
+
+It loads automatically when you work inside this repo. To use it from a board project as well:
+
+```bash
+cp .claude/agents/kicad-worker.md ~/.claude/agents/
+```
+
+Agent definitions are read at session start — after adding or editing one, reload the session before the agent becomes available.
+
+**Give it decided work, not decisions.** It is deliberately not the right tool for choosing between footprint candidates, diagnosing why a route failed, or weighing trade-offs. Resolve those in the main conversation and hand the agent the resulting concrete action.
+
+**When you add a new MCP tool, add it to the agent's `tools:` list.** The list is an explicit allowlist; a tool missing from it is invisible to the agent, which will report the tool as unavailable rather than failing loudly.
+
+---
+
 ## Tool reference
 
 ### Inspection tools (read-only, safe to call freely)
@@ -57,11 +102,11 @@ They are least useful — and most dangerous — for large routing sessions, net
 | `query_traces_in_region` | All copper trace segments whose bounding box overlaps a region — pairs with `query_pads_in_region` for pre-routing reconnaissance. Uses bounding-box overlap (conservative: a shallow diagonal segment can rarely be reported when only its bbox, not the segment itself, clips the region). |
 | `check_trace_clearance` | Collision and clearance check for a proposed segment — call before `add_trace`. Checks the segment against **both** existing pads and existing traces (different-layer and same-net traces are exempted; pass `net` so same-net T-junctions aren't false-flagged). |
 | `verify_connectivity` | BFS through traces and vias to confirm two pads are physically wired |
-| `export_layer_svg` | Export copper layers as SVG + PNG image |
-| `export_netlist` | Full component and net connectivity from a schematic |
+| `export_layer_svg` | Export copper layers as a PNG preview image plus the path to the saved SVG. The SVG markup is **not** inlined by default (it runs to tens of thousands of tokens) — grep the saved file for exact coordinates, or pass `include_svg_source: true`. |
+| `export_netlist` | Condensed component list (ref, value, footprint) and every net with its pads. Pass `raw: true` for the full kicad-cli S-expression, which is ~10x larger and mostly library boilerplate. |
 | `export_bom` | Bill of materials as CSV |
-| `run_drc` | Design Rules Check — JSON report + board render |
-| `run_erc` | Electrical Rules Check on a schematic |
+| `run_drc` | Design Rules Check — violations grouped by type with counts, capped by `max_details` (default 50). Pass `raw: true` for the full JSON, `include_render: true` for a board image (off by default). Reads design rules from the sibling `.kicad_pro`; a board copied without it is checked against stricter defaults and reports different counts. |
+| `run_erc` | Electrical Rules Check on a schematic — same condensed grouping as `run_drc`, with `raw` and `max_details`. |
 | `grep_kicad_file` | Substring search in a KiCad file with line context |
 | `read_kicad_file` | Read any `.kicad_pcb` or `.kicad_sch` file |
 | `read_kicad_section` | Read one named section of a large file |
@@ -81,6 +126,7 @@ Each edit tool that modifies a `.kicad_pcb` file renders the board afterward. Sc
 | Tool | What it does | Risk |
 |---|---|---|
 | `add_power_symbol` | Adds a power net symbol — embeds `lib_symbols` definition and places instance atomically | Low — but verify the net name with `list_nets` first |
+| `route_net` | **Route a whole net between two pads with one call.** Server-side octilinear (45°) A* that avoids existing pads and traces at proper clearance, switches layers through vias when needed, and writes every segment itself. Omit `layer` to let it use both sides; `dry_run: true` previews the path. Rejects a route longer than `max_length_ratio` (default 3.0) × the direct distance rather than committing a board-spanning detour. | Medium — prefer this over emitting many `add_trace` calls; still verify with `run_drc` |
 | `add_trace` | Add a copper segment. Net is a string name, not a number. Optional `check: true` runs the same collision check as `check_trace_clearance` before writing and refuses on any COLLISION (add `force: true` to write anyway); default is `check: false`, matching prior always-write behavior. | **Pass `check: true`** for routing sessions. A trace through a pad passes DRC until fill_zones runs |
 | `add_wire` | Add a schematic wire | Low — schematic preview shown |
 | `add_label` | Add a net label to a schematic | Low |
@@ -119,10 +165,12 @@ Then follow this order:
 
 1. **`list_nets`** — discover exact net names before touching anything
 2. **`query_pads_in_region`** and **`query_traces_in_region`** — inspect the area you intend to route, both pads and existing copper
-3. **`check_trace_clearance`** (pass the trace's `net`, so same-net T-junctions aren't false-flagged) — verify proposed segment is clear of both pads and existing traces, or equivalently call `add_trace` with `check: true`
-4. **`add_trace`** (or other edit) — make the change
+3. **`route_net`** — for an ordinary pad-to-pad connection, let the router compute the geometry. Use `dry_run: true` first to see the path and its length ratio before committing.
+4. **`add_trace`** (with `check: true`, passing the trace's `net`) — only when you need a specific segment the router wouldn't choose, e.g. a deliberate shape or a partial run. `check_trace_clearance` does the same collision test standalone.
 5. **`verify_connectivity`** — confirm the pads are now wired
-6. **`run_drc`** — full design rules pass with board render
+6. **`run_drc`** — full design rules pass
+
+**On net order:** `route_net` handles one connection at a time and knows nothing about the ones you haven't asked for yet. Routing a board from scratch therefore depends on the order you pick — an early net can wall off a corridor a later net needs, and you find out only when the later route fails or returns a wild detour. Route power and wide traces first, decide a layer convention up front (e.g. pass `layer` explicitly to keep one side for horizontal runs), and treat a rejected over-long route as a signal to rip something up rather than a reason to raise `max_length_ratio`.
 
 If routing goes wrong, use **`delete_trace`** (filtered by `net`, `layer`, `uuid`, or region, with `dry_run: true` to preview first) to remove the bad segments — don't fall back to an ad-hoc script over the raw file.
 
@@ -131,6 +179,8 @@ Open KiCad to visually confirm any change that you can't fully describe from the
 ---
 
 ## Known limitations
+
+**Pad positions on rotated footprints were wrong before 2026-07-30.** `parse_pcb_pads` used a plain counter-clockwise rotation matrix, but the PCB Y axis points down, so the sin terms must be negated. Every rotated footprint had its pads mirrored to the opposite corner — a `-90°` part reported pads ~21 mm from their true location — while unrotated parts were unaffected, which is why it went unnoticed. This silently corrupted `get_pad_position`, `check_trace_clearance`, `verify_connectivity`, `query_pads_in_region`, and `route_net`. Fixed and pinned by a regression test against KiCad's own reported coordinates. If you acted on pad coordinates from an older build, re-check them.
 
 **`verify_connectivity` false negatives:** connectivity is checked by matching trace endpoints to pad centres using millimetre coordinates bucketed to a 5 micron grid. If a pad position computed from a rotated footprint differs from the trace endpoint by more than 5 µm — well beyond ordinary floating-point drift, but possible in unusual cases — the BFS will report DISCONNECTED even when the board is correctly routed. Treat DISCONNECTED as "worth checking in KiCad", not as a confirmed fault.
 
