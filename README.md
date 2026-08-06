@@ -246,6 +246,21 @@ See [docs/MCP_KICAD_TOOLS.md](docs/MCP_KICAD_TOOLS.md) for the full tool list, r
 
 ---
 
+## Claude Code plugin (recommended for agents)
+
+The MCP server above also installs as a [Claude Code plugin](https://code.claude.com/docs/en/plugins), which — unlike Claude Desktop — can bundle custom subagents alongside the MCP tools. This repo self-hosts its own plugin marketplace.
+
+**Prerequisite:** the `kicad2print` binary must already be installed and on your `PATH` (see [Installation](#installation) above) — the plugin points at it by name, it doesn't bundle the binary.
+
+```
+/plugin marketplace add N0t4R0b0t/kicad2print
+/plugin install kicad2print@kicad2print
+```
+
+Claude Desktop has no concept of agents — it only reads the plain MCP config shown above. Use the Claude Code plugin if you want the bundled agent(s) as well as the MCP tools.
+
+---
+
 ## Troubleshooting
 
 | Symptom | Cause | Fix |

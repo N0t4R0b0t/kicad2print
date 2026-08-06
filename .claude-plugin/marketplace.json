@@ -1,0 +1,12 @@
+{
+  "name": "kicad2print",
+  "owner": { "name": "N0t4R0b0t", "url": "https://github.com/N0t4R0b0t" },
+  "description": "Self-hosted marketplace for the kicad2print Claude Code plugin.",
+  "plugins": [
+    {
+      "name": "kicad2print",
+      "source": "./",
+      "description": "Convert KiCad PCB designs to 3D-printable substrate models, with MCP tools and agents for editing KiCad boards from Claude."
+    }
+  ]
+}
