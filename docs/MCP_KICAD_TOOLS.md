@@ -189,7 +189,11 @@ Open KiCad to visually confirm any change that you can't fully describe from the
 
 ## Known limitations
 
-**Pad positions on rotated footprints were wrong before 2026-07-30.** `parse_pcb_pads` used a plain counter-clockwise rotation matrix, but the PCB Y axis points down, so the sin terms must be negated. Every rotated footprint had its pads mirrored to the opposite corner — a `-90°` part reported pads ~21 mm from their true location — while unrotated parts were unaffected, which is why it went unnoticed. This silently corrupted `get_pad_position`, `check_trace_clearance`, `verify_connectivity`, `query_pads_in_region`, and `route_net`. Fixed and pinned by a regression test against KiCad's own reported coordinates. If you acted on pad coordinates from an older build, re-check them.
+**Pad positions on rotated footprints were wrong before 2026-07-30.** The rotation used a plain counter-clockwise matrix, but the PCB Y axis points down, so the sin terms must be negated. Every rotated footprint had its pads mirrored to the opposite corner — a `-90°` part reported pads ~21 mm from their true location — while unrotated parts were unaffected, which is why it went unnoticed.
+
+The PCB side had **three independent implementations** of "absolute pad position" and all three carried the bug: `parse_pcb_pads` (behind `route_net`, `check_trace_clearance`, `verify_connectivity`, `query_pads_in_region`), `extract_pad_positions` (behind `get_pad_position`), and `collect_pad_positions` (behind `cleanup_traces`' orphan detection — so it could delete a segment that really did land on a rotated footprint's pad). All are fixed and pinned by a single test that checks every path against KiCad's own reported coordinates. The schematic pin path is separate code with its own Y-flip handling and was already correct.
+
+If you acted on pad coordinates from an older build, re-check them.
 
 **`verify_connectivity` false negatives:** connectivity is checked by matching trace endpoints to pad centres using millimetre coordinates bucketed to a 5 micron grid. If a pad position computed from a rotated footprint differs from the trace endpoint by more than 5 µm — well beyond ordinary floating-point drift, but possible in unusual cases — the BFS will report DISCONNECTED even when the board is correctly routed. Treat DISCONNECTED as "worth checking in KiCad", not as a confirmed fault.
 

@@ -1616,8 +1616,9 @@ fn extract_pad_positions(block: &str) -> Vec<(String, f64, f64, String)> {
             if let (Some(sx), Some(sy)) = (parts.next(), parts.next()) {
                 let sy_clean = sy.trim_end_matches(')');
                 if let (Ok(lx), Ok(ly)) = (sx.parse::<f64>(), sy_clean.parse::<f64>()) {
-                    let gx = fp_x + lx * cos_r - ly * sin_r;
-                    let gy = fp_y + lx * sin_r + ly * cos_r;
+                    // Y-down rotation: sin terms negated. See parse_pcb_pads.
+                    let gx = fp_x + lx * cos_r + ly * sin_r;
+                    let gy = fp_y - lx * sin_r + ly * cos_r;
                     pads.push((pad_num, gx, gy, layer));
                 }
             }
@@ -1987,9 +1988,13 @@ fn collect_pad_positions(content: &str) -> Vec<(f64, f64)> {
                         .collect();
                     if nums.len() >= 2 {
                         let (px, py) = (nums[0], nums[1]);
-                        // Rotate pad position by footprint rotation
-                        let gx = fx + px * cos_r - py * sin_r;
-                        let gy = fy + px * sin_r + py * cos_r;
+                        // Rotate pad position by footprint rotation. Y-down, so the
+                        // sin terms are negated — see parse_pcb_pads. Getting this
+                        // wrong here made cleanup_traces judge orphan-ness against
+                        // mirrored pad positions, so it could delete a segment that
+                        // really was landing on a rotated footprint's pad.
+                        let gx = fx + px * cos_r + py * sin_r;
+                        let gy = fy - px * sin_r + py * cos_r;
                         positions.push((gx, gy));
                     }
                 }
@@ -9070,6 +9075,47 @@ mod tests {
             assert!(
                 (p.x - ex).abs() < 0.01 && (p.y - ey).abs() < 0.01,
                 "{r}.{n} parsed as ({:.2},{:.2}), KiCad says ({ex:.2},{ey:.2})", p.x, p.y
+            );
+        }
+    }
+
+    #[test]
+    fn every_pcb_pad_position_path_agrees_with_kicad_on_rotated_footprints() {
+        // There are three independent implementations of "absolute pad position"
+        // on the PCB side, and fixing only one is exactly the mistake that shipped:
+        // parse_pcb_pads feeds route_net/clearance/connectivity, extract_pad_positions
+        // feeds get_pad_position, and collect_pad_positions feeds cleanup_traces'
+        // orphan detection. They must all agree with KiCad.
+        let pcb = sample_pcb_rotated_footprints();
+        let truth = [("U1", "5", 123.26, 57.73), ("MOUSE1", "5", 138.86, 61.93)];
+
+        for (r, n, ex, ey) in truth {
+            let p = parse_pcb_pads(&pcb).into_iter()
+                .find(|p| p.reference == r && p.pad_num == n)
+                .unwrap_or_else(|| panic!("parse_pcb_pads lost {r}.{n}"));
+            assert!(
+                (p.x - ex).abs() < 0.01 && (p.y - ey).abs() < 0.01,
+                "parse_pcb_pads: {r}.{n} = ({:.2},{:.2}), KiCad says ({ex:.2},{ey:.2})", p.x, p.y
+            );
+        }
+
+        let blocks = pcb_edit::find_footprint_blocks(&pcb);
+        for (r, n, ex, ey) in truth {
+            let range = blocks.get(r).unwrap_or_else(|| panic!("no footprint {r}")).clone();
+            let pads = extract_pad_positions(&pcb[range]);
+            let (_, x, y, _) = pads.iter().find(|(num, _, _, _)| num == n)
+                .unwrap_or_else(|| panic!("extract_pad_positions lost {r}.{n}"));
+            assert!(
+                (x - ex).abs() < 0.01 && (y - ey).abs() < 0.01,
+                "extract_pad_positions: {r}.{n} = ({x:.2},{y:.2}), KiCad says ({ex:.2},{ey:.2})"
+            );
+        }
+
+        let collected = collect_pad_positions(&pcb);
+        for (r, n, ex, ey) in truth {
+            assert!(
+                collected.iter().any(|(x, y)| (x - ex).abs() < 0.01 && (y - ey).abs() < 0.01),
+                "collect_pad_positions has no pad at {r}.{n} ({ex:.2},{ey:.2}); got {collected:?}"
             );
         }
     }
