@@ -73,7 +73,11 @@ fn main() -> Result<()> {
 #[derive(Parser, Debug)]
 #[command(
     name = "kicad2print",
-    version = "0.1.0",
+    // Sourced from Cargo.toml so it can never drift. It had been hardcoded at
+    // "0.1.0" since the beginning, so every release reported the wrong version —
+    // and the release workflow sets the version by rewriting Cargo.toml from the
+    // git tag, which a hardcoded string here silently discarded.
+    version = env!("CARGO_PKG_VERSION"),
     about = "Convert KiCad PCB designs to 3D-printable STL/3MF models",
     long_about = "Transform a KiCad .kicad_pcb file into a 3D-printable substrate \
                   for hybrid PCB construction using wire traces and copper eyelets."

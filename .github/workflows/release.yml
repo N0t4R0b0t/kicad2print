@@ -103,6 +103,9 @@ jobs:
           VERSION="${VERSION#v}"
           echo "Setting version to $VERSION"
           sed -i "s/^version = \"[^\"]*\"/version = \"$VERSION\"/" Cargo.toml
+          # Keep the plugin manifest in step with the tag too — it is a separate
+          # file the build would otherwise leave stale.
+          sed -i "s/\"version\": \"[^\"]*\"/\"version\": \"$VERSION\"/" .claude-plugin/plugin.json
           cargo update --precise "$VERSION" kicad2print 2>/dev/null || true
 
       - name: Install Rust toolchain

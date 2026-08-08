@@ -1,7 +1,7 @@
 {
   "name": "kicad2print",
   "displayName": "kicad2print",
-  "version": "1.2.0",
+  "version": "1.5.0",
   "description": "Convert KiCad PCB designs to 3D-printable substrate models, with an MCP server for scanning, editing, and rendering KiCad boards from Claude.",
   "author": { "name": "N0t4R0b0t", "url": "https://github.com/N0t4R0b0t" },
   "homepage": "https://github.com/N0t4R0b0t/kicad2print",
