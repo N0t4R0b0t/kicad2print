@@ -21,12 +21,10 @@ desktop.ini
 logs/
 *.log
 
-# Claude Code config: local settings and worktrees stay private, but the
-# kicad-worker subagent definition ships with the repo.
-.claude/*
-!.claude/agents/
-.claude/agents/*
-!.claude/agents/kicad-worker.md
+# Local Claude Code settings and worktrees. Note .mcp.json is deliberately NOT
+# ignored: .claude-plugin/plugin.json references it as the plugin's MCP config,
+# so ignoring it shipped the plugin with no server definition at all.
+.claude/
 
 # Personal / unpublished drafts
 LINKEDIN.md

@@ -44,46 +44,55 @@ They are least useful — and most dangerous — for large routing sessions, net
 
 ## Setup
 
-### Wiring up the server
+### As a Claude Code plugin (recommended)
 
-`.mcp.json` in the repo root registers the server and ships with the project. It points at the release binary, so build once first:
+This repo self-hosts a plugin marketplace, which is the only setup that bundles the subagent alongside the MCP tools:
 
-```bash
-cargo build --release
+```
+/plugin marketplace add N0t4R0b0t/kicad2print
+/plugin install kicad2print@kicad2print
 ```
 
-Then start Claude Code from the repo root. To use the tools from a *board* project instead (the more common case — you usually want to edit a board, not this repo), add the same block to that project's `.mcp.json` or to `~/.claude.json`, with an absolute path to the binary:
+The plugin points at the `kicad2print` binary **by name**, so it must already be on your `PATH` — the plugin does not bundle it. `.claude-plugin/plugin.json` references `./.mcp.json` for the server definition.
+
+Under a plugin install the tools are namespaced `mcp__plugin_kicad2print_kicad2print__*`, and the agent appears as `kicad2print:kicad-worker`.
+
+### Without the plugin
+
+Register the server directly — in `~/.claude.json` for Claude Code, or `~/.config/Claude/claude_desktop_config.json` for Claude Desktop:
 
 ```json
 {
   "mcpServers": {
     "kicad2print": {
-      "command": "/path/to/kicad2print/target/release/kicad2print",
+      "command": "/absolute/path/to/kicad2print",
       "args": ["--mcp"]
     }
   }
 }
 ```
 
+Here the tools are namespaced `mcp__kicad2print__*`. Claude Desktop has no concept of agents, so this route gives you the tools only.
+
 The server does not hot-reload. After rebuilding the binary, reconnect the server (`/mcp reconnect`) or restart the session, or you will keep talking to the old build.
 
 ### The `kicad-worker` subagent
 
-`.claude/agents/kicad-worker.md` ships with this repo. It is a Haiku-model subagent scoped to the `mcp__kicad2print__*` tools that executes mechanical, already-decided work — DRC/ERC runs, file reads and greps, position and net lookups, renders, and specific edits — and reports back a condensed digest instead of raw tool output.
+`agents/kicad-worker.md` is a Haiku subagent scoped to the kicad2print MCP tools. It executes mechanical, already-decided work — DRC/ERC runs, file reads and greps, position and net lookups, renders, specific edits — and reports back a condensed digest instead of raw tool output.
 
 **Why it exists:** these tools return large payloads. A DRC report on a modest board is thousands of tokens; a netlist or layer SVG is tens of thousands. Routing that through a cheap subagent keeps it out of the main conversation, where it would otherwise crowd out the actual design reasoning.
 
-It loads automatically when you work inside this repo. To use it from a board project as well:
+Its `tools:` list uses wildcards covering **both** namespaces, so the same file works whether the server is installed as a plugin or registered directly:
 
-```bash
-cp .claude/agents/kicad-worker.md ~/.claude/agents/
+```yaml
+tools: ["Read", "Grep", "Glob", "Bash", "mcp__kicad2print__*", "mcp__plugin_kicad2print_kicad2print__*"]
 ```
 
-Agent definitions are read at session start — after adding or editing one, reload the session before the agent becomes available.
+Prefer wildcards over an explicit tool list — an enumerated allowlist silently hides any newly added tool from the agent, which then reports it as unavailable rather than failing loudly.
+
+If you are not using the plugin, copy the file to `~/.claude/agents/` to make the agent available. Agent definitions are read at session start, so reload after adding or editing one.
 
 **Give it decided work, not decisions.** It is deliberately not the right tool for choosing between footprint candidates, diagnosing why a route failed, or weighing trade-offs. Resolve those in the main conversation and hand the agent the resulting concrete action.
-
-**When you add a new MCP tool, add it to the agent's `tools:` list.** The list is an explicit allowlist; a tool missing from it is invisible to the agent, which will report the tool as unavailable rather than failing loudly.
 
 ---
 

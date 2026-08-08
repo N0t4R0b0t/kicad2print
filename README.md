@@ -198,8 +198,6 @@ Add to `~/.config/Claude/claude_desktop_config.json` (Linux) or `%APPDATA%\Claud
 
 Restart Claude Desktop. The KiCad tools will appear automatically.
 
-For **Claude Code**, the repo's own `.mcp.json` already registers the server against `target/release/kicad2print` — run `cargo build --release` and start a session from the repo root. The repo also ships a `kicad-worker` subagent (`.claude/agents/kicad-worker.md`) that runs the tool-heavy calls on a cheaper model and reports back a summary, which keeps large DRC reports and netlists out of the main conversation. Copy it to `~/.claude/agents/` to use it from your board projects too. See [docs/MCP_KICAD_TOOLS.md](docs/MCP_KICAD_TOOLS.md#setup) for details.
-
 ### What you can do
 
 - **Scan a project** — get a rendered board image, full BOM, and file list in one shot
@@ -262,6 +260,8 @@ The MCP server above also installs as a [Claude Code plugin](https://code.claude
 ```
 
 Claude Desktop has no concept of agents — it only reads the plain MCP config shown above. Use the Claude Code plugin if you want the bundled agent(s) as well as the MCP tools.
+
+The bundled agent is **`kicad-worker`** (`agents/kicad-worker.md`), which runs the tool-heavy calls — DRC/ERC, reads and greps, position and net lookups, renders, specified edits — on a cheaper model and reports back a summary. These tools return large payloads, and keeping them out of the main conversation leaves room for the actual design reasoning. Give it decided work, not decisions. See [docs/MCP_KICAD_TOOLS.md](docs/MCP_KICAD_TOOLS.md#the-kicad-worker-subagent).
 
 ---
 
