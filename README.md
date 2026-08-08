@@ -261,6 +261,8 @@ The MCP server above also installs as a [Claude Code plugin](https://code.claude
 
 Claude Desktop has no concept of agents — it only reads the plain MCP config shown above. Use the Claude Code plugin if you want the bundled agent(s) as well as the MCP tools.
 
+The plugin also bundles six **skills** — safe editing, PCB routing, schematic editing, project creation, and two for contributors working on kicad2print itself. They load automatically when the task matches. See [docs/MCP_KICAD_TOOLS.md](docs/MCP_KICAD_TOOLS.md#bundled-skills).
+
 The bundled agent is **`kicad-worker`** (`agents/kicad-worker.md`), which runs the tool-heavy calls — DRC/ERC, reads and greps, position and net lookups, renders, specified edits — on a cheaper model and reports back a summary. These tools return large payloads, and keeping them out of the main conversation leaves room for the actual design reasoning. Give it decided work, not decisions. See [docs/MCP_KICAD_TOOLS.md](docs/MCP_KICAD_TOOLS.md#the-kicad-worker-subagent).
 
 ---

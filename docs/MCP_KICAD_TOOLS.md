@@ -76,6 +76,23 @@ Here the tools are namespaced `mcp__kicad2print__*`. Claude Desktop has no conce
 
 The server does not hot-reload. After rebuilding the binary, reconnect the server (`/mcp reconnect`) or restart the session, or you will keep talking to the old build.
 
+### Bundled skills
+
+The plugin ships six skills under `skills/`, auto-discovered on install. They load
+when the task matches their description, so you get the relevant one without asking:
+
+| Skill | Loads when |
+|---|---|
+| `kicad-safe-editing` | any edit to a board that matters — checkpointing, working on copies, reading DRC as a delta, when to stop |
+| `kicad-pcb-routing` | routing, placement, board outline, zone fills, and reading `route_net` failures |
+| `kicad-schematic-editing` | symbols, wires, labels, power symbols, ERC, staying on the connection grid |
+| `kicad-project-creation` | starting a board from scratch, and what the tools genuinely cannot scaffold |
+| `kicad-sexpr-parsing` | *contributors* — changing kicad2print's own KiCad file parsing |
+| `mcp-tool-output` | *contributors* — designing tool responses that don't burn the caller's context |
+
+The last two are scoped to development of this repo and stay quiet during ordinary
+board work.
+
 ### The `kicad-worker` subagent
 
 `agents/kicad-worker.md` is a Haiku subagent scoped to the kicad2print MCP tools. It executes mechanical, already-decided work — DRC/ERC runs, file reads and greps, position and net lookups, renders, specific edits — and reports back a condensed digest instead of raw tool output.
