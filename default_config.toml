@@ -28,41 +28,98 @@ channel_depth_mm = 0.5
 
 
 # ============================================================================
-# VIA / EYELET CONFIGURATION
+# TRACE GROOVE PROFILE
 # ============================================================================
-#
-# These settings control how via holes are represented in the printed model.
 
-# Via style: how eyelets are represented
+# Cross-section of the trace grooves.
 #
-#   "hole"   - Full through-holes that you can drill with a drill press
-#              after printing. Allows drilling to exact diameter needed.
-#              Slightly longer print time but more flexible.
+#   "rect"      - vertical walls, flat floor. What wire mode wants, so the wire
+#                 seats flat against the floor.
+#   "trapezoid" - sloped walls down to channel_floor_width_mm.
+#   "vee"       - sloped walls that converge. Ignores channel_floor_width_mm.
+#                 The model narrows past what a nozzle can lay, so the slicer
+#                 stops opening the groove and it ends in a truncated point
+#                 rather than the flat shelf a trapezoid carves.
 #
-#   "indent" - Shallow dimples on top and bottom to guide copper eyelets
-#              (like a drilling jig). No post-print drilling needed.
-#              Faster printing, less flexible.
+# Sloped walls matter when electroplating. A square-bottomed groove plates
+# unevenly: current density is highest at the top corners and lowest at the
+# floor centre, so copper grows inward from the walls and can seal over the top
+# — leaving a void — before the floor is covered. Removing the corner lets the
+# groove fill from the bottom up. Sloped walls also print better on a 0.4 mm
+# nozzle, most of all on the underside, where a square groove has to be closed
+# off by bridging a flat ceiling.
 #
-# Recommendation: Use "indent" for faster printing and assembly.
-eyelet_style = "indent"
+# The trade-off is copper cross-section: a vee carries roughly half of what a
+# rect does at the same width and depth.
+channel_profile = "rect"
 
-# Diameter of via holes or indent dimples (millimeters)
+# Groove floor width when channel_profile = "trapezoid". The opening stays at
+# channel_width_mm; only the bottom narrows. Ignored for "rect" and "vee".
+channel_floor_width_mm = 0.4
+
+# Step height for sloped walls. They are built as a stack of thin constant-width
+# bands rather than a true ramp — set this to your slicer's layer height and the
+# printed part is identical to a smooth slope, because the print is quantised to
+# the same steps anyway. Smaller values cost more geometry processing.
+taper_slice_height_mm = 0.2
+
+
+# ============================================================================
+# THROUGH-HOLE BARRELS
+# ============================================================================
+
+# How every through-hole barrel is shaped.
 #
-# Should match the size of your copper eyelets:
-#   - M0.9 eyelets (smaller):   0.9 mm
-#   - M1.3 eyelets (standard):  1.3 mm
-#   - M2.0 eyelets (larger):    2.0 mm
+#   "straight" - a plain bore. The front and back copper networks are then
+#                completely separate: a straight bore through 2 mm of plastic
+#                cannot be reached with a brush, so seed paint never coats it.
+#                Bridge the layers with a pressed-in eyelet, or — usually far
+#                less painful — a snipped component lead soldered on both faces.
 #
-# If using "hole" style with a drill press, use a slightly larger value
-# (e.g., 1.5 for M1.3 eyelets) to be conservative.
+#   "cone"     - countersunk from both faces, meeting at a short straight
+#                throat. Every point of the barrel is then in line of sight
+#                from one face or the other, so seed paint can actually be
+#                applied and plating grows from both mouths toward the middle.
+#                No eyelet, no flange to trim. The bottom cone doubles as a
+#                solder cup, which is what makes a top-side trace solderable
+#                from underneath.
+#
+# Cone mouths are much wider than the bore they surround — a 0.8 mm hole with
+# 45 degree walls through a 2.2 mm board wants a ~3 mm crater on each face. On
+# fine pitches they are shrunk automatically to stay clear of other nets; holes
+# with no room at all stay straight and are listed in the run output.
+via_style = "straight"
+
+# Countersink wall angle, in degrees from the board surface. 45 is both the
+# standard countersink angle and the steepest overhang an FDM printer holds
+# without support. That limit only binds on the bottom cone — it is the one
+# that narrows as it rises; the top cone always prints cleanly.
+cone_angle_deg = 45.0
+
+# Length of the straight section where the two cones meet. Letting them meet at
+# a knife edge gives a throat that prints badly and leaves the component lead
+# nothing to locate against.
+throat_height_mm = 0.4
+
+# Minimum material left between a cone mouth and any foreign-net copper or the
+# board edge. This is a correctness constraint rather than a cosmetic one: two
+# mouths on different nets that merge would short together once plated.
+min_rim_mm = 0.3
+
+# Minimum bore diameter for vias (millimeters).
+#
+# KiCad via drills are commonly 0.3-0.4 mm, below what an FDM nozzle can hold
+# open, so every via bore is widened to at least this. A via whose own drill is
+# larger keeps its real size. If you do use eyelets, match this to them:
+#   - M0.9 eyelets:  0.9 mm
+#   - M1.3 eyelets:  1.3 mm
+#   - M2.0 eyelets:  2.0 mm
 eyelet_diameter_mm = 1.5
 
-# Depth of shallow indent dimples (only used when eyelet_style = "indent")
-#
-# Typical range: 0.2-0.4 mm
-#   - Shallower (0.2mm): easier to print, less precise
-#   - Deeper (0.4mm):    harder to print, better eyelet guidance
-indent_depth_mm = 0.3
+# --- Deprecated, kept only so older config files still load -----------------
+# eyelet_style and indent_depth_mm never affected the generated geometry: vias
+# have always been cut as full through-holes, whatever these were set to. Use
+# via_style above instead.
 
 
 # ============================================================================

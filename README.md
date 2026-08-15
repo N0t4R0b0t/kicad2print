@@ -146,9 +146,14 @@ kicad2print my_board.kicad_pcb --mode electrolysis
 | `mode` | `copper-wire` | `electrolysis` | Selects assembly guide style |
 | `channel_width_mm` | `1.2` | `0.7` | Groove width — wire diameter or trace width |
 | `channel_depth_mm` | `0.5` | `0.5` | Groove depth |
-| `eyelet_style` | `indent` | `hole` | Via representation (`indent` = dimple, `hole` = through-hole) |
-| `eyelet_diameter_mm` | `1.5` | `1.5` | Via hole or dimple diameter |
-| `indent_depth_mm` | `0.3` | `0.3` | Dimple depth (indent style only) |
+| `channel_profile` | `rect` | `trapezoid` | Groove cross-section: `rect`, `trapezoid`, or `vee` |
+| `channel_floor_width_mm` | `0.4` | `0.4` | Groove floor width for `trapezoid` (opening stays at `channel_width_mm`) |
+| `taper_slice_height_mm` | `0.2` | `0.2` | Step height for sloped walls — set to your slicer's layer height |
+| `via_style` | `straight` | `straight` | Barrel shape: `straight`, or `cone` for eyelet-free plated holes |
+| `cone_angle_deg` | `45.0` | `45.0` | Countersink wall angle from the board surface (`cone` only) |
+| `throat_height_mm` | `0.4` | `0.4` | Straight section where the two cones meet (`cone` only) |
+| `min_rim_mm` | `0.3` | `0.3` | Material kept between a cone mouth and foreign-net copper (`cone` only) |
+| `eyelet_diameter_mm` | `1.5` | `1.5` | Minimum via bore diameter |
 | `pad_hole_diameter_mm` | `0.8` | `0.8` | Minimum component pad hole diameter |
 | `substrate_thickness_mm` | `3.0` | `3.0` | Total board thickness |
 | `scale_factor` | `0.0` | `0.0` | `0` = true 1:1 scale; `>0` = exact multiplier |
@@ -157,11 +162,30 @@ kicad2print my_board.kicad_pcb --mode electrolysis
 
 Settings are merged in order: **built-in defaults → TOML file → CLI flags**.
 
-### Eyelet styles
+> `eyelet_style`, `indent_depth_mm` and `--no-via-indents` are deprecated and
+> inert. They never changed the generated geometry — vias have always been cut
+> as full through-holes — and the tool now says so when they are set. Use
+> `via_style` instead.
 
-**`indent`** (copper wire default) — shallow dimples on top and bottom mark via locations. No drilling required. Faster to print and assemble.
+### Groove profiles
 
-**`hole`** (electrolysis default) — full through-holes sized to accept your eyelets. Required when the via hole walls need to be primed and plated.
+**`rect`** (default) — vertical walls and a flat floor. What wire mode wants, so the wire seats flat against the floor.
+
+**`trapezoid`** / **`vee`** — sloped walls. A `trapezoid` descends to a deliberate flat floor of `channel_floor_width_mm`; a `vee` ignores that setting and converges, letting the slicer truncate it where the groove gets too narrow to extrude. These matter for electroplating. A square-bottomed groove plates unevenly: current density is highest at the top corners and lowest at the floor centre, so copper grows inward from the walls and can seal over the opening — leaving a void — before the floor is covered. Removing the corner lets the groove fill from the bottom up. Sloped walls also print better on a 0.4 mm nozzle, most of all on the underside, where a square groove has to be closed off by bridging a flat ceiling. The trade-off is copper cross-section: a `vee` carries roughly half of what a `rect` does at the same width and depth, so prefer `trapezoid` where current matters.
+
+### Via styles
+
+**`straight`** (default) — a plain bore. The two copper layers are otherwise completely separate, and you cannot get a brush down a small hole through a couple of millimetres of plastic, so the barrel never plates. Bridge the layers with a pressed-in eyelet, or — usually far less painful — a snipped component lead soldered on both faces.
+
+**`cone`** — countersunk from both faces, meeting at a short straight throat. Every point of the barrel is then in line of sight from one face or the other, so seed paint can actually be applied and plating grows from both mouths toward the middle. No eyelet, no flange to trim. The bottom cone doubles as a solder cup, which is what makes a top-side trace solderable from underneath.
+
+Cone mouths are much wider than the bore — a 0.8 mm hole with 45° walls through a 2.2 mm board wants a ~3 mm crater per face — so on fine pitches they are shrunk automatically to keep `min_rim_mm` clear of other nets, and holes with no room stay straight. The run reports how many.
+
+The countersink is built from the same band stack that forms the trace grooves, so it works with every groove profile. Cone depth is bounded by `channel_depth_mm` for that reason, with `throat_height_mm` applying whichever is tighter.
+
+### Mesh validation
+
+Every generated mesh is checked for being a closed, consistently-wound solid, and the result is reported. This matters because the failure modes are invisible in a 3D preview: an open surface is what lets a slicer fill a through-hole solid or render the board as a featureless plaque. The check also reports genus, which verifies the through-holes are topologically present. Don't print past a warning.
 
 ---
 
@@ -171,6 +195,7 @@ Settings are merged in order: **built-in defaults → TOML file → CLI flags**.
 - **Infill:** 40–60% rectilinear. Higher infill = stiffer board.
 - **Material:** PLA is fine for most projects. PETG if you need heat resistance (e.g., near a power section).
 - **Orientation:** print flat (board face up). Support is not needed for the trace grooves.
+- **Sloped walls:** if you use `channel_profile = "trapezoid"`/`"vee"` or `via_style = "cone"`, set `taper_slice_height_mm` to your layer height. Sloped walls are built as a stack of thin bands, and at layer height the printed part is identical to a smooth ramp.
 - **First layer:** a good first layer matters — the bottom pad holes need to be clean for component insertion.
 
 ---

@@ -52,7 +52,9 @@ mod render;
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use config::{CliOverrides, Config, EyeletStyle, Mode, OutputFormat, StencilMount};
+use config::{
+    ChannelProfile, CliOverrides, Config, EyeletStyle, Mode, OutputFormat, StencilMount, ViaStyle,
+};
 use std::path::PathBuf;
 use std::process::Command;
 
@@ -95,12 +97,12 @@ struct Args {
 
     /// Construction mode: 'copper-wire' or 'electrolysis'
     ///
-    /// Selects preset geometry defaults and assembly guide style.
+    /// Applies the matching preset from presets/ as the baseline — the file is
+    /// compiled in, so --mode electrolysis is exactly equivalent to
+    /// --config presets/electrolysis.toml.
     /// 'copper-wire' (default): wide channels for 30 AWG wire, wire-laying guide.
     /// 'electrolysis': narrow channels for electroplated copper, plating guide.
-    /// Any explicit --channel-width / --channel-depth / --eyelet-style flags override
-    /// the mode preset. Copy presets/copper-wire.toml or presets/electrolysis.toml
-    /// into your project for a fully customisable starting point.
+    /// Your own TOML overrides the preset, and CLI flags override both.
     #[arg(long, value_name = "MODE")]
     mode: Option<String>,
 
@@ -111,6 +113,49 @@ struct Args {
     /// Depth of trace channels (millimeters)
     #[arg(long, value_name = "MM")]
     channel_depth: Option<f64>,
+
+    /// Trace groove cross-section: 'rect', 'trapezoid', or 'vee'.
+    /// Sloped walls plate more evenly (a rectangular groove tends to leave the
+    /// centre unfilled) and print better on a 0.4mm nozzle.
+    #[arg(long, value_name = "PROFILE")]
+    channel_profile: Option<String>,
+
+    /// Groove floor width for --channel-profile=trapezoid (millimeters).
+    /// The opening stays at --channel-width; this narrows only the bottom.
+    #[arg(long, value_name = "MM")]
+    channel_floor_width: Option<f64>,
+
+    /// Step height for sloped walls (millimeters).
+    /// Set this to your slicer's layer height: V grooves and cone countersinks
+    /// are built as a stack of constant-width bands, and at layer height the
+    /// printed result is identical to a smooth ramp. Band count is
+    /// channel-depth / this, capped at 8, so very small values stop helping.
+    #[arg(long, value_name = "MM")]
+    taper_slice_height: Option<f64>,
+
+    /// Countersink wall angle in degrees from the board surface (--via-style cone).
+    /// 45 is the standard countersink angle and the steepest overhang an FDM
+    /// printer holds without support.
+    #[arg(long, value_name = "DEG")]
+    cone_angle: Option<f64>,
+
+    /// Straight section where the two cones meet (millimeters, --via-style cone).
+    /// Stops them meeting at a fragile knife edge and gives the lead something
+    /// to locate against.
+    #[arg(long, value_name = "MM")]
+    throat_height: Option<f64>,
+
+    /// Material kept between a cone mouth and foreign-net copper or the board
+    /// edge (millimeters). A correctness constraint, not cosmetic: merged
+    /// mouths on different nets short together once plated.
+    #[arg(long, value_name = "MM")]
+    min_rim: Option<f64>,
+
+    /// Through-hole barrel shape: 'straight' or 'cone'.
+    /// 'cone' countersinks both faces so the barrel can be seed-painted and
+    /// plated without an eyelet, and gives a solder cup on the underside.
+    #[arg(long, value_name = "STYLE")]
+    via_style: Option<String>,
 
     /// Style of via/eyelet representation: 'hole' or 'indent'
     #[arg(long, value_name = "STYLE")]
@@ -200,6 +245,20 @@ impl Args {
             .transpose()
             .map_err(|e| anyhow::anyhow!("Invalid eyelet-style: {}", e))?;
 
+        let via_style = self
+            .via_style
+            .as_ref()
+            .map(|s| s.parse::<ViaStyle>())
+            .transpose()
+            .map_err(|e| anyhow::anyhow!("Invalid via-style: {}", e))?;
+
+        let channel_profile = self
+            .channel_profile
+            .as_ref()
+            .map(|s| s.parse::<ChannelProfile>())
+            .transpose()
+            .map_err(|e| anyhow::anyhow!("Invalid channel-profile: {}", e))?;
+
         let output_format = self
             .format
             .as_ref()
@@ -224,6 +283,13 @@ impl Args {
         Ok(CliOverrides {
             channel_width_mm: self.channel_width,
             channel_depth_mm: self.channel_depth,
+            via_style,
+            channel_profile,
+            channel_floor_width_mm: self.channel_floor_width,
+            taper_slice_height_mm: self.taper_slice_height,
+            cone_angle_deg: self.cone_angle,
+            throat_height_mm: self.throat_height,
+            min_rim_mm: self.min_rim,
             eyelet_style,
             eyelet_diameter_mm: self.eyelet_diameter,
             indent_depth_mm: self.indent_depth,
@@ -282,6 +348,28 @@ fn open_viewer(file_path: &PathBuf) {
     }
 }
 
+/// Validates a generated mesh and reports anything that would make a slicer
+/// misbehave.
+///
+/// This is deliberately a warning rather than a hard failure: a slightly
+/// imperfect mesh is often still printable, and refusing to write the file
+/// would leave the user with nothing to inspect. But it must never be silent —
+/// the defects it looks for (an unclosed surface, inconsistent winding, zero
+/// enclosed volume) are exactly the ones that look fine in a 3D preview and
+/// then slice into a corked hole or a featureless plaque.
+fn check_mesh(mesh: &geometry::Mesh3D, what: &str, verbose: bool) {
+    let report = geometry::validate_mesh(mesh);
+    if let Some(problems) = report.problems() {
+        eprintln!("\n⚠️  {what}: mesh validation failed — {}", report.summary());
+        for line in problems.lines() {
+            eprintln!("   {line}");
+        }
+        eprintln!("   Inspect the STL before printing; the slicer may not show this.");
+    } else if verbose {
+        println!("   ✓ {what} validated: {}", report.summary());
+    }
+}
+
 fn cli_main() -> Result<()> {
     // Parse command-line arguments
     let args = Args::parse();
@@ -297,10 +385,12 @@ fn cli_main() -> Result<()> {
         .map(|p| p.as_path())
         .unwrap_or_else(|| std::path::Path::new("kicad2print.toml"));
 
-    let mut config = Config::from_file(config_path)?;
+    // The mode has to be known before the file is read: it selects the preset
+    // that the file layers on top of.
+    let overrides = args.to_overrides()?;
+    let mut config = Config::load(config_path, overrides.mode)?;
 
     // Step 2: Apply command-line overrides
-    let overrides = args.to_overrides()?;
     config.merge_cli_overrides(&overrides);
 
     if args.verbose {
@@ -410,6 +500,12 @@ fn cli_main() -> Result<()> {
         println!("   Generated {} triangles", mesh.triangle_count());
     }
 
+    // Step 6b: Check the mesh is actually a closed solid before writing it.
+    // A gap here is invisible in the preview but decides what the slicer does:
+    // an open surface is what turns a through-hole into a corked one, or the
+    // whole board into a flat plaque. Cheaper to catch now than after a print.
+    check_mesh(&mesh, "substrate", args.verbose);
+
     // Step 7: Export to files
     if args.verbose {
         println!("\n💾 Exporting to {} format...", config.output_format);
@@ -440,6 +536,7 @@ fn cli_main() -> Result<()> {
             if let Some(smesh) = geometry::generate_stencil(&geometry_pcb, &config, layer)
                 .context("Failed to generate stencil geometry")?
             {
+                check_mesh(&smesh, &format!("stencil{}", suffix), args.verbose);
                 let path = out_dir.join(format!("{}{}.stl", stem, suffix));
                 export::stl::write(&smesh, &path).context("Failed to write stencil STL")?;
                 if args.verbose {
@@ -457,6 +554,7 @@ fn cli_main() -> Result<()> {
         if config.stencil_mount == StencilMount::Ring {
             let ring = geometry::generate_clamp_ring(&geometry_pcb, &config)
                 .context("Failed to generate clamp ring geometry")?;
+            check_mesh(&ring, "clamp ring", args.verbose);
             let path = out_dir.join(format!("{}_stencil_ring.stl", stem));
             export::stl::write(&ring, &path).context("Failed to write clamp ring STL")?;
             if args.verbose {

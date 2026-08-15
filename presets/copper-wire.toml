@@ -3,10 +3,15 @@
 # Use this preset when you will lay physical copper wire into the grooves.
 # Suitable for 30 AWG Kynar wire (0.25 mm conductor, ~0.5 mm with insulation).
 #
-# Usage:
-#   kicad2print my_board.kicad_pcb --config presets/copper-wire.toml
-# Or select via CLI flag (uses these values when not overridden by the TOML above):
+# Usage — these two are exactly equivalent:
 #   kicad2print my_board.kicad_pcb --mode copper-wire
+#   kicad2print my_board.kicad_pcb --config presets/copper-wire.toml
+#
+# This file IS the definition of `--mode copper-wire`. It is compiled into the
+# binary and applied as that mode's baseline, so editing it changes what the
+# flag does. Settings layer in this order, each overriding the last:
+#
+#   built-in defaults  ->  this preset  ->  your own TOML  ->  CLI flags
 
 mode = "copper-wire"
 
@@ -22,13 +27,27 @@ channel_width_mm = 1.2
 channel_depth_mm = 0.5
 
 # ============================================================================
-# VIA / EYELET CONFIGURATION
+# THROUGH-HOLE BARRELS
 # ============================================================================
 
-# Shallow dimples guide eyelets without requiring post-print drilling.
-eyelet_style = "indent"
+#   "straight" - plain bore. Bridge the layers with an eyelet, or more easily
+#                with a snipped component lead soldered on both faces.
+#   "cone"     - countersunk from both faces. Mainly for electroplating, but
+#                the bottom countersink is also a convenient solder cup.
+via_style = "straight"
+
+# Floor for the bore diameter. KiCad via drills are often 0.3-0.4 mm, below
+# what an FDM nozzle holds open, so bores are widened to at least this. Match
+# it to your eyelets if you use them (M0.9 -> 0.9, M1.3 -> 1.3).
 eyelet_diameter_mm = 1.5
-indent_depth_mm = 0.3
+
+# ============================================================================
+# TRACE GROOVE PROFILE
+# ============================================================================
+
+# Wire mode wants a square groove so the wire seats flat against the floor.
+# "trapezoid" / "vee" exist for electroplating, where sloped walls fill better.
+channel_profile = "rect"
 
 # ============================================================================
 # COMPONENT PAD CONFIGURATION

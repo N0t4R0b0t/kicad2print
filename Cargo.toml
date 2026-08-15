@@ -31,7 +31,7 @@ thiserror = "1.0"
 nalgebra = "0.33"
 
 # 2D polygon boolean ops (union/difference/intersection)
-geo = { version = "0.28", features = ["earcutr"] }
+geo = { version = "0.33", features = ["earcutr"] }
 # Earcut triangulation (also a transitive dep of geo, pinned explicitly for direct use)
 earcutr = "0.4"
 

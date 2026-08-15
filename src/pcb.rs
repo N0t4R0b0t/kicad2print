@@ -130,15 +130,20 @@ impl ArcTrace {
 /// A via (vertical interconnect access) connecting front and back copper layers.
 ///
 /// Vias are holes that allow electrical connections between the top and bottom
-/// of the board. In the hybrid construction method, vias are either:
-/// - Full through-holes (eyelet_style = "hole"): drilled with copper eyelets
-/// - Shallow indents (eyelet_style = "indent"): small dimples that guide solder
-#[derive(Debug, Clone, Copy)]
+/// of the board. How they are realised in the printed substrate depends on
+/// `via_style`: a plain straight bore (which needs a pressed-in eyelet to carry
+/// copper between layers), or a double cone whose barrel can be seed-painted
+/// and plated directly.
+#[derive(Debug, Clone)]
 pub struct Via {
     /// Center point of the via hole
     pub center: Point2,
     /// Diameter of the via hole (drill size) in millimeters
     pub drill: f64,
+    /// Net name this via is connected to, if the board declared one. Resolved
+    /// from the via's `(net N)` index against the file's net table. Needed so
+    /// cone mouths are only allowed to merge with same-net copper.
+    pub net_name: Option<String>,
 }
 
 impl Via {
@@ -147,6 +152,7 @@ impl Via {
         Via {
             center: self.center.scale(factor),
             drill: self.drill * factor,
+            net_name: self.net_name.clone(),
         }
     }
 }
@@ -178,7 +184,15 @@ pub struct Pad {
     /// Drill hole diameter in millimeters. 0.0 means no through-hole (SMD pad) —
     /// callers must not synthesize a hole for these; only a real KiCad drill
     /// value should ever produce a through-hole.
+    ///
+    /// For a slotted (oval) drill this is the *width* — the local-X extent —
+    /// and `drill_h` carries the length. Consumers that only want one number
+    /// (previews, reports) can keep reading this field alone.
     pub drill: f64,
+    /// Drill hole length in millimeters for a slotted `(drill oval W L)` pad,
+    /// in the pad's local Y. Equal to `drill` for an ordinary round drill, so
+    /// `drill_h != drill` is the test for "this is a slot".
+    pub drill_h: f64,
     /// Pad number string (e.g. "1", "2", "A1")
     pub number: String,
     /// Net name this pad is connected to, if any
@@ -204,6 +218,7 @@ impl Pad {
         Pad {
             center: self.center.scale(factor),
             drill: self.drill * factor,
+            drill_h: self.drill_h * factor,
             number: self.number.clone(),
             net_name: self.net_name.clone(),
             width: self.width * factor,

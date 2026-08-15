@@ -12,10 +12,26 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
+/// The mode presets, compiled into the binary.
+///
+/// `--mode` used to apply a short hardcoded list of geometry defaults that was
+/// meant to mirror these files but drifted from them badly: the preset carried
+/// two dozen settings the hardcoded block never touched, so `--mode
+/// electrolysis` and `--config presets/electrolysis.toml` quietly produced
+/// different boards while the documentation claimed they were equivalent.
+///
+/// Embedding rather than reading `presets/` at runtime is deliberate — an
+/// installed binary has no such directory beside it, so a runtime read would
+/// work from a source checkout and silently fall back to bare defaults
+/// everywhere else.
+const PRESET_COPPER_WIRE: &str = include_str!("../presets/copper-wire.toml");
+const PRESET_ELECTROLYSIS: &str = include_str!("../presets/electrolysis.toml");
+
 /// Construction mode — selects default geometry and assembly guide style.
 ///
-/// Each mode ships with a preset TOML config (see `presets/`) and a tailored
-/// assembly guide. Individual settings can still be overridden via TOML or CLI.
+/// Each mode is *defined by* its preset TOML in `presets/`, which is compiled
+/// into the binary and applied as the baseline for that mode. Individual
+/// settings can still be overridden via TOML or CLI.
 ///
 /// # Values
 /// - `"copper-wire"` — lay 30 AWG wire into grooves (wider channels, standard wire-laying guide)
@@ -45,6 +61,16 @@ impl std::str::FromStr for Mode {
             "copper-wire" | "wire" => Ok(Mode::CopperWire),
             "electrolysis" | "electro" => Ok(Mode::Electrolysis),
             other => Err(format!("Unknown mode: '{}'. Use 'copper-wire' or 'electrolysis'", other)),
+        }
+    }
+}
+
+impl Mode {
+    /// The preset TOML that defines this mode's baseline settings.
+    pub fn preset_toml(self) -> &'static str {
+        match self {
+            Mode::CopperWire => PRESET_COPPER_WIRE,
+            Mode::Electrolysis => PRESET_ELECTROLYSIS,
         }
     }
 }
@@ -80,6 +106,116 @@ impl std::str::FromStr for StencilMount {
             "lip" | "integral" => Ok(StencilMount::Lip),
             "ring" | "clamp" => Ok(StencilMount::Ring),
             other => Err(format!("Unknown stencil mount: '{}'. Use 'lip' or 'ring'", other)),
+        }
+    }
+}
+
+/// Cross-section profile of the trace grooves.
+///
+/// Electroplating a *rectangular* groove tends to leave the middle starved:
+/// current density is highest at the top corners and lowest at the floor
+/// centre, so copper grows inward from the side walls and can bridge over the
+/// opening — sealing a void — before the floor is covered. Sloping the walls
+/// removes the re-entrant corner, so the deposit fills from the bottom up and
+/// the cross-section stays self-similar as it grows.
+///
+/// A sloped groove also prints better on an FDM machine: each layer's opening
+/// is a different width, so the slicer lays progressively wider perimeters
+/// instead of fighting a constant narrow gap between two vertical walls. The
+/// gain is largest on the *bottom* face, where a rectangular groove has to be
+/// closed off by bridging a flat ceiling and a sloped one does not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ChannelProfile {
+    /// Vertical walls, flat floor — the original square-U groove.
+    #[default]
+    Rect,
+    /// Sloped walls down to a flat floor of `channel_floor_width_mm`.
+    /// Keeps some floor area (and so some copper cross-section) while still
+    /// removing the corner that starves the centre.
+    Trapezoid,
+    /// Sloped walls that converge, ignoring `channel_floor_width_mm`.
+    ///
+    /// The model narrows to well under a nozzle width; where the groove gets
+    /// too narrow to extrude, the slicer stops opening it and prints solid, so
+    /// the printed groove ends in a naturally truncated point rather than the
+    /// deliberate flat shelf a trapezoid carves. Best plating behaviour, at the
+    /// cost of roughly half the copper cross-section for a given width and
+    /// depth — prefer `Trapezoid` where current capacity matters.
+    Vee,
+}
+
+impl std::fmt::Display for ChannelProfile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ChannelProfile::Rect => write!(f, "rect"),
+            ChannelProfile::Trapezoid => write!(f, "trapezoid"),
+            ChannelProfile::Vee => write!(f, "vee"),
+        }
+    }
+}
+
+impl std::str::FromStr for ChannelProfile {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "rect" | "rectangular" | "square" | "u" => Ok(ChannelProfile::Rect),
+            "trapezoid" | "trap" => Ok(ChannelProfile::Trapezoid),
+            "vee" | "v" => Ok(ChannelProfile::Vee),
+            other => Err(format!(
+                "Unknown channel profile: '{}'. Use 'rect', 'trapezoid', or 'vee'",
+                other
+            )),
+        }
+    }
+}
+
+/// How a through-hole's barrel is shaped.
+///
+/// The problem this exists to solve: on a two-layer board the front and back
+/// copper networks are otherwise completely separate, and a straight bore
+/// through 2 mm of plastic cannot be reached with a brush, so seed paint never
+/// coats it. That leaves a pressed-in metal eyelet as the only conductor
+/// between layers — fiddly to install, and its flange has to be trimmed
+/// wherever pins are close together.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ViaStyle {
+    /// A plain straight bore. Layer-to-layer continuity needs an eyelet or a
+    /// soldered wire stitch.
+    #[default]
+    Straight,
+    /// A countersink from each face meeting at a short straight throat.
+    ///
+    /// Every point of the barrel is then in line of sight from one face or the
+    /// other, so seed paint can actually be applied and the plating grows from
+    /// both mouths toward the middle. The bottom cone doubles as a solder cup,
+    /// which is what makes a top-side trace solderable from underneath.
+    ///
+    /// The cost is board area: cone mouths are much wider than the bore, so on
+    /// fine pitches they get automatically shrunk to keep clear of neighbouring
+    /// copper on other nets.
+    Cone,
+}
+
+impl std::fmt::Display for ViaStyle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ViaStyle::Straight => write!(f, "straight"),
+            ViaStyle::Cone => write!(f, "cone"),
+        }
+    }
+}
+
+impl std::str::FromStr for ViaStyle {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "straight" | "bore" | "hole" => Ok(ViaStyle::Straight),
+            "cone" | "double-cone" | "countersink" => Ok(ViaStyle::Cone),
+            other => Err(format!("Unknown via style: '{}'. Use 'straight' or 'cone'", other)),
         }
     }
 }
@@ -204,11 +340,80 @@ pub struct Config {
     #[serde(default = "default_channel_depth")]
     pub channel_depth_mm: f64,
 
-    /// How vias are represented in the 3D model.
+    /// Cross-section profile of the trace grooves — see `ChannelProfile`.
     ///
-    /// - "hole": full through-holes that you can drill with a drill press
-    /// - "indent": shallow dimples on top and bottom (no drilling required)
-    /// Default: "indent" (faster printing and assembly)
+    /// Default: "rect" (the original square-U groove), so existing designs
+    /// regenerate unchanged. Switch to "trapezoid" or "vee" if electroplating
+    /// leaves the centre of your traces unfilled.
+    #[serde(default = "default_channel_profile")]
+    pub channel_profile: ChannelProfile,
+
+    /// Width of the groove *floor* when `channel_profile = "trapezoid"`.
+    ///
+    /// The groove opening stays at `channel_width_mm`; this narrows only the
+    /// bottom, so board area and the stencil are unaffected. Wall slope is
+    /// derived from this together with `channel_depth_mm`, rather than being
+    /// configured separately — with the opening width and depth already fixed,
+    /// specifying both a floor width and an angle would be contradictory.
+    ///
+    /// Ignored for "rect" (floor = opening) and "vee" (floor = 0, clamped up
+    /// to one nozzle width). Default: 0.4 mm — one 0.4 mm nozzle track.
+    #[serde(default = "default_channel_floor_width")]
+    pub channel_floor_width_mm: f64,
+
+    /// Height of each step in a tapered groove or cone, in millimeters.
+    ///
+    /// Sloped walls are built as a stack of thin constant-width bands rather
+    /// than a true ramp. Set this to your slicer's layer height and the printed
+    /// result is identical to a smooth slope, because the print is quantised to
+    /// the same steps anyway.
+    ///
+    /// Smaller values mean more polygon boolean operations — the slowest and
+    /// least robust part of the pipeline — so the band count is capped
+    /// internally. Default: 0.2 mm.
+    #[serde(default = "default_taper_slice_height")]
+    pub taper_slice_height_mm: f64,
+
+    /// Barrel shape for every through-hole — see `ViaStyle`.
+    ///
+    /// Default: "straight", so existing designs regenerate unchanged. Use
+    /// "cone" for eyelet-free plated through-holes.
+    #[serde(default = "default_via_style")]
+    pub via_style: ViaStyle,
+
+    /// Wall angle of the countersinks, in degrees from the board surface.
+    ///
+    /// 45° is both the standard countersink angle and the steepest overhang an
+    /// FDM printer holds without support — which matters only for the *bottom*
+    /// cone, since that one narrows as it rises and so is the overhanging one.
+    /// A larger angle means a steeper, narrower cone that eats less board area
+    /// but is harder to get paint into. Default: 45.
+    #[serde(default = "default_cone_angle")]
+    pub cone_angle_deg: f64,
+
+    /// Height of the straight section where the two cones meet, in millimeters.
+    ///
+    /// Letting the cones meet at a knife edge gives a fragile throat that
+    /// prints badly and leaves the component lead nothing to locate against. A
+    /// short parallel section fixes both. Default: 0.4 mm.
+    #[serde(default = "default_throat_height")]
+    pub throat_height_mm: f64,
+
+    /// Minimum material to leave between a cone mouth and any foreign-net
+    /// copper or the board edge, in millimeters.
+    ///
+    /// Cone mouths are far wider than the bore they surround — a 0.8 mm hole
+    /// with 45° cones through a 2.2 mm board wants a ~3 mm crater on each face,
+    /// which on 2.54 mm pin pitch would short to its neighbour. Mouths are
+    /// shrunk automatically to preserve this clearance. Default: 0.3 mm.
+    #[serde(default = "default_min_rim")]
+    pub min_rim_mm: f64,
+
+    /// Deprecated and inert — use `via_style` instead.
+    ///
+    /// This never affected the generated geometry: vias have always been cut as
+    /// full through-holes, whichever value was set. Kept so existing config
+    /// files still load, and warned about at runtime when set to "indent".
     #[serde(default = "default_eyelet_style")]
     pub eyelet_style: EyeletStyle,
 
@@ -219,10 +424,8 @@ pub struct Config {
     #[serde(default = "default_eyelet_diameter")]
     pub eyelet_diameter_mm: f64,
 
-    /// Depth of shallow indent dimples (only used when eyelet_style = "indent").
-    ///
-    /// A shallower indent is easier to print but provides less guidance for the eyelet.
-    /// Default: 0.3 mm (visible indentation but doesn't weaken substrate)
+    /// Deprecated and inert — there are no indent dimples. Kept so existing
+    /// config files still load. Use `via_style = "cone"` for a countersink.
     #[serde(default = "default_indent_depth")]
     pub indent_depth_mm: f64,
 
@@ -272,10 +475,8 @@ pub struct Config {
     #[serde(default = "default_generate_pad_holes")]
     pub generate_pad_holes: bool,
 
-    /// Whether to generate indent guides for vias/eyelets.
-    ///
-    /// Default: true (generate via indent guides)
-    /// Set to false to skip via indents and solder vias directly instead.
+    /// Deprecated and inert — there have never been via indent guides to skip.
+    /// Kept so existing config files still load; warned about when set false.
     #[serde(default = "default_generate_via_indents")]
     pub generate_via_indents: bool,
 
@@ -397,7 +598,14 @@ pub struct Config {
 // Default value functions for serde
 fn default_channel_width() -> f64 { 1.2 }
 fn default_channel_depth() -> f64 { 0.5 }
-fn default_eyelet_style() -> EyeletStyle { EyeletStyle::Indent }
+fn default_channel_profile() -> ChannelProfile { ChannelProfile::Rect }
+fn default_via_style() -> ViaStyle { ViaStyle::Straight }
+fn default_cone_angle() -> f64 { 45.0 }
+fn default_throat_height() -> f64 { 0.4 }
+fn default_min_rim() -> f64 { 0.3 }
+fn default_channel_floor_width() -> f64 { 0.4 }
+fn default_taper_slice_height() -> f64 { 0.2 }
+fn default_eyelet_style() -> EyeletStyle { EyeletStyle::Hole }
 fn default_eyelet_diameter() -> f64 { 1.5 }
 fn default_indent_depth() -> f64 { 0.3 }
 fn default_pad_hole_diameter() -> f64 { 0.8 }
@@ -427,6 +635,13 @@ impl Default for Config {
         Config {
             channel_width_mm: default_channel_width(),
             channel_depth_mm: default_channel_depth(),
+            channel_profile: default_channel_profile(),
+            via_style: default_via_style(),
+            cone_angle_deg: default_cone_angle(),
+            throat_height_mm: default_throat_height(),
+            min_rim_mm: default_min_rim(),
+            channel_floor_width_mm: default_channel_floor_width(),
+            taper_slice_height_mm: default_taper_slice_height(),
             eyelet_style: default_eyelet_style(),
             eyelet_diameter_mm: default_eyelet_diameter(),
             indent_depth_mm: default_indent_depth(),
@@ -485,6 +700,60 @@ impl Config {
         Ok(config)
     }
 
+    /// Loads the effective configuration, layering each source over the last:
+    ///
+    /// 1. built-in field defaults
+    /// 2. the selected mode's preset (compiled in; see `Mode::preset_toml`)
+    /// 3. the user's TOML file, if present
+    /// 4. CLI flags (applied afterwards by `merge_cli_overrides`)
+    ///
+    /// Layering happens on the parsed TOML tables rather than on `Config`
+    /// values, which is what makes "the user did not mention this key" and "the
+    /// user set this key to the same value as the default" distinguishable. The
+    /// previous approach compared each field against its default to guess
+    /// whether it had been set, and so could not tell those apart.
+    ///
+    /// The mode is taken from `--mode` when given, otherwise from the user's
+    /// file, otherwise the default.
+    pub fn load<P: AsRef<Path>>(path: P, cli_mode: Option<Mode>) -> Result<Self> {
+        let path = path.as_ref();
+
+        let user_table: toml::Table = if path.exists() {
+            let content = std::fs::read_to_string(path)
+                .with_context(|| format!("Failed to read config file {}", path.display()))?;
+            toml::from_str(&content)
+                .with_context(|| format!("Invalid TOML in config file {}", path.display()))?
+        } else {
+            if path.as_os_str() != "kicad2print.toml" {
+                eprintln!("Note: config file {} not found, using defaults", path.display());
+            }
+            toml::Table::new()
+        };
+
+        let mode = cli_mode
+            .or_else(|| {
+                user_table
+                    .get("mode")
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| s.parse::<Mode>().ok())
+            })
+            .unwrap_or_default();
+
+        let mut table: toml::Table = toml::from_str(mode.preset_toml())
+            .expect("built-in mode preset must be valid TOML");
+        for (k, v) in user_table {
+            table.insert(k, v);
+        }
+
+        let mut config: Config = table
+            .try_into()
+            .context("Failed to apply configuration (check key names and value types)")?;
+        // `--mode` selected the baseline, so it also decides the final mode
+        // regardless of what the user's file happens to say.
+        config.mode = mode;
+        Ok(config)
+    }
+
     /// Merges CLI overrides into this config.
     ///
     /// Each `Option` in the input struct, if `Some`, overwrites the corresponding
@@ -495,6 +764,27 @@ impl Config {
         }
         if overrides.channel_depth_mm.is_some() {
             self.channel_depth_mm = overrides.channel_depth_mm.unwrap();
+        }
+        if overrides.via_style.is_some() {
+            self.via_style = overrides.via_style.unwrap();
+        }
+        if overrides.channel_profile.is_some() {
+            self.channel_profile = overrides.channel_profile.unwrap();
+        }
+        if let Some(v) = overrides.channel_floor_width_mm {
+            self.channel_floor_width_mm = v;
+        }
+        if let Some(v) = overrides.taper_slice_height_mm {
+            self.taper_slice_height_mm = v;
+        }
+        if let Some(v) = overrides.cone_angle_deg {
+            self.cone_angle_deg = v;
+        }
+        if let Some(v) = overrides.throat_height_mm {
+            self.throat_height_mm = v;
+        }
+        if let Some(v) = overrides.min_rim_mm {
+            self.min_rim_mm = v;
         }
         if overrides.eyelet_style.is_some() {
             self.eyelet_style = overrides.eyelet_style.unwrap();
@@ -538,43 +828,10 @@ impl Config {
         if let Some(mount) = overrides.stencil_mount {
             self.stencil_mount = mount;
         }
-        if let Some(mode) = overrides.mode {
-            // Apply mode and its geometry defaults, but only for fields not already
-            // explicitly set by the TOML config (i.e. still at their serde defaults).
-            self.mode = mode;
-            match mode {
-                Mode::Electrolysis => {
-                    if overrides.channel_width_mm.is_none()
-                        && (self.channel_width_mm - default_channel_width()).abs() < f64::EPSILON
-                    {
-                        self.channel_width_mm = 0.7;
-                    }
-                    if overrides.channel_depth_mm.is_none()
-                        && (self.channel_depth_mm - default_channel_depth()).abs() < f64::EPSILON
-                    {
-                        self.channel_depth_mm = 0.8;
-                    }
-                    if overrides.substrate_thickness_mm.is_none()
-                        && (self.substrate_thickness_mm - default_substrate_thickness()).abs() < f64::EPSILON
-                    {
-                        self.substrate_thickness_mm = 2.2;
-                    }
-                    if overrides.eyelet_style.is_none()
-                        && self.eyelet_style == default_eyelet_style()
-                    {
-                        self.eyelet_style = EyeletStyle::Hole;
-                    }
-                    // Electroplating needs every trace shorted to one cathode —
-                    // enable the snap-on stencil + bus by default in this mode.
-                    if overrides.generate_stencil.is_none() && !self.generate_stencil {
-                        self.generate_stencil = true;
-                    }
-                }
-                Mode::CopperWire => {
-                    // Copper-wire defaults are the same as the global defaults; nothing to adjust.
-                }
-            }
-        }
+        // `mode` is deliberately absent here: it is applied earlier, by
+        // `Config::load`, because it selects the preset baseline that
+        // everything else layers on top of. Re-applying it at this point would
+        // be too late to affect any of the geometry it is supposed to set.
     }
 
     /// Prints the current configuration to stdout.
@@ -610,6 +867,13 @@ impl Config {
 /// arguments don't override config file values.
 #[derive(Debug, Default)]
 pub struct CliOverrides {
+    pub via_style: Option<ViaStyle>,
+    pub channel_profile: Option<ChannelProfile>,
+    pub channel_floor_width_mm: Option<f64>,
+    pub taper_slice_height_mm: Option<f64>,
+    pub cone_angle_deg: Option<f64>,
+    pub throat_height_mm: Option<f64>,
+    pub min_rim_mm: Option<f64>,
     pub channel_width_mm: Option<f64>,
     pub channel_depth_mm: Option<f64>,
     pub eyelet_style: Option<EyeletStyle>,
@@ -627,4 +891,127 @@ pub struct CliOverrides {
     pub stencil_plating_bus: Option<bool>,
     pub stencil_mount: Option<StencilMount>,
     pub mode: Option<Mode>,
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Serialised form, for comparing two configs field by field.
+    fn as_table(c: &Config) -> toml::Table {
+        toml::Table::try_from(c).expect("config serialises")
+    }
+
+    fn missing() -> &'static Path {
+        Path::new("definitely-not-a-real-config-file.toml")
+    }
+
+    /// The regression this whole mechanism exists for. `--mode electrolysis`
+    /// used to apply a hardcoded five-field block that was supposed to mirror
+    /// `presets/electrolysis.toml` but had drifted from it by two dozen
+    /// settings, so the two ways of selecting a mode produced different boards
+    /// while the docs claimed they were equivalent.
+
+    /// copper-wire is the default mode, so its preset must not introduce any
+    /// difference from the built-in field defaults — otherwise running with no
+    /// arguments would silently change behaviour the moment the preset became
+    /// the baseline.
+    #[test]
+    fn copper_wire_preset_equals_the_builtin_defaults() {
+        let defaults = as_table(&Config::default());
+        let preset = as_table(&Config::load(missing(), Some(Mode::CopperWire)).expect("loads"));
+        let diffs: Vec<_> = preset
+            .iter()
+            .filter(|(k, v)| defaults.get(*k) != Some(*v))
+            .map(|(k, v)| format!("{k}: default={:?} preset={v:?}", defaults.get(k)))
+            .collect();
+        assert!(diffs.is_empty(), "copper-wire preset drifted from defaults:\n{}", diffs.join("\n"));
+    }
+
+    #[test]
+    fn mode_flag_matches_its_preset_file_exactly() {
+        for (mode, file) in [
+            (Mode::Electrolysis, "presets/electrolysis.toml"),
+            (Mode::CopperWire, "presets/copper-wire.toml"),
+        ] {
+            let from_flag = Config::load(missing(), Some(mode)).expect("mode preset loads");
+            let from_file = Config::load(file, None).expect("preset file loads");
+            assert_eq!(
+                as_table(&from_flag),
+                as_table(&from_file),
+                "--mode {mode} and --config {file} must produce identical settings"
+            );
+        }
+    }
+
+    /// The specific settings that the old hardcoded block silently ignored.
+    /// Their absence is what produced a board sliced at the wrong layer height.
+    #[test]
+    fn mode_preset_carries_the_geometry_settings_it_documents() {
+        let c = Config::load(missing(), Some(Mode::Electrolysis)).expect("loads");
+        assert_eq!(c.channel_width_mm, 0.7);
+        assert_eq!(c.channel_depth_mm, 0.8);
+        assert_eq!(c.substrate_thickness_mm, 2.2);
+        assert!(c.generate_stencil, "electrolysis needs the seeding stencil");
+        // None of these were reachable through --mode before.
+        assert_eq!(c.channel_profile, ChannelProfile::Trapezoid);
+        assert_eq!(c.taper_slice_height_mm, 0.12);
+        assert_eq!(c.channel_floor_width_mm, 0.4);
+    }
+
+    #[test]
+    fn copper_wire_is_the_default_mode() {
+        let c = Config::load(missing(), None).expect("loads");
+        assert_eq!(c.mode, Mode::CopperWire);
+        assert_eq!(c.channel_width_mm, 1.2, "wire mode keeps the wide groove");
+        assert_eq!(c.channel_profile, ChannelProfile::Rect, "wire seats flat");
+    }
+
+    #[test]
+    fn a_user_file_overrides_the_mode_preset() {
+        let dir = std::env::temp_dir().join(format!("k2p-cfg-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("user.toml");
+        std::fs::write(&f, "channel_width_mm = 0.35\n").unwrap();
+
+        let c = Config::load(&f, Some(Mode::Electrolysis)).expect("loads");
+        assert_eq!(c.channel_width_mm, 0.35, "user file wins over the preset");
+        assert_eq!(c.channel_depth_mm, 0.8, "untouched keys still come from the preset");
+        assert_eq!(c.mode, Mode::Electrolysis, "--mode still selects the mode");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A user file that sets a key to the same value as the built-in default
+    /// must still count as having set it. The old default-comparison approach
+    /// could not distinguish that case from the key being absent.
+    #[test]
+    fn setting_a_key_to_its_default_value_still_overrides_the_preset() {
+        let dir = std::env::temp_dir().join(format!("k2p-dflt-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("user.toml");
+        // 1.2 is the built-in default; electrolysis would otherwise force 0.7.
+        std::fs::write(&f, "channel_width_mm = 1.2\n").unwrap();
+
+        let c = Config::load(&f, Some(Mode::Electrolysis)).expect("loads");
+        assert_eq!(
+            c.channel_width_mm, 1.2,
+            "explicitly asking for the default value must not be mistaken for silence"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn cli_flags_beat_both_the_file_and_the_preset() {
+        let mut c = Config::load(missing(), Some(Mode::Electrolysis)).expect("loads");
+        c.merge_cli_overrides(&CliOverrides {
+            channel_width_mm: Some(0.9),
+            ..Default::default()
+        });
+        assert_eq!(c.channel_width_mm, 0.9);
+        assert_eq!(c.channel_depth_mm, 0.8, "other preset values survive");
+    }
 }

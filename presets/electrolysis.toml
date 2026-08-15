@@ -11,10 +11,15 @@
 #   5. Test traces with a multimeter.
 #   6. Solder components.
 #
-# Usage:
-#   kicad2print my_board.kicad_pcb --config presets/electrolysis.toml
-# Or select via CLI flag (uses these values when not overridden by the TOML above):
+# Usage — these two are exactly equivalent:
 #   kicad2print my_board.kicad_pcb --mode electrolysis
+#   kicad2print my_board.kicad_pcb --config presets/electrolysis.toml
+#
+# This file IS the definition of `--mode electrolysis`. It is compiled into the
+# binary and applied as that mode's baseline, so editing it changes what the
+# flag does. Settings layer in this order, each overriding the last:
+#
+#   built-in defaults  ->  this preset  ->  your own TOML  ->  CLI flags
 
 mode = "electrolysis"
 
@@ -30,15 +35,79 @@ channel_width_mm = 0.7
 channel_depth_mm = 0.8
 
 # ============================================================================
-# VIA / EYELET CONFIGURATION
+# TRACE GROOVE PROFILE
 # ============================================================================
 
-# Shallow indents on top and bottom — no drilling, no eyelets required. The
-# conductive primer coats the dimple and electrolysis fills it with copper,
-# bridging the layers directly.
-eyelet_style = "indent"
+# Electroplating a square-bottomed groove tends to leave the middle unfilled:
+# current density is highest at the top corners and lowest at the floor centre,
+# so copper grows inward from the walls and can bridge over the opening —
+# sealing a void — before the floor is covered. Sloping the walls removes the
+# corner, so the groove fills from the bottom up instead.
+#
+#   "rect"      - vertical walls (original behaviour)
+#   "trapezoid" - sloped walls down to a flat floor of channel_floor_width_mm
+#   "vee"       - sloped walls that converge; ignores channel_floor_width_mm
+#
+# A vee narrows past what the nozzle can lay, so the slicer stops opening the
+# groove and the printed result ends in a truncated point instead of the flat
+# shelf a trapezoid carves. That is better for plating, but it roughly halves
+# the copper cross-section — prefer "trapezoid" where current capacity matters.
+channel_profile = "trapezoid"
+channel_floor_width_mm = 0.4
+
+# Height of each step in a sloped wall. Set this to your slicer's layer height:
+# the wall is built as a stack of thin bands, and at layer height the printed
+# result is identical to a smooth ramp because the print is quantised anyway.
+# A value that does not match means the bands land partway through layers, and
+# the slicer rounds them off — which is the detail you were trying to keep.
+#
+# 0.12 matches the "Super Quality ASA PCB" Cura profile (Creality "super"
+# quality is 0.12 mm layers). Change this if you print these at a different
+# layer height.
+taper_slice_height_mm = 0.12
+
+# ============================================================================
+# THROUGH-HOLE BARRELS
+# ============================================================================
+
+# The two copper layers are otherwise completely separate, and a straight bore
+# through 2 mm of plastic cannot be reached with a brush — seed paint never
+# coats it. That is why a pressed-in eyelet used to be mandatory.
+#
+#   "straight" - plain bore; needs an eyelet or a soldered wire stitch
+#   "cone"     - countersunk from both faces, meeting at a short throat
+#
+# With "cone" every point of the barrel is in line of sight from one face or
+# the other, so seed paint can be worked in and the plating grows from both
+# mouths toward the middle. The bottom cone also forms a solder cup, which is
+# what lets you solder a top-side trace from underneath.
+#
+# Cone mouths are much wider than the bore, so on tight pitches they are shrunk
+# automatically to stay clear of other nets. Holes with no room at all stay
+# straight and are reported — those still need an eyelet or a wire stitch.
+#
+# Cones are the point of this preset: they are what makes a plated barrel
+# possible without pressing an eyelet into every hole. Every run validates the
+# resulting mesh and reports what it found — read that before printing.
+via_style = "cone"
+
+# Countersink wall angle, degrees from the board surface. 45 is the standard
+# countersink angle and also the steepest overhang an FDM printer holds without
+# support — which matters for the bottom cone, the one that narrows as it rises.
+cone_angle_deg = 45.0
+
+# Straight section where the two cones meet. Letting them meet at a knife edge
+# gives a fragile throat and nothing for the lead to locate against.
+throat_height_mm = 0.4
+
+# Material kept between a cone mouth and any foreign-net copper or the board
+# edge. This is a correctness constraint, not cosmetic: merged mouths on
+# different nets would short together once plated.
+min_rim_mm = 0.3
+
+# Floor for the bore diameter. Via drills in KiCad are often 0.3-0.4 mm, below
+# what an FDM nozzle holds open, so bores are widened to at least this.
 eyelet_diameter_mm = 1.5
-indent_depth_mm = 0.3
 
 # ============================================================================
 # COMPONENT PAD CONFIGURATION

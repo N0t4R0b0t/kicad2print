@@ -103,12 +103,12 @@ fn export_board_svg_b64(pcb_input: &Path) -> Option<String> {
 
 fn default_steps(pcb: &PcbData, config: &Config) -> Vec<AssemblyStep> {
     match config.mode {
-        Mode::CopperWire => default_steps_copper_wire(pcb),
+        Mode::CopperWire => default_steps_copper_wire(pcb, config),
         Mode::Electrolysis => default_steps_electrolysis(pcb, config),
     }
 }
 
-fn default_steps_copper_wire(pcb: &PcbData) -> Vec<AssemblyStep> {
+fn default_steps_copper_wire(pcb: &PcbData, config: &Config) -> Vec<AssemblyStep> {
     let mut steps = Vec::new();
     if !pcb.footprints.is_empty() {
         steps.push(AssemblyStep {
@@ -139,10 +139,30 @@ fn default_steps_copper_wire(pcb: &PcbData) -> Vec<AssemblyStep> {
             name: "Connect vias".to_string(),
             components: vec![],
             wire_layer: None,
-            instruction: "Insert copper eyelets into each via hole and solder top and bottom to bridge layers.".to_string(),
+            instruction: via_bridging_instruction(config),
         });
     }
     steps
+}
+
+/// Instruction for bridging the two copper layers, which depends entirely on
+/// the barrel shape. A straight bore cannot be painted or brushed through, so
+/// it needs a physical conductor; a double cone is reachable from both faces
+/// and plates on its own.
+fn via_bridging_instruction(config: &Config) -> String {
+    match config.via_style {
+        crate::config::ViaStyle::Cone => "Each hole is countersunk from both faces, so the \
+             barrel is reachable with a brush. Work seed paint into both cones and down through \
+             the throat, checking against a light that the coating is continuous. No eyelets \
+             needed — but any hole the report listed as too tight for a cone is still a plain \
+             bore, and those need an eyelet or a snipped component lead soldered top and bottom."
+            .to_string(),
+        crate::config::ViaStyle::Straight => "Insert copper eyelets into each via hole and \
+             solder top and bottom to bridge layers. A snipped resistor lead soldered on both \
+             faces works just as well and needs no flange trimming — or regenerate with \
+             --via-style cone to make the barrels plateable and skip this step."
+            .to_string(),
+    }
 }
 
 /// Copper plating statistics derived from the trace geometry and channel
@@ -319,7 +339,7 @@ fn default_steps_electrolysis(pcb: &PcbData, config: &Config) -> Vec<AssemblySte
             name: "Connect vias".to_string(),
             components: vec![],
             wire_layer: None,
-            instruction: "Insert copper eyelets into each via hole and solder top and bottom to bridge layers.".to_string(),
+            instruction: via_bridging_instruction(config),
         });
     }
     steps.push(AssemblyStep {

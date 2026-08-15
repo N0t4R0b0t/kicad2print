@@ -39,6 +39,12 @@ pub fn walk_kicad_tree(nodes: &[SexpNode]) -> Result<PcbData> {
     let mut pcb = PcbData::default();
     let mut outline_segments = Vec::new();
 
+    // Pre-scan the file's net table so vias can resolve their `(net N)` index
+    // to a name. Vias only ever carry the index; pads carry the name directly.
+    // Done as a separate pass rather than inline so it doesn't depend on the
+    // net declarations preceding the vias that reference them.
+    let net_names = collect_net_table(nodes);
+
     // Walk the top-level nodes
     for node in nodes {
         if let Some(list) = node.as_list() {
@@ -63,7 +69,7 @@ pub fn walk_kicad_tree(nodes: &[SexpNode]) -> Result<PcbData> {
 
                     // Via hole connecting front and back layers
                     "via" => {
-                        if let Ok(via) = parse_via(node) {
+                        if let Ok(via) = parse_via(node, &net_names) {
                             pcb.vias.push(via);
                         }
                     }
@@ -218,15 +224,75 @@ fn parse_arc(node: &SexpNode) -> Result<ArcTrace> {
     })
 }
 
+/// Parses a pad's `(drill ...)` node into `(width, length)` in millimeters,
+/// both in the pad's local frame. Returns `(0.0, 0.0)` when there is no drill
+/// (an SMD pad) or the node is malformed.
+///
+/// Handles both KiCad forms:
+/// - `(drill 0.8)` → `(0.8, 0.8)`, a round hole
+/// - `(drill oval 1.0 1.6)` → `(1.0, 1.6)`, a slot
+///
+/// An optional trailing `(offset x y)` is ignored — it shifts the hole within
+/// the land, which the substrate model does not currently represent.
+fn parse_drill(node: Option<&SexpNode>) -> (f64, f64) {
+    let Some(node) = node else { return (0.0, 0.0) };
+    let first = node.nth(1).and_then(|n| n.as_atom());
+
+    match first {
+        Some("oval") => {
+            let w = node.nth(2).and_then(|n| n.as_atom()).and_then(|s| s.parse::<f64>().ok());
+            let h = node.nth(3).and_then(|n| n.as_atom()).and_then(|s| s.parse::<f64>().ok());
+            match (w, h) {
+                (Some(w), Some(h)) if w > 0.0 && h > 0.0 => (w, h),
+                // A malformed oval still had *some* drill intent; fall back to
+                // whichever dimension parsed rather than dropping the hole.
+                (Some(w), None) if w > 0.0 => (w, w),
+                (None, Some(h)) if h > 0.0 => (h, h),
+                _ => (0.0, 0.0),
+            }
+        }
+        Some(s) => match s.parse::<f64>() {
+            Ok(d) if d > 0.0 => (d, d),
+            _ => (0.0, 0.0),
+        },
+        None => (0.0, 0.0),
+    }
+}
+
+/// Collects the board's net table: `(net INDEX "NAME")` top-level declarations,
+/// keyed by index. Net 0 is KiCad's unconnected pseudo-net and is skipped so it
+/// never reads as a real shared net.
+fn collect_net_table(nodes: &[SexpNode]) -> std::collections::HashMap<i64, String> {
+    let mut map = std::collections::HashMap::new();
+    for node in nodes {
+        let Some(list) = node.as_list() else { continue };
+        if list.first().and_then(|n| n.as_atom()) != Some("net") {
+            continue;
+        }
+        let Some(idx) = node.nth(1).and_then(|n| n.as_atom()).and_then(|s| s.parse::<i64>().ok())
+        else {
+            continue;
+        };
+        let Some(name) = node.nth(2).and_then(|n| n.as_atom()) else { continue };
+        if idx != 0 && !name.is_empty() {
+            map.insert(idx, name.to_string());
+        }
+    }
+    map
+}
+
 /// Parses a `(via ...)` node.
 ///
 /// A via looks like:
 /// ```text
-/// (via (at 25.0 30.0) (size 0.8) (drill 0.4) ...)
+/// (via (at 25.0 30.0) (size 0.8) (drill 0.4) (net 3) ...)
 /// ```
 ///
-/// Note: drill is actually the diameter (not radius).
-fn parse_via(node: &SexpNode) -> Result<Via> {
+/// Note: drill is actually the diameter (not radius). The via's `(size ...)` —
+/// its annular pad diameter — is deliberately not read: the printed substrate
+/// carves a bore, not a copper annulus, and the surrounding copper comes from
+/// the cone mouth or the trace channel instead.
+fn parse_via(node: &SexpNode, net_names: &std::collections::HashMap<i64, String>) -> Result<Via> {
     let center = node
         .get_child("at")
         .and_then(|n| get_xy_point(n))
@@ -240,7 +306,15 @@ fn parse_via(node: &SexpNode) -> Result<Via> {
         .and_then(|s| s.parse::<f64>().ok())
         .ok_or_else(|| anyhow!("via missing (drill D)"))?;
 
-    Ok(Via { center, drill })
+    // A via references its net by index only, so resolve through the net table.
+    let net_name = node
+        .get_child("net")
+        .and_then(|n| n.nth(1))
+        .and_then(|n| n.as_atom())
+        .and_then(|s| s.parse::<i64>().ok())
+        .and_then(|idx| net_names.get(&idx).cloned());
+
+    Ok(Via { center, drill, net_name })
 }
 
 /// Parses a `(gr_line ...)` node on Edge.Cuts layer.
@@ -512,11 +586,14 @@ fn parse_footprint(node: &SexpNode) -> Result<Footprint> {
                                 .unwrap_or(0.0);
                             let absolute_rot_deg = fp_rot_deg + pad_local_rot_deg;
 
-                            let drill = item.get_child("drill")
-                                .and_then(|n| n.nth(1))
-                                .and_then(|n| n.as_atom())
-                                .and_then(|s| s.parse::<f64>().ok())
-                                .unwrap_or(0.0);
+                            // KiCad writes drills in two forms:
+                            //   (drill 0.8)              — round
+                            //   (drill oval 1.0 1.6)     — slotted
+                            // and either may be followed by an (offset x y).
+                            // Parsing only nth(1) as a float silently yields 0.0
+                            // for the oval form, which made the pad look like an
+                            // SMD pad and dropped its hole entirely.
+                            let (drill, drill_h) = parse_drill(item.get_child("drill"));
 
                             // Include through-hole pads (drill > 0) always.
                             // Include SMD pads (drill == 0) only when they carry a net,
@@ -526,6 +603,7 @@ fn parse_footprint(node: &SexpNode) -> Result<Footprint> {
                                 pads.push(Pad {
                                     center: absolute_pos,
                                     drill,
+                                    drill_h,
                                     number: pad_number,
                                     net_name,
                                     width: pad_w,
@@ -639,4 +717,118 @@ fn get_string_value(node: &SexpNode) -> Option<String> {
         }
     }
     None
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::parser::sexp::parse_sexp;
+
+    /// Parse a board literal the same way `parser::parse_kicad_pcb` does:
+    /// `walk_kicad_tree` expects the *children* of the `(kicad_pcb ...)` root,
+    /// not the root itself.
+    fn walk(board: &str) -> PcbData {
+        let nodes = parse_sexp(board).expect("board parses");
+        let root_children = nodes
+            .first()
+            .and_then(|n| n.as_list())
+            .filter(|l| l.first().and_then(|n| n.as_atom()) == Some("kicad_pcb"))
+            .map(|l| &l[1..])
+            .expect("test board has a kicad_pcb root");
+        walk_kicad_tree(root_children).expect("tree walks")
+    }
+
+    #[test]
+    fn oval_drill_produces_a_slot_instead_of_silently_dropping_the_hole() {
+        // Regression: `(drill oval W L)` used to be parsed as `nth(1).parse::<f64>()`,
+        // which fails on the atom "oval" and yielded drill = 0.0 — indistinguishable
+        // from an SMD pad, so the pad got no substrate hole at all.
+        let board = r#"
+        (kicad_pcb
+          (footprint "test:SLOT"
+            (at 10.0 20.0)
+            (pad "1" thru_hole oval (at 0 0) (size 2.0 3.0) (drill oval 1.0 1.6) (net 1 "SIG"))
+          )
+        )
+        "#;
+        let pcb = walk(board);
+
+        assert_eq!(pcb.pads.len(), 1, "expected the slotted pad to be extracted");
+        let pad = &pcb.pads[0];
+        assert!(pad.drill > 0.0, "slotted pad must not read as an SMD pad");
+        assert_eq!(pad.drill, 1.0, "oval drill width");
+        assert_eq!(pad.drill_h, 1.6, "oval drill length");
+    }
+
+    #[test]
+    fn round_drill_sets_both_axes_equal() {
+        let board = r#"
+        (kicad_pcb
+          (footprint "test:ROUND"
+            (at 0 0)
+            (pad "1" thru_hole circle (at 0 0) (size 1.6 1.6) (drill 0.8) (net 1 "SIG"))
+          )
+        )
+        "#;
+        let pcb = walk(board);
+
+        let pad = &pcb.pads[0];
+        assert_eq!((pad.drill, pad.drill_h), (0.8, 0.8), "round drill is square in both axes");
+    }
+
+    #[test]
+    fn smd_pad_has_no_drill_in_either_axis() {
+        let board = r#"
+        (kicad_pcb
+          (footprint "test:SMD"
+            (at 0 0)
+            (pad "1" smd rect (at 0 0) (size 1.0 0.6) (net 1 "SIG"))
+          )
+        )
+        "#;
+        let pcb = walk(board);
+
+        let pad = &pcb.pads[0];
+        assert_eq!((pad.drill, pad.drill_h), (0.0, 0.0), "SMD pad must never fabricate a hole");
+    }
+
+    #[test]
+    fn via_keeps_its_own_drill_and_resolves_its_net_name() {
+        // The via's net is an *index*; only the top-level net table maps it to a
+        // name. Cone clearance needs the name to tell same-net from foreign copper.
+        let board = r#"
+        (kicad_pcb
+          (net 0 "")
+          (net 1 "GND")
+          (net 2 "VCC")
+          (via (at 25.0 30.0) (size 0.8) (drill 0.45) (net 2))
+        )
+        "#;
+        let pcb = walk(board);
+
+        assert_eq!(pcb.vias.len(), 1);
+        let via = &pcb.vias[0];
+        assert_eq!(via.drill, 0.45, "via must keep its own drill, not a global default");
+        assert_eq!(via.net_name.as_deref(), Some("VCC"), "net index 2 resolves via the net table");
+    }
+
+    #[test]
+    fn via_on_the_unconnected_pseudo_net_reports_no_net() {
+        // Net 0 is KiCad's "unconnected" placeholder. Treating it as a real
+        // shared net would let unrelated cone mouths merge into each other.
+        let board = r#"
+        (kicad_pcb
+          (net 0 "")
+          (net 1 "GND")
+          (via (at 5.0 5.0) (size 0.8) (drill 0.4) (net 0))
+        )
+        "#;
+        let pcb = walk(board);
+
+        assert_eq!(pcb.vias[0].net_name, None, "net 0 must not resolve to a real net");
+    }
 }

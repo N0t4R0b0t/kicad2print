@@ -67,13 +67,13 @@ Steps 1–2 are software/printer; steps 3–7 are the wet workflow; step 8 is no
 
 ```mermaid
 flowchart LR
-    subgraph s1["Step 3 — Eyelet pressed in"]
+    subgraph s1["Step 3 — Barrel made reachable"]
         direction TB
         e1["
         ░░░░░░░░░░░░░░░░░░
-        ░░ ┌──┐    ┌──┐ ░░  ← brass eyelet
-        ░░ │  │    │  │ ░░     pressed into hole
-        ░░ └──┘    └──┘ ░░
+        ░░ \\  /    ┌──┐ ░░  ← cone: paint reaches
+        ░░  |  |    │  │ ░░     the barrel from both
+        ░░ /  \\    └──┘ ░░     faces. Or an eyelet.
         ░░░░░░░░░░░░░░░░░░  ← plastic substrate
         "]
     end
@@ -126,8 +126,10 @@ kicad2print my_board.kicad_pcb --config kicad2print.toml
 |---|---|---|
 | `channel_width_mm` | `0.7` | Defines the **trace width**. Plated copper fills the groove. 0.3–0.5 mm for signal traces, 0.7–1.0 mm for power. |
 | `channel_depth_mm` | `0.5` | Deeper grooves survive the seed sanding step (if you choose to sand) and hold more copper. Don't go below 0.4 mm. |
-| `eyelet_style` | `hole` | Must be `hole`, not `indent` — eyelets press into actual through-holes and get plated in place. |
-| `eyelet_diameter_mm` | `1.5` | Sized for press-fit of your eyelet. Measure your eyelets and match. |
+| `channel_profile` | `trapezoid` | A square-bottomed groove plates unevenly — copper grows inward from the walls and can seal over the top before the floor is covered, leaving a void down the middle. Sloping the walls removes the corner so the groove fills bottom-up. `vee` slopes all the way but roughly halves the copper cross-section. |
+| `channel_floor_width_mm` | `0.4` | Groove floor width for `trapezoid`. The opening stays at `channel_width_mm`. |
+| `via_style` | `straight` | `cone` countersinks both faces so the barrel can be seed-painted and plated without an eyelet — see [step 3](#step-3--bridge-the-two-copper-layers). |
+| `eyelet_diameter_mm` | `1.5` | Minimum bore diameter. KiCad via drills (0.3–0.4 mm) are below what a nozzle holds open, so bores widen to at least this. Match it to your eyelets if you use them. |
 | `substrate_thickness_mm` | `3.0` | Slightly thicker than wire mode — gives rigidity during the bath. |
 
 The generated `boardname_guide.html` includes a continuity-test tab that's especially valuable for plating: you'll use it at steps 5 and 7 to verify every net.
@@ -139,16 +141,65 @@ Electrolysis mode also emits a **snap-on paint stencil** alongside the substrate
 ## Step 2 — Print the substrate
 
 - **Material:** PETG preferred (Tg ~80°C — survives nearby soldering better). PLA works but is more heat-sensitive at the soldering step.
-- **Layer height:** 0.1 mm for fine grooves (≤ 0.5 mm), 0.2 mm otherwise.
+- **Layer height:** 0.1 mm for fine grooves (≤ 0.5 mm), 0.2 mm otherwise. If you use a sloped `channel_profile` or `--via-style cone`, set `taper_slice_height_mm` to match your layer height: sloped walls are built as a stack of thin bands, and at layer height the printed result is identical to a smooth ramp.
 - **Infill:** 60% or more — the board needs to resist warping in the bath.
 - **Orientation:** flat, board face up. Grooves should be on the top surface.
-- **First layer:** clean and well-tuned — the bottom of through-holes needs to be open so eyelets seat fully.
+- **First layer:** clean and well-tuned — the bottom of through-holes needs to be open so eyelets seat fully (and so a bottom countersink comes out as a clean cup rather than a puddle).
+- **Check the validation report.** Every run checks the mesh is a closed solid and prints what it found. An open mesh is invisible in a 3D preview but decides what the slicer does with it — a corked through-hole or a featureless plaque. Do not print past a warning.
 
 After printing, clean the board with isopropyl alcohol and let it dry completely. Skin oils prevent seed paint from adhering.
 
 ---
 
-## Step 3 — Press in the eyelets
+## Step 3 — Bridge the two copper layers
+
+The front and back copper networks are built as two completely separate groove
+systems. Something has to carry current between them at every through-hole, and
+a straight bore is the problem: you cannot get a brush down a 0.8 mm hole
+through 2 mm of plastic, so seed paint never coats the barrel and it never
+plates. There are three ways out, in order of how much trouble they are.
+
+### Countersunk barrels (no insert)
+
+Generate with `--via-style cone`. Each hole is countersunk from both faces, the
+two cones meeting at a short straight throat:
+
+```sh
+kicad2print board.kicad_pcb --mode electrolysis --via-style cone
+```
+
+Every point of the barrel is then in line of sight from one face or the other,
+so seed paint can actually be worked in, and copper grows from both mouths
+toward the middle. The bottom countersink doubles as a solder cup — which is
+what lets you solder a top-side trace from underneath.
+
+Two things to know before relying on it:
+
+- **Cone mouths are wide.** A 0.8 mm hole with 45° walls through a 2.2 mm board
+  wants a ~3 mm crater on each face. On 2.54 mm pin pitch two of those would
+  overlap and short the pins together once plated, so mouths are shrunk
+  automatically to keep `min_rim_mm` clear of foreign-net copper and the board
+  edge. Holes with no room at all stay straight, and the run tells you how many
+  — those still need one of the options below.
+- **Check the mesh report.** Every run validates the output. On dense boards
+  cone mode can still leave a small number of gaps or self-touching faces; the
+  run prints exactly what it found and where. Read it before printing.
+
+Work the seed paint into both cones and down through the throat, then hold the
+board up to a light: you should not see bare plastic through any barrel.
+
+### Wire stitches
+
+Far less painful than eyelets and needs no special parts. Push a snipped
+resistor or diode lead through the hole, solder it on both faces, and clip it
+flush. No flange to trim on tight pitches. This is the pragmatic default if you
+are not using cones.
+
+### Brass eyelets
+
+Still supported (`--via-style straight`, the default), and the most mechanically
+robust option, but the most work: they have to be pressed in, and the flange
+must be trimmed wherever pins are close together.
 
 Use **brass eyelets** sized to your `eyelet_diameter_mm`. Common sources:
 
@@ -161,7 +212,13 @@ Use **brass eyelets** sized to your `eyelet_diameter_mm`. Common sources:
 - Steel — needs a nickel strike first
 - Plated steel — plating layer interferes with bonding
 
-Press each eyelet into its through-hole until the flange sits flush on the top surface. A simple eyelet setter (or even a flat-faced punch and a hammer with a soft backer underneath) works. The eyelet should be a firm friction fit — if it falls out, the hole is too large; if it won't seat, the hole is too small.
+Press each eyelet into its through-hole until the flange sits flush on the top
+surface. A simple eyelet setter (or even a flat-faced punch and a hammer with a
+soft backer underneath) works. The eyelet should be a firm friction fit — if it
+falls out, the hole is too large; if it won't seat, the hole is too small.
+
+Eyelets must go in **before** plating, so the copper grows around the flange and
+locks them in.
 
 ### The plating bus and sacrificial bridges
 
